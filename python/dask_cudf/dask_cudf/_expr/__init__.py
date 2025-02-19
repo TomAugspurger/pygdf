@@ -36,9 +36,6 @@ from dask.dataframe.dask_expr._reductions import (
     Reduction,
     Var,
 )
-from dask.dataframe.dask_expr._util import (
-    _raise_if_object_series,
-)
 from dask.dataframe.dask_expr.io.io import (
     FusedIO,
     FusedParquetIO,
@@ -49,7 +46,7 @@ from dask.dataframe.dask_expr.io.parquet import (
     ReadParquetPyarrowFS,
 )
 
-from dask_cudf._expr.utils import _convert_to_list
+from dask_cudf._expr.utils import _convert_to_list, _raise_if_object_series
 
 _dask_version = importlib.metadata.version("dask")
 
