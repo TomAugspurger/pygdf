@@ -34,6 +34,7 @@ from cudf_polars.dsl.expressions import rolling
 from cudf_polars.dsl.expressions.base import ExecutionContext
 from cudf_polars.dsl.nodebase import Node
 from cudf_polars.dsl.to_ast import to_ast, to_parquet_filter
+from cudf_polars.dsl.tracing import trace
 from cudf_polars.dsl.utils.windows import range_window_bounds
 from cudf_polars.utils import dtypes
 from cudf_polars.utils.versions import POLARS_VERSION_LT_128
@@ -472,6 +473,7 @@ class Scan(IR):
         return df.with_columns([Column(filepaths, name=name)])
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         schema: Schema,
@@ -673,7 +675,10 @@ class Scan(IR):
                 )
                 if include_file_paths is not None:
                     df = Scan.add_file_paths(
-                        include_file_paths, paths, tbl_w_meta.num_rows_per_source, df
+                        include_file_paths,
+                        paths,
+                        tbl_w_meta.num_rows_per_source,
+                        df,
                     )
             if filters is not None:
                 # Mask must have been applied.
@@ -694,7 +699,8 @@ class Scan(IR):
             # TODO: I don't think cudf-polars supports nested types in general right now
             # (but when it does, we should pass child column names from nested columns in)
             df = DataFrame.from_table(
-                plc_tbl_w_meta.tbl, plc_tbl_w_meta.column_names(include_children=False)
+                plc_tbl_w_meta.tbl,
+                plc_tbl_w_meta.column_names(include_children=False),
             )
             col_order = list(schema.keys())
             if row_index is not None:
@@ -762,6 +768,7 @@ class Cache(IR):
         return False
 
     @classmethod
+    @trace
     def do_evaluate(
         cls, key: int, refcount: int, df: DataFrame
     ) -> DataFrame:  # pragma: no cover; basic evaluation never calls this
@@ -843,6 +850,7 @@ class DataFrameScan(IR):
         )
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         schema: Schema,
@@ -884,6 +892,7 @@ class Select(IR):
         self._non_child_args = (self.exprs, should_broadcast)
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         exprs: tuple[expr.NamedExpr, ...],
@@ -919,6 +928,7 @@ class Reduce(IR):
         self._non_child_args = (self.exprs,)
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         exprs: tuple[expr.NamedExpr, ...],
@@ -1136,6 +1146,7 @@ class GroupBy(IR):
         )
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         keys_in: Sequence[expr.NamedExpr],
@@ -1297,6 +1308,7 @@ class ConditionalJoin(IR):
         self._non_child_args = (predicate_wrapper, zlice, suffix, maintain_order)
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         predicate_wrapper: Predicate,
@@ -1477,6 +1489,7 @@ class Join(IR):
         ).columns()
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         left_on_exprs: Sequence[expr.NamedExpr],
@@ -1608,6 +1621,7 @@ class HStack(IR):
         self.children = (df,)
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         exprs: Sequence[expr.NamedExpr],
@@ -1672,6 +1686,7 @@ class Distinct(IR):
     }
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         keep: plc.stream_compaction.DuplicateKeepOption,
@@ -1761,6 +1776,7 @@ class Sort(IR):
         self.children = (df,)
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         by: Sequence[expr.NamedExpr],
@@ -1810,6 +1826,7 @@ class Slice(IR):
         self.children = (df,)
 
     @classmethod
+    @trace
     def do_evaluate(cls, offset: int, length: int, df: DataFrame) -> DataFrame:
         """Evaluate and return a dataframe."""
         return df.slice((offset, length))
@@ -1830,6 +1847,7 @@ class Filter(IR):
         self.children = (df,)
 
     @classmethod
+    @trace
     def do_evaluate(cls, mask_expr: expr.NamedExpr, df: DataFrame) -> DataFrame:
         """Evaluate and return a dataframe."""
         (mask,) = broadcast(mask_expr.evaluate(df), target_length=df.num_rows)
@@ -1848,6 +1866,7 @@ class Projection(IR):
         self.children = (df,)
 
     @classmethod
+    @trace
     def do_evaluate(cls, schema: Schema, df: DataFrame) -> DataFrame:
         """Evaluate and return a dataframe."""
         # This can reorder things.
@@ -1876,6 +1895,7 @@ class MergeSorted(IR):
         self._non_child_args = (key,)
 
     @classmethod
+    @trace
     def do_evaluate(cls, key: str, *dfs: DataFrame) -> DataFrame:
         left, right = dfs
         right = right.discard_columns(right.column_names_set - left.column_names_set)
@@ -1965,6 +1985,7 @@ class MapFunction(IR):
         self._non_child_args = (schema, name, self.options)
 
     @classmethod
+    @trace
     def do_evaluate(
         cls, schema: Schema, name: str, options: Any, df: DataFrame
     ) -> DataFrame:
@@ -2060,6 +2081,7 @@ class Union(IR):
         schema = self.children[0].schema
 
     @classmethod
+    @trace
     def do_evaluate(cls, zlice: Zlice | None, *dfs: DataFrame) -> DataFrame:
         """Evaluate and return a dataframe."""
         # TODO: only evaluate what we need if we have a slice?
@@ -2115,6 +2137,7 @@ class HConcat(IR):
         )
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         should_broadcast: bool,  # noqa: FBT001
@@ -2158,6 +2181,7 @@ class Empty(IR):
         self.children = ()
 
     @classmethod
+    @trace
     def do_evaluate(cls) -> DataFrame:  # pragma: no cover
         """Evaluate and return a dataframe."""
         return DataFrame([])

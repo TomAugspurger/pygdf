@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import pylibcudf as plc
 
 from cudf_polars.dsl.ir import IR, DataFrameScan, Scan, Union
+from cudf_polars.dsl.tracing import trace
 from cudf_polars.experimental.base import PartitionInfo
 from cudf_polars.experimental.dispatch import lower_ir_node
 
@@ -179,6 +180,7 @@ class SplitScan(IR):
             )
 
     @classmethod
+    @trace
     def do_evaluate(
         cls,
         split_index: int,

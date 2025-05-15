@@ -26,12 +26,47 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pynvml
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+    OTLPSpanExporter,
+)
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 import polars as pl
 
 from cudf_polars.dsl.translate import Translator
 from cudf_polars.experimental.explain import explain_query
 from cudf_polars.experimental.parallel import evaluate_streaming
+
+
+def setup_tracing() -> None:
+    """Run on both the main thread and dask workers."""
+    # Create a TracerProvider
+    provider = TracerProvider(
+        resource=Resource.create(
+            {
+                "service.name": "pdsh",
+            }
+        )
+    )
+
+    # Create an OTLP exporter for Jaeger
+    otlp_exporter = OTLPSpanExporter(
+        endpoint="http://localhost:4317"  # OTLP gRPC endpoint for Jaeger
+    )
+
+    # Add the exporter to the provider
+    provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
+
+    # Sets the global default tracer provider
+    trace.set_tracer_provider(provider)
+
+
+# Get a tracer
+tracer = trace.get_tracer("cudf_polars")
+
 
 if TYPE_CHECKING:
     import pathlib
@@ -1127,6 +1162,7 @@ def run(args: argparse.Namespace) -> None:
     """Run the benchmark."""
     client = None
     run_config = RunConfig.from_args(args)
+    setup_tracing()
 
     if run_config.scheduler == "distributed":
         from dask_cuda import LocalCUDACluster
@@ -1143,6 +1179,7 @@ def run(args: argparse.Namespace) -> None:
         # Avoid UVM in distributed cluster
         client = Client(LocalCUDACluster(**kwargs))
         client.wait_for_workers(run_config.n_workers)
+        client.run(setup_tracing)
         if run_config.shuffle != "tasks":
             try:
                 from rapidsmpf.integrations.dask import bootstrap_dask_cluster
@@ -1153,73 +1190,97 @@ def run(args: argparse.Namespace) -> None:
                     raise ImportError from err
 
     records: defaultdict[int, list[Record]] = defaultdict(list)
-    for q_id in run_config.queries:
-        try:
-            q = getattr(PDSHQueries, f"q{q_id}")(run_config)
-        except AttributeError as err:
-            raise NotImplementedError(f"Query {q_id} not implemented.") from err
 
-        records[q_id] = []
+    with tracer.start_as_current_span("pdsh_benchmarks") as benchmark_span:
+        benchmark_span.set_attribute("executor", run_config.executor)
+        benchmark_span.set_attribute("scheduler", run_config.scheduler)
+        benchmark_span.set_attribute("n_workers", run_config.n_workers)
+        if run_config.shuffle is not None:
+            benchmark_span.set_attribute("shuffle", run_config.shuffle)
+        if run_config.broadcast_join_limit is not None:
+            benchmark_span.set_attribute(
+                "broadcast_join_limit", run_config.broadcast_join_limit
+            )
+        benchmark_span.set_attribute("rapidsmpf_spill", run_config.rapidsmpf_spill)
+        benchmark_span.set_attribute("spill_device", run_config.spill_device)
+        if run_config.blocksize is not None:
+            benchmark_span.set_attribute("blocksize", run_config.blocksize)
 
-        for it in range(args.iterations):
-            t0 = time.monotonic()
+        for q_id in run_config.queries:
+            try:
+                q = getattr(PDSHQueries, f"q{q_id}")(run_config)
+            except AttributeError as err:
+                raise NotImplementedError(f"Query {q_id} not implemented.") from err
 
-            if run_config.executor == "cpu":
-                result = q.collect(new_streaming=True)
-            else:
-                executor_options: dict[str, Any] = {}
-                if run_config.executor == "streaming":
-                    executor_options = {
-                        "cardinality_factor": {
-                            "c_custkey": 0.05,  # Q10
-                            "l_orderkey": 1.0,  # Q18
-                            "l_partkey": 0.1,  # Q20
-                            "o_custkey": 0.25,  # Q22
-                        },
-                    }
-                    if run_config.blocksize:
-                        executor_options["target_partition_size"] = run_config.blocksize
-                    if run_config.shuffle:
-                        executor_options["shuffle_method"] = run_config.shuffle
-                    if run_config.broadcast_join_limit:
-                        executor_options["broadcast_join_limit"] = (
-                            run_config.broadcast_join_limit
+            records[q_id] = []
+
+            for it in range(args.iterations):
+                with tracer.start_as_current_span("execute-query") as span:
+                    span.set_attribute("query_id", q_id)
+                    span.set_attribute("iteration", it)
+
+                    t0 = time.monotonic()
+
+                    if run_config.executor == "cpu":
+                        result = q.collect(new_streaming=True)
+                    else:
+                        executor_options: dict[str, Any] = {}
+                        if run_config.executor == "streaming":
+                            executor_options = {
+                                "cardinality_factor": {
+                                    "c_custkey": 0.05,  # Q10
+                                    "l_orderkey": 1.0,  # Q18
+                                    "l_partkey": 0.1,  # Q20
+                                    "o_custkey": 0.25,  # Q22
+                                },
+                            }
+                            if run_config.blocksize:
+                                executor_options["target_partition_size"] = (
+                                    run_config.blocksize
+                                )
+                            if run_config.shuffle:
+                                executor_options["shuffle_method"] = run_config.shuffle
+                            if run_config.broadcast_join_limit:
+                                executor_options["broadcast_join_limit"] = (
+                                    run_config.broadcast_join_limit
+                                )
+                            if run_config.rapidsmpf_spill:
+                                executor_options["rapidsmpf_spill"] = (
+                                    run_config.rapidsmpf_spill
+                                )
+                            if run_config.scheduler == "distributed":
+                                executor_options["scheduler"] = "distributed"
+
+                        engine = pl.GPUEngine(
+                            raise_on_fail=True,
+                            executor=run_config.executor,
+                            executor_options=executor_options,
                         )
-                    if run_config.rapidsmpf_spill:
-                        executor_options["rapidsmpf_spill"] = run_config.rapidsmpf_spill
-                    if run_config.scheduler == "distributed":
-                        executor_options["scheduler"] = "distributed"
+                        if args.debug:
+                            translator = Translator(q._ldf.visit(), engine)
+                            ir = translator.translate_ir()
+                            if run_config.executor == "in-memory":
+                                result = ir.evaluate(cache={}, timer=None).to_polars()
+                            elif run_config.executor == "streaming":
+                                result = evaluate_streaming(
+                                    ir, translator.config_options
+                                ).to_polars()
+                        else:
+                            result = q.collect(engine=engine)
 
-                engine = pl.GPUEngine(
-                    raise_on_fail=True,
-                    executor=run_config.executor,
-                    executor_options=executor_options,
-                )
-                if args.debug:
-                    translator = Translator(q._ldf.visit(), engine)
-                    ir = translator.translate_ir()
-                    if run_config.executor == "in-memory":
-                        result = ir.evaluate(cache={}, timer=None).to_polars()
-                    elif run_config.executor == "streaming":
-                        result = evaluate_streaming(
-                            ir, translator.config_options
-                        ).to_polars()
-                else:
-                    result = q.collect(engine=engine)
-
-            t1 = time.monotonic()
-            record = Record(query=q_id, duration=t1 - t0)
-            if args.print_results:
-                print(result)
-            if args.explain and it == 0:
-                if args.explain_logical:
-                    print(f"\nQuery {q_id} - Logical plan\n")
-                    print(explain_query(q, engine, physical=False))
-                else:
-                    print(f"\nQuery {q_id} - Physical plan\n")
-                    print(explain_query(q, engine))
-            print(f"Ran query={q_id} in {record.duration:0.4f}s", flush=True)
-            records[q_id].append(record)
+                    t1 = time.monotonic()
+                    record = Record(query=q_id, duration=t1 - t0)
+                    if args.print_results:
+                        print(result)
+                    if args.explain and it == 0:
+                        if args.explain_logical:
+                            print(f"\nQuery {q_id} - Logical plan\n")
+                            print(explain_query(q, engine, physical=False))
+                        else:
+                            print(f"\nQuery {q_id} - Physical plan\n")
+                            print(explain_query(q, engine))
+                    print(f"Ran query={q_id} in {record.duration:0.4f}s", flush=True)
+                    records[q_id].append(record)
 
     run_config = dataclasses.replace(run_config, records=dict(records))
 
