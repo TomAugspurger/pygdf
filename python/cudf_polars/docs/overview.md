@@ -488,3 +488,15 @@ To centralize validation and keep things well-typed internally, we model our
 additional configuration as a set of dataclasses defined in
 `cudf_polars/utils/config.py`. To transition from user-provided options to our
 (validated) internal options, use `ConfigOptions.from_polars_engine`.
+
+
+## Tracing
+
+Let's say you have a
+
+```python
+df.select("a").count()
+```
+
+We always have a root node, which is the "output" IR node (is this true? Might break with `.sink()` but w/e). We can form a tree by following the children
+

@@ -155,3 +155,46 @@ class Node(Generic[T]):
             args = ", ".join(f"{arg!r}" for arg in self._ctor_arguments(self.children))
             self._repr_value = f"{type(self).__name__}({args})"
             return self._repr_value
+
+
+if TYPE_CHECKING:
+    import rich.tree.Tree
+
+
+def pprint_tree(q, label="cudf.polars expression tree"):
+    import rich
+    import rich.tree
+    import polars as pl
+    from cudf_polars.dsl.translate import Translator
+    # Convert to our IR
+
+    tree = rich.tree.Tree(label=label)
+
+    ir = Translator(q._ldf.visit(), pl.GPUEngine()).translate_ir()
+
+    branch = tree
+    nodes = [ir]
+    seen = set(nodes)
+    lifo = list(nodes)
+
+    while lifo:
+        node = lifo.pop()
+        # yield node
+        schema = list(node.schema)
+        if len(schema) > 6:
+            schema = schema[:2] + ["..."] + schema[-2:]
+
+        label = f"{type(node).__name__} ({schema})"
+        tmp = branch.add(label)
+
+        for child in reversed(node.children):
+            branch = tmp
+            if child not in seen:
+                seen.add(child)
+                lifo.append(child)
+
+    return tree
+
+
+
+

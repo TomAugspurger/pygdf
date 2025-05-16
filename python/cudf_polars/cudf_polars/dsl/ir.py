@@ -193,7 +193,7 @@ class IR(Node["IR"]):
         translation phase should fail earlier.
     """
 
-    def evaluate(self, *, cache: CSECache, timer: Timer | None) -> DataFrame:
+    def evaluate(self, *, cache: CSECache, timer: Timer | None, parent_id: int | None = None) -> DataFrame:
         """
         Evaluate the node (recursively) and return a dataframe.
 
@@ -224,6 +224,12 @@ class IR(Node["IR"]):
             translation phase should fail earlier.
         """
         children = [child.evaluate(cache=cache, timer=timer) for child in self.children]
+
+        if parent_id is None:
+            import opentelemetry.trace
+            span = opentelemetry.trace.get_current_span()
+            parent_id = span.get_span_context().trace_id
+
         if timer is not None:
             start = time.monotonic_ns()
             result = self.do_evaluate(*self._non_child_args, *children)
@@ -232,7 +238,7 @@ class IR(Node["IR"]):
             timer.store(start, end, type(self).__name__)
             return result
         else:
-            return self.do_evaluate(*self._non_child_args, *children)
+            return self.do_evaluate(*self._non_child_args, *children, parent_id=parent_id)
 
 
 class ErrorNode(IR):
