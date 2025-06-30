@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from cudf_polars.containers import DataFrame
     from cudf_polars.experimental.dispatch import LowerIRTransformer
     from cudf_polars.utils.config import ConfigOptions
+    from cudf_polars.utils.timer import Timer
 
 
 @lower_ir_node.register(IR)
@@ -208,7 +209,11 @@ def post_process_task_graph(
     return graph
 
 
-def evaluate_streaming(ir: IR, config_options: ConfigOptions) -> DataFrame:
+def evaluate_streaming(
+    ir: IR,
+    config_options: ConfigOptions,
+    timer: Timer | None = None,
+) -> DataFrame:
     """
     Evaluate an IR graph with partitioning.
 
@@ -218,6 +223,9 @@ def evaluate_streaming(ir: IR, config_options: ConfigOptions) -> DataFrame:
         Logical plan to evaluate.
     config_options
         GPUEngine configuration options.
+    timer
+        If not None, a Timer object to record timings for the
+        evaluation of the node.
 
     Returns
     -------
@@ -227,7 +235,7 @@ def evaluate_streaming(ir: IR, config_options: ConfigOptions) -> DataFrame:
 
     graph, key = task_graph(ir, partition_info, config_options)
 
-    return get_scheduler(config_options)(graph, key)
+    return get_scheduler(config_options)(graph, key, timer=timer)
 
 
 @generate_ir_tasks.register(IR)

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from collections import Counter
 from collections.abc import MutableMapping
 from itertools import chain
@@ -14,6 +15,8 @@ from typing_extensions import Unpack
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from typing import TypeAlias
+
+    from cudf_polars.utils.timer import Timer
 
 
 Key: TypeAlias = str | tuple[str, Unpack[tuple[int, ...]]]
@@ -120,6 +123,7 @@ def synchronous_scheduler(
     key: Key,
     *,
     cache: MutableMapping | None = None,
+    timer: Timer | None = None,
 ) -> Any:
     """
     Execute the task graph for a given key.
@@ -132,6 +136,9 @@ def synchronous_scheduler(
         The final output key to extract from the graph.
     cache
         Intermediate-data cache.
+    timer
+        If not None, a Timer object to record timings for the
+        evaluation of each task.
 
     Returns
     -------
@@ -146,7 +153,17 @@ def synchronous_scheduler(
     refcount = Counter(chain.from_iterable(dependencies.values()))
 
     for k in toposort(graph, dependencies):
-        cache[k] = _execute_task(graph[k], cache)
+        if timer is not None:
+            start = time.monotonic_ns()
+            result = _execute_task(graph[k], cache)
+            end = time.monotonic_ns()
+            timer.store(start, end, str(k))
+        else:
+            result = _execute_task(graph[k], cache)
+
+        cache[k] = result
+        del result  # remove our local reference
+
         for dep in dependencies[k]:
             refcount[dep] -= 1
             if refcount[dep] == 0 and dep != key:
