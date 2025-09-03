@@ -205,6 +205,15 @@ def test_validate_streaming_executor_shuffle_method(
             ConfigOptions.from_polars_engine(engine)
 
 
+def test_rapifsmpf_single_raises() -> None:
+    engine = pl.GPUEngine(
+        executor="streaming",
+        executor_options={"shuffle_method": "rapidsmpf-single"},
+    )
+    with pytest.raises(ValueError, match="not a supported shuffle method"):
+        ConfigOptions.from_polars_engine(engine)
+
+
 @pytest.mark.parametrize("executor", ["in-memory", "streaming"])
 def test_hashable(executor: str) -> None:
     config = ConfigOptions.from_polars_engine(
@@ -308,6 +317,17 @@ def test_validate_max_rows_per_partition(option: str) -> None:
                 executor_options={option: object()},
             )
         )
+
+
+def test_distributed_no_sink_to_directory_raises() -> None:
+    engine = pl.GPUEngine(
+        executor="streaming",
+        executor_options={"scheduler": "distributed", "sink_to_directory": False},
+    )
+    with pytest.raises(
+        ValueError, match="The distributed scheduler requires sink_to_directory=True"
+    ):
+        ConfigOptions.from_polars_engine(engine)
 
 
 def test_executor_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
