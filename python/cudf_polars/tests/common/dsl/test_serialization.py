@@ -14,6 +14,7 @@ from cudf_polars.dsl.expressions.boolean import BooleanFunction
 from cudf_polars.dsl.expressions.datetime import TemporalFunction
 from cudf_polars.dsl.expressions.string import StringFunction
 from cudf_polars.dsl.ir import ConditionalJoin
+from cudf_polars.dsl.translate import Translator
 from cudf_polars.testing.asserts import get_default_engine
 from cudf_polars.utils.versions import (
     POLARS_VERSION_LT_131,
@@ -94,9 +95,16 @@ def test_from_polars_invalid_polars_attribute(function):
         function.Name.from_polars(f"{function.__name__}.InvalidAttribute")
 
 
-def test_pickle_conditional_join():
-    from cudf_polars.dsl.translate import Translator
+def test_pickle_node(tmp_path):
+    df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+    df.write_parquet(tmp_path / "df.parquet")
+    q = pl.scan_parquet(tmp_path / "df.parquet")
 
+    ir = Translator(q._ldf.visit(), engine=get_default_engine()).translate_ir()
+    pickle.loads(pickle.dumps(ir))  # no errors
+
+
+def test_pickle_conditional_join():
     lhs = pl.LazyFrame(
         {"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, None], "c": ["a", "b", "c", "d", "e"]}
     )
