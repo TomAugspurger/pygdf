@@ -22,7 +22,7 @@ def test_make_source_single_file(tmp_path, fmt, use_str_path):
 
 
 @pytest.mark.parametrize("fmt", ["csv", "ndjson", "parquet"])
-@pytest.mark.parametrize("n_files", [2, 5])
+@pytest.mark.parametrize("n_files", [1, 2, 5])
 def test_make_source_multiple_files(tmp_path, fmt, n_files):
     df = pl.DataFrame({"a": list(range(100)), "b": ["x"] * 100})
     make_partitioned_source(df, tmp_path, fmt, n_files=n_files)
