@@ -7,11 +7,14 @@ import pickle
 
 import pytest
 
+import polars as pl
 from polars.polars import _expr_nodes as pl_expr
 
 from cudf_polars.dsl.expressions.boolean import BooleanFunction
 from cudf_polars.dsl.expressions.datetime import TemporalFunction
 from cudf_polars.dsl.expressions.string import StringFunction
+from cudf_polars.dsl.ir import ConditionalJoin
+from cudf_polars.testing.asserts import get_default_engine
 from cudf_polars.utils.versions import (
     POLARS_VERSION_LT_131,
     POLARS_VERSION_LT_132,
@@ -89,3 +92,28 @@ def test_from_polars_invalid_polars_attribute(function):
     # Test converting from polars function with invalid attribute name
     with pytest.raises(AttributeError, match="InvalidAttribute"):
         function.Name.from_polars(f"{function.__name__}.InvalidAttribute")
+
+
+def test_pickle_conditional_join():
+    from cudf_polars.dsl.translate import Translator
+
+    lhs = pl.LazyFrame(
+        {"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, 4, None], "c": ["a", "b", "c", "d", "e"]}
+    )
+    rhs = pl.LazyFrame(
+        {"a": [1, 2, 3, 4, 5], "b": [1, 2, 3, None, 5], "c": ["A", "B", "C", "D", "E"]}
+    )
+
+    q = lhs.with_row_index().join_where(
+        rhs,
+        pl.col("a") >= 1,
+        pl.col("a") >= pl.col("a_right"),
+        pl.col("c_right") <= "B",
+    )
+
+    ir = Translator(q._ldf.visit(), engine=get_default_engine()).translate_ir()
+    assert isinstance(ir, ConditionalJoin)
+    predicate = ir._non_child_args[0]
+    result = pickle.loads(pickle.dumps(predicate))
+    # Predicate.ast, a pylibcudf.Expression, doesn't compare equal after pickling.
+    assert result.predicate == predicate.predicate
