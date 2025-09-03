@@ -1,9 +1,11 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 import polars as pl
 
+from cudf_polars.containers import DataFrame
+from cudf_polars.dsl.ir import HConcat
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 
 
@@ -26,3 +28,13 @@ def test_hconcat_different_heights():
 
     q = pl.concat([left, right], how="horizontal")
     assert_gpu_result_equal(q)
+
+
+def test_hconcat_should_broadcast():
+    # We have to do this directly at the ir level.
+
+    dfs = [
+        DataFrame.from_polars(pl.DataFrame({"a": [1, 2, 3]})),
+        DataFrame.from_polars(pl.DataFrame({"b": [1, 2, 3]})),
+    ]
+    HConcat.do_evaluate(True, *dfs)  # noqa: FBT003
