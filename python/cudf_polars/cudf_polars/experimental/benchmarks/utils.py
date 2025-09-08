@@ -13,13 +13,17 @@ import os
 import statistics
 import sys
 import textwrap
+import threading
 import time
 import traceback
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal, assert_never
 
+import nvitop
 import nvtx
+import pynvml
+from distributed.diagnostics.plugin import WorkerPlugin
 
 import polars as pl
 
@@ -29,6 +33,8 @@ except ImportError:
     pynvml = None
 
 try:
+    import rmm.statistics
+
     from cudf_polars.dsl.translate import Translator
     from cudf_polars.experimental.explain import explain_query
     from cudf_polars.experimental.parallel import evaluate_streaming
@@ -45,6 +51,43 @@ if TYPE_CHECKING:
 
 
 ExecutorType = Literal["in-memory", "streaming", "cpu"]
+
+
+def monitor(device: nvitop.Device, event: threading.Event):
+    total = device.memory_total()
+
+    while not event.is_set():
+        proc = device.processes()[os.getpid()]
+        from_rmm = rmm.statistics.get_statistics().current_bytes
+        print(
+            f"{device.index}: {from_rmm / total * 100:.2f}%",
+            f"{proc.gpu_memory() / total * 100:.2f}%",
+        )
+        time.sleep(1)
+
+
+class MemoryMonitor(WorkerPlugin):
+    def __init__(self):
+        self.device = None
+        self.index = None
+        self._event = None
+
+    def setup(self, worker):
+        pynvml.nvmlInit()
+        index = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0])
+        self.device = nvitop.Device(index)
+        self._event = threading.Event()
+
+        threading.Thread(
+            target=monitor,
+            args=(
+                self.device,
+                self._event,
+            ),
+        ).start()
+
+    def teardown(self, worker):
+        self._event.set()
 
 
 @dataclasses.dataclass
@@ -430,6 +473,8 @@ def initialize_dask_cluster(run_config: RunConfig, args: argparse.Namespace):  #
                     }
                 ),
             )
+            client.run(rmm.statistics.enable_statistics)
+            client.register_worker_plugin(MemoryMonitor())
         except ImportError as err:
             if run_config.shuffle == "rapidsmpf":
                 raise ImportError(
