@@ -63,7 +63,8 @@ def make_partitioned_source(
                 raise ValueError(f"Unsupported format: {fmt}")
 
     if n_files == 1:
-        if path.is_dir():
+        if path.is_dir():  # pragma: not in-memory
+            # TODO: *should* this be tested with the in-memory executor?
             path = path / f"part.0.{fmt}"
         write(df, path)
     else:
@@ -80,7 +81,7 @@ def make_lazy_frame(
     path: str | Path | None = None,
     n_files: int = 1,
     n_rows: int | None = None,
-) -> pl.LazyFrame:
+) -> pl.LazyFrame:  # pragma: not in-memory
     """
     Returns a pl.LazyFrame from a pl.DataFrame.
 

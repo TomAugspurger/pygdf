@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")"/../python/cudf_polars/
 
 # Test the "in-memory" executor
-python -m pytest --cache-clear "$@" tests/common tests/in_memory tests/streaming_distributed --executor in-memory
+python -m pytest --cache-clear "$@" tests/common tests/in_memory --executor in-memory
 
 # Test the default "streaming" executor
 python -m pytest --cache-clear "$@" tests/common tests/streaming tests/streaming_distributed --executor streaming

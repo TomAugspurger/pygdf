@@ -371,7 +371,7 @@ class StatsPlanningOptions:
 
 
 @dataclasses.dataclass(frozen=True, eq=True)
-class StreamingExecutor:
+class StreamingExecutor:  # pragma: not in-memory
     """
     Configuration for the cudf-polars streaming executor.
 

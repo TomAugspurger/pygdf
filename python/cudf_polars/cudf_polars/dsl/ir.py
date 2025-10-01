@@ -1591,7 +1591,7 @@ class ConditionalJoin(IR):
             self.predicate = predicate
             self.ast = to_ast(predicate)
 
-        def __reduce__(self) -> tuple[Any, ...]:
+        def __reduce__(self) -> tuple[Any, ...]:  # pragma: not in-memory
             """Pickle a Predicate object."""
             return (type(self), (self.predicate,))
 
@@ -2560,7 +2560,7 @@ class HConcat(IR):
         """Evaluate and return a dataframe."""
         # Special should_broadcast case.
         # Used to recombine decomposed expressions
-        if should_broadcast:
+        if should_broadcast:  # pragma: not in-memory
             return DataFrame(
                 broadcast(*itertools.chain.from_iterable(df.columns for df in dfs))
             )
@@ -2584,7 +2584,7 @@ class HConcat(IR):
         )
 
 
-class Empty(IR):
+class Empty(IR):  # pragma: not in-memory
     """Represents an empty DataFrame with a known schema."""
 
     __slots__ = ("schema",)

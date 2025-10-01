@@ -82,7 +82,8 @@ xfail_strict = true
 exclude_also = [
   "if TYPE_CHECKING:",
   "class .*\\bProtocol(?:\\[[^]]+\\])?\\):",
-  "assert_never\\("
+  "assert_never\\(",
+  "$CUDF_POLARS_EXCLUDE_IN_MEMORY",
 ]
 # The cudf_polars test suite doesn't exercise the plugin, so we omit
 # it from coverage checks.

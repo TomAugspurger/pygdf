@@ -95,7 +95,7 @@ class UniqueStats:
     fraction: ColumnStat[float] = dataclasses.field(default_factory=ColumnStat[float])
 
 
-class DataSourceInfo:
+class DataSourceInfo:  # pragma: not in-memory
     """
     Table data source information.
 
@@ -139,7 +139,7 @@ class DataSourcePair(NamedTuple):
     column_name: str
 
 
-class ColumnSourceInfo:
+class ColumnSourceInfo:  # pragma: not in-memory
     """
     Source column information.
 
