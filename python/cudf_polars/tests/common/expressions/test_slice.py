@@ -6,7 +6,7 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 
 
 @pytest.mark.parametrize(
@@ -21,4 +21,4 @@ def test_slice(zlice):
     df = pl.LazyFrame({"a": [0, 1, 2, 3], "b": [1, 2, 3, 4]})
     q = df.select(pl.col("a").slice(*zlice))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

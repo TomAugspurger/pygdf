@@ -12,7 +12,7 @@ import polars as pl
 from cudf_polars.dsl.expr import TemporalFunction
 from cudf_polars.testing.asserts import (
     assert_collect_raises,
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 
@@ -42,7 +42,7 @@ def test_datetime_dataframe_scan(dtype):
     ).lazy()
 
     query = ldf.select(pl.col("b"), pl.col("a"))
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 datetime_extract_fields = [
@@ -81,7 +81,7 @@ def test_datetime_extract(field):
 
     q = ldf.select(field(pl.col("datetimes").dt))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_datetime_extra_unsupported(monkeypatch):
@@ -138,7 +138,7 @@ def test_date_extract(field):
 
     q = ldf.select(field(pl.col("dates").dt))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("format", ["%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d"])
@@ -154,7 +154,7 @@ def test_strftime_timestamp(format):
 
     q = ldf.select(pl.col("dates").dt.strftime(format))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("format", ["iso", "polars"])
@@ -193,7 +193,7 @@ def test_datetime_month_start(dtype):
     ).lazy()
 
     q = data.select(pl.col("dates").dt.month_start())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -217,7 +217,7 @@ def test_datetime_month_end(dtype):
     ).lazy()
 
     q = data.select(pl.col("dates").dt.month_end())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -238,7 +238,7 @@ def test_is_leap_year(data, dtype):
     ldf = pl.LazyFrame({"dates": pl.Series(data, dtype=dtype)})
 
     q = ldf.select(pl.col("dates").dt.is_leap_year())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -258,7 +258,7 @@ def test_ordinal_day(start_date, end_date):
         pl.col("date").dt.ordinal_day().alias("day_of_year"),
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_isoweek():
@@ -278,7 +278,7 @@ def test_isoweek():
 
     q = df.with_columns(pl.col("date").dt.week().alias("isoweek"))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_isoyear():
@@ -299,7 +299,7 @@ def test_isoyear():
 
     q = df.with_columns(pl.col("date").dt.iso_year().alias("isoyear"))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -322,7 +322,7 @@ def test_datetime_cast_time_unit_datetime(dtype, time_unit):
 
     q = df.select(pl.col("date").dt.cast_time_unit(time_unit).alias("time_unit_ms"))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -344,7 +344,7 @@ def test_datetime_cast_time_unit_duration(dtype, time_unit):
     df = pl.DataFrame({"date": sr}).lazy()
 
     q = df.select(pl.col("date").dt.cast_time_unit(time_unit).alias("time_unit_ms"))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -385,7 +385,7 @@ def test_datetime_from_integer(datetime_dtype, integer_dtype):
             polars_except=pl.exceptions.InvalidOperationError,
         )
     else:
-        assert_gpu_result_equal(q)
+        assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -421,4 +421,4 @@ def test_integer_from_datetime(datetime_dtype, integer_dtype):
     ]
     df = pl.LazyFrame({"data": pl.Series(values, dtype=datetime_dtype)})
     q = df.select(pl.col("data").cast(integer_dtype).alias("int_from_datetime"))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

@@ -9,7 +9,7 @@ import polars as pl
 from cudf_polars import Translator
 from cudf_polars.dsl import ir
 from cudf_polars.dsl.traversal import traversal
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 from cudf_polars.utils.versions import POLARS_VERSION_LT_1323
 
 
@@ -29,7 +29,7 @@ def test_cache(request):
     df2 = pl.LazyFrame({"a": [7, 8], "b": [12, 13]})
 
     q = pl.concat([df1, df2, df1, df2, df1])
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
     t = Translator(q._ldf.visit(), pl.GPUEngine())
     qir = t.translate_ir()

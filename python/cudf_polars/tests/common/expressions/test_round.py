@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 
 
 @pytest.fixture(params=[pl.Float32, pl.Float64])
@@ -29,4 +29,4 @@ def df(dtype, with_nulls):
 def test_round(df, decimals):
     q = df.select(pl.col("a").round(decimals=decimals))
 
-    assert_gpu_result_equal(q, check_exact=False)
+    assert_gpu_result_equal_default(q, check_exact=False)

@@ -6,7 +6,7 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 
 
 @pytest.mark.parametrize(
@@ -31,7 +31,7 @@ def test_merge_sorted_without_nulls(descending):
         }
     ).sort("age", descending=descending)
     q = df0.merge_sorted(df1, key="age")
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -56,4 +56,4 @@ def test_merge_sorted_with_nulls(descending):
         }
     ).sort("age", descending=descending)
     q = df0.merge_sorted(df1, key="age")
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

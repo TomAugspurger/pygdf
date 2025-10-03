@@ -11,7 +11,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_132, POLARS_VERSION_LT_1321
@@ -128,7 +128,7 @@ def test_groupby(df: pl.LazyFrame, maintain_order, keys, exprs):
         sort_keys = list(q.collect_schema().keys())[: len(keys)]
         q = q.sort(*sort_keys)
 
-    assert_gpu_result_equal(q, check_exact=False)
+    assert_gpu_result_equal_default(q, check_exact=False)
 
 
 def test_groupby_sorted_keys(df: pl.LazyFrame, keys, exprs):
@@ -147,18 +147,18 @@ def test_groupby_sorted_keys(df: pl.LazyFrame, keys, exprs):
         # https://github.com/pola-rs/polars/issues/17556
         # Can't assert that the query without post-sorting fails,
         # since it _might_ pass.
-        assert_gpu_result_equal(qsorted, check_exact=False)
+        assert_gpu_result_equal_default(qsorted, check_exact=False)
     elif schema[sort_keys[0]] == pl.Boolean():
         # Boolean keys don't do sorting, so we get random order
-        assert_gpu_result_equal(qsorted, check_exact=False)
+        assert_gpu_result_equal_default(qsorted, check_exact=False)
     else:
-        assert_gpu_result_equal(q, check_exact=False)
+        assert_gpu_result_equal_default(q, check_exact=False)
 
 
 def test_groupby_len(df, keys):
     q = df.group_by(*keys).agg(pl.len())
 
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 @pytest.mark.parametrize(
@@ -193,7 +193,7 @@ def test_groupby_null_keys(maintain_order):
     if not maintain_order:
         q = q.sort("key")
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.xfail(reason="https://github.com/pola-rs/polars/issues/17513")
@@ -206,7 +206,7 @@ def test_groupby_minmax_with_nan():
         pl.col("value").max().alias("max"), pl.col("value").min().alias("min")
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("op", [pl.Expr.nan_max, pl.Expr.nan_min])
@@ -247,7 +247,7 @@ def test_groupby_literal_in_agg(df, key, expr):
     # check_row_order=False doesn't work for list aggregations
     # so just sort by the group key
     q = df.group_by(key).agg(expr).sort(key, maintain_order=True)
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -284,26 +284,26 @@ def test_groupby_maintain_order_random(nrows, nkeys, with_nulls):
         )
     q = df.lazy().group_by(key_names, maintain_order=True).agg(pl.col("value").sum())
     # The streaming executor is too slow for large n_rows with blocksize_mode="small"
-    assert_gpu_result_equal(q, blocksize_mode="default" if nrows > 30 else None)
+    assert_gpu_result_equal_default(q, blocksize_mode="default" if nrows > 30 else None)
 
 
 def test_groupby_len_with_nulls():
     df = pl.DataFrame({"a": [1, 1, 1, 2], "b": [1, None, 2, 3]})
     q = df.lazy().group_by("a").agg(pl.col("b").len())
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 @pytest.mark.parametrize("column", ["int", "string", "uint16_with_null"])
 def test_groupby_nunique(df: pl.LazyFrame, column):
     q = df.group_by("key1").agg(pl.col(column).n_unique())
 
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 def test_groupby_null_count(df: pl.LazyFrame):
     q = df.group_by("key1").agg(pl.col("uint16_with_null").null_count())
 
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 @pytest.mark.parametrize(
@@ -335,7 +335,7 @@ def test_groupby_mean_type_promotion(df: pl.LazyFrame) -> None:
 
     q = df.group_by("key1").agg(pl.col("float").mean())
 
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 def test_groupby_sum_all_null_group_returns_null():
@@ -347,7 +347,7 @@ def test_groupby_sum_all_null_group_returns_null():
     )
 
     q = df.group_by("key").agg(out=pl.col("null_groups").sum())
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 @pytest.mark.parametrize(
@@ -363,7 +363,7 @@ def test_groupby_sum_all_null_group_returns_null():
 def test_groupby_aggs_keep_unsupported_as_null(df: pl.LazyFrame, agg_expr) -> None:
     lf = df.filter(pl.col("datetime") == date(2004, 12, 1))
     q = lf.group_by("datetime").agg(agg_expr)
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -396,7 +396,7 @@ def test_groupby_aggs_keep_unsupported_as_null(df: pl.LazyFrame, agg_expr) -> No
 )
 def test_groupby_ternary_supported(df: pl.LazyFrame, expr: pl.Expr) -> None:
     q = df.group_by("key1").agg(expr)
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 @pytest.mark.parametrize(

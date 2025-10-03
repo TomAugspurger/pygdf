@@ -7,7 +7,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 
@@ -43,7 +43,7 @@ def tests(dtypes):
 def test_cast_supported(tests):
     df, totype = tests
     q = df.select(pl.col("a").cast(totype))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("dtypes", _unsupported_dtypes, indirect=True)

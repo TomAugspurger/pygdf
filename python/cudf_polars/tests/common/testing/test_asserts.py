@@ -11,7 +11,7 @@ import polars as pl
 
 from cudf_polars.testing.asserts import (
     assert_collect_raises,
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
     assert_sink_ir_translation_raises,
 )
@@ -21,7 +21,7 @@ def test_translation_assert_raises():
     df = pl.LazyFrame({"a": [1, 2, 3]})
 
     # This should succeed
-    assert_gpu_result_equal(df)
+    assert_gpu_result_equal_default(df)
 
     with pytest.raises(AssertionError):
         # This should fail, because we can translate this query.

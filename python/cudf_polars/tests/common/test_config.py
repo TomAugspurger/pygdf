@@ -17,7 +17,7 @@ import cudf_polars.utils.config
 from cudf_polars.callback import default_memory_resource
 from cudf_polars.dsl.ir import DataFrameScan
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 from cudf_polars.utils.config import ConfigOptions
@@ -61,7 +61,7 @@ def test_polars_verbose_warns(monkeypatch):
         ),
     ):
         # And ensure that collecting issues the correct warning.
-        assert_gpu_result_equal(q)
+        assert_gpu_result_equal_default(q)
 
 
 def test_unsupported_config_raises():

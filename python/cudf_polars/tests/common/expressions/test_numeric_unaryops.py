@@ -10,7 +10,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_132
@@ -74,7 +74,7 @@ def ldf(with_nulls, dtype):
 def test_unary(ldf, op):
     expr = getattr(pl.col("a"), op)()
     q = ldf.select(expr)
-    assert_gpu_result_equal(q, check_exact=False)
+    assert_gpu_result_equal_default(q, check_exact=False)
 
 
 @pytest.mark.parametrize("base_literal", [False, True])
@@ -85,7 +85,7 @@ def test_pow(ldf, base_literal, exponent_literal):
 
     q = ldf.select(base.pow(exponent))
 
-    assert_gpu_result_equal(q, check_exact=False)
+    assert_gpu_result_equal_default(q, check_exact=False)
 
 
 @pytest.mark.parametrize("natural", [True, False])
@@ -97,13 +97,13 @@ def test_log(ldf, natural):
 
     q = ldf.select(expr)
 
-    assert_gpu_result_equal(q, check_exact=False)
+    assert_gpu_result_equal_default(q, check_exact=False)
 
 
 @pytest.mark.parametrize("col", ["a", "b", "c"])
 def test_negate(ldf, col):
     q = ldf.select(-pl.col(col))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_null_count():
@@ -119,7 +119,7 @@ def test_null_count():
         pl.col("bar").is_null().sum(),
         pl.col("baz").is_null().sum(),
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
@@ -132,7 +132,7 @@ def test_rank_supported(
     )
     expr = pl.col("a").rank(method=method, descending=descending)
     q = ldf.select(expr)
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
@@ -152,7 +152,7 @@ def test_rank_methods_with_nulls_or_ties(
         expr = pl.when((base % 2) == 0).then(pl.lit(-5)).otherwise(base)
 
     q = ldf.select(expr.rank(method=method, descending=descending))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("seed", [42])

@@ -10,7 +10,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130
@@ -59,7 +59,7 @@ def test_datetime_rolling(df, closed, period):
         count=pl.len(),
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("dtype", [pl.Int32, pl.UInt32, pl.Int64, pl.UInt64])
@@ -72,7 +72,7 @@ def test_rolling_integral_orderby(dtype):
     )
     q = df.rolling("orderby", period="4i", closed="both").agg(pl.col("values").sum())
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_rolling_collect_list_raises():
@@ -100,7 +100,7 @@ def test_rolling_empty_aggs(with_slice):
     if with_slice:
         q = q.slice(2)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_calendrical_period_unsupported(df):
@@ -134,7 +134,7 @@ def test_grouped_rolling():
     )
     q = df.rolling("orderby", period="5i", group_by="keys").agg(pl.col("values").sum())
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_grouped_rolling_unsorted_raises():
@@ -215,7 +215,7 @@ def test_rolling_sum_all_null_window_returns_null():
         out=pl.col("null_windows").sum()
     )
     # Expected: [0, 0, 5, 5, 5, 1]
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_rolling_null_count(df):
@@ -225,7 +225,7 @@ def test_rolling_null_count(df):
     q = lf.rolling("dt", period="48h", closed="both").agg(
         nc=pl.col("null").null_count()
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -254,7 +254,7 @@ def test_rolling_null_count(df):
 )
 def test_rolling_ternary_supported(df, expr):
     q = df.rolling("dt", period="48h", closed="both").agg(expr.alias("out"))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(

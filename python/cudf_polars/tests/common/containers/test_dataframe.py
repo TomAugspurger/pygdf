@@ -11,7 +11,7 @@ from polars.testing.asserts import assert_frame_equal
 import pylibcudf as plc
 
 from cudf_polars.containers import Column, DataFrame, DataType
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 
 
 def test_select_missing_raises():
@@ -167,12 +167,12 @@ def test_sorted_flags_preserved(with_nulls, nulls_last):
 
 def test_empty_name_roundtrips_overlap():
     df = pl.LazyFrame({"": [1, 2, 3], "column_0": [4, 5, 6]})
-    assert_gpu_result_equal(df)
+    assert_gpu_result_equal_default(df)
 
 
 def test_empty_name_roundtrips_no_overlap():
     df = pl.LazyFrame({"": [1, 2, 3], "b": [4, 5, 6]})
-    assert_gpu_result_equal(df)
+    assert_gpu_result_equal_default(df)
 
 
 @pytest.mark.parametrize(

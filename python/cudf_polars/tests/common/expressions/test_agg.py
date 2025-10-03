@@ -8,7 +8,7 @@ import polars as pl
 
 from cudf_polars.dsl import expr
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 
@@ -71,7 +71,7 @@ def df(dtype, with_nulls, is_sorted):
 def test_agg(df, agg):
     expr = getattr(pl.col("a"), agg)()
     q = df.select(expr)
-    assert_gpu_result_equal(q, check_exact=False)
+    assert_gpu_result_equal_default(q, check_exact=False)
 
 
 def test_bool_agg(agg, request):
@@ -81,7 +81,7 @@ def test_bool_agg(agg, request):
     expr = getattr(pl.col("a"), agg)()
     q = df.select(expr)
 
-    assert_gpu_result_equal(q, check_exact=False)
+    assert_gpu_result_equal_default(q, check_exact=False)
 
 
 @pytest.mark.parametrize("cum_agg", sorted(expr.UnaryFunction._supported_cum_aggs))
@@ -98,7 +98,7 @@ def test_cum_agg_reverse_unsupported(cum_agg):
 def test_quantile(df, q, interp):
     expr = pl.col("a").quantile(q, interp)
     q = df.select(expr)
-    assert_gpu_result_equal(q, check_exact=False)
+    assert_gpu_result_equal_default(q, check_exact=False)
 
 
 def test_quantile_invalid_q(df):
@@ -131,7 +131,7 @@ def test_agg_float_with_nans(op):
     )
     q = df.select(op(pl.col("a")), op(pl.col("b")))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.xfail(reason="https://github.com/pola-rs/polars/issues/17513")
@@ -141,14 +141,14 @@ def test_agg_singleton(op):
 
     q = df.select(op(pl.col("a")))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("data", [[], [None], [None, 2, 3, None]])
 def test_sum_empty_zero(data):
     df = pl.LazyFrame({"a": pl.Series(values=data, dtype=pl.Int32())})
     q = df.select(pl.col("a").sum())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_implode_agg_unsupported():

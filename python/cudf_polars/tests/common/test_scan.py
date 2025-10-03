@@ -12,6 +12,7 @@ import polars as pl
 
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 from cudf_polars.testing.io import make_partitioned_source
@@ -191,7 +192,7 @@ def test_scan_csv_column_renames_projection_schema(tmp_path):
         },
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -228,7 +229,7 @@ def test_scan_csv_multi(tmp_path, filename, glob, nrows_skiprows):
         source = tmp_path / filename
     q = pl.scan_csv(source, glob=glob, n_rows=n_rows, skip_rows=skiprows)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_scan_csv_multi_differing_colnames(tmp_path):
@@ -276,7 +277,7 @@ def test_scan_csv_comment_char(tmp_path):
 
     q = pl.scan_csv(tmp_path / "test.csv", comment_prefix="#")
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("nulls", [None, "3", ["3", "5"]])
@@ -286,7 +287,7 @@ def test_scan_csv_null_values(tmp_path, nulls):
 
     q = pl.scan_csv(tmp_path / "test.csv", null_values=nulls)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_scan_csv_decimal_comma(tmp_path):
@@ -295,7 +296,7 @@ def test_scan_csv_decimal_comma(tmp_path):
 
     q = pl.scan_csv(tmp_path / "test.csv", separator="|", decimal_comma=True)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_scan_csv_skip_initial_empty_rows(tmp_path):
@@ -308,7 +309,7 @@ def test_scan_csv_skip_initial_empty_rows(tmp_path):
 
     q = pl.scan_csv(tmp_path / "test.csv", separator="|", skip_rows=1)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -322,7 +323,7 @@ def test_scan_csv_skip_initial_empty_rows(tmp_path):
 def test_scan_ndjson_schema(df, tmp_path, schema):
     make_partitioned_source(df, tmp_path / "file", "ndjson")
     q = pl.scan_ndjson(tmp_path / "file", schema=schema)
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_scan_ndjson_unsupported(df, tmp_path):
@@ -360,7 +361,7 @@ def test_scan_include_file_path(request, tmp_path, format, scan_fn, df, n_rows):
     elif format == "parquet":
         assert_gpu_result_equal(q, engine=NO_CHUNK_ENGINE)
     else:
-        assert_gpu_result_equal(q)
+        assert_gpu_result_equal_default(q)
 
 
 @pytest.fixture(
@@ -429,7 +430,7 @@ def test_select_arbitrary_order_with_row_index_column(tmp_path):
     q = pl.scan_parquet(tmp_path / "df.parquet", row_index_name="foo").select(
         [pl.col("a"), pl.col("foo")]
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -462,7 +463,7 @@ def test_scan_csv_with_and_without_header(
     if columns is not None:
         q = q.select(columns)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_scan_csv_without_header_and_new_column_names_raises(df, tmp_path):
@@ -478,7 +479,7 @@ def test_scan_with_row_index(tmp_path: Path) -> None:
     df.write_csv(tmp_path / "test-1.csv")
 
     q = pl.scan_csv(tmp_path / "test-*.csv", row_index_name="index", row_index_offset=0)
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_scan_from_file_uri(tmp_path: Path) -> None:
@@ -601,4 +602,4 @@ def test_scan_ndjson_remote(
     )
 
     q = pl.scan_ndjson(httpserver.url_for(server_path))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

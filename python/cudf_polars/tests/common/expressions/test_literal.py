@@ -12,7 +12,7 @@ import pylibcudf as plc
 
 from cudf_polars.containers import DataType
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 
@@ -44,7 +44,7 @@ def test_numeric_literal(integer, float):
 
     q = df.select(integer=integer, float_=float, sum_=integer + float)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.fixture(
@@ -80,7 +80,7 @@ def test_timelike_literal(timestamp, timedelta):
         schema["delta"],
         plc.binaryop.BinaryOperator.ADD,
     ):
-        assert_gpu_result_equal(q)
+        assert_gpu_result_equal_default(q)
     else:
         assert_ir_translation_raises(q, NotImplementedError)
 
@@ -94,7 +94,7 @@ def test_select_literal_series():
         c=pl.Series([[[1]], [], [[1, 2, 3, 4]]], dtype=pl.List(pl.List(pl.Float32()))),
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(

@@ -6,7 +6,7 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130
 
 
@@ -19,7 +19,7 @@ def test_gather():
     )
 
     query = ldf.select(pl.col("a").gather(pl.col("b")))
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 def test_gather_with_nulls():
@@ -32,7 +32,7 @@ def test_gather_with_nulls():
 
     query = ldf.select(pl.col("a").gather(pl.col("b")))
 
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 @pytest.mark.parametrize("negative", [False, True])

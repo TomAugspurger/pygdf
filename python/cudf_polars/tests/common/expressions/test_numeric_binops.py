@@ -9,7 +9,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_132
 
@@ -78,7 +78,7 @@ def test_numeric_binop(df, binop):
 
     q = df.select(binop(left, right))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("left_scalar", [False, True])
@@ -90,7 +90,7 @@ def test_binop_with_scalar(left_scalar, right_scalar):
     rop = pl.lit(6) if right_scalar else pl.col("b")
     q = df.select(lop / rop)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("zero", [0, pl.lit(0)])
@@ -99,7 +99,7 @@ def test_floor_div_binop_by_zero(zero, ltype):
 
     q = df.select(pl.col("a") // zero)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("divisor", [1, 2.0])
@@ -108,7 +108,7 @@ def test_true_div_boolean_column(divisor):
 
     q = df.select(pl.col("a") / divisor)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_true_div_with_decimals():
@@ -120,4 +120,4 @@ def test_true_div_with_decimals():
         schema={"foo": pl.Decimal(15, 2), "bar": pl.Decimal(15, 2)},
     )
     q = df.select(pl.col("bar") / pl.col("foo"))
-    assert_gpu_result_equal(q, check_dtypes=not POLARS_VERSION_LT_132)
+    assert_gpu_result_equal_default(q, check_dtypes=not POLARS_VERSION_LT_132)

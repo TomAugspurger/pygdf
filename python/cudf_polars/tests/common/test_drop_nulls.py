@@ -7,7 +7,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_132
@@ -34,7 +34,7 @@ def null_data(request):
 
 def test_drop_null(null_data):
     q = null_data.select(pl.col("a").drop_nulls())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -44,12 +44,12 @@ def test_drop_null(null_data):
 )
 def test_fill_null(null_data, value):
     q = null_data.select(pl.col("a").fill_null(value))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_fill_null_with_string():
     q = pl.LazyFrame({"a": [None, "a"]}).select(pl.col("a").fill_null("b"))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -60,7 +60,7 @@ def test_fill_null_with_strategy(null_data, strategy):
     if POLARS_VERSION_LT_132:
         assert_ir_translation_raises(q, NotImplementedError)
     else:
-        assert_gpu_result_equal(q)
+        assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("strategy", ["forward", "backward"])
@@ -73,4 +73,4 @@ def test_fill_null_with_limit(null_data, strategy, limit):
         if POLARS_VERSION_LT_132:
             assert_ir_translation_raises(q, NotImplementedError)
         else:
-            assert_gpu_result_equal(q)
+            assert_gpu_result_equal_default(q)

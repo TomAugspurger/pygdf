@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 __all__: list[str] = [
     "assert_gpu_result_equal",
+    "assert_gpu_result_equal_default",
     "assert_ir_translation_raises",
     "assert_sink_ir_translation_raises",
     "assert_sink_result_equal",
@@ -136,6 +137,97 @@ def assert_gpu_result_equal(
         got,
         **assert_kwargs_bool,
         **tol_kwargs,  # type: ignore[arg-type]
+    )
+
+
+def assert_gpu_result_equal_default(
+    lazydf: pl.LazyFrame,
+    *,
+    collect_kwargs: dict[OptimizationArgs, bool] | None = None,
+    polars_collect_kwargs: dict[OptimizationArgs, bool] | None = None,
+    cudf_collect_kwargs: dict[OptimizationArgs, bool] | None = None,
+    check_row_order: bool = True,
+    check_column_order: bool = True,
+    check_dtypes: bool = True,
+    check_exact: bool = True,
+    rtol: float = 1e-05,
+    atol: float = 1e-08,
+    categorical_as_str: bool = False,
+    executor: str | None = None,
+    blocksize_mode: Literal["small", "default"] | None = None,
+) -> None:
+    """
+    Assert that collection of a lazyframe on GPU produces correct results using the default engine.
+
+    This function is similar to `assert_gpu_result_equal` but does not accept an `engine`
+    parameter. It only uses the default engine configuration set up for the test runner.
+    This is intended for "generic" tests that rely on default engine configuration,
+    as opposed to engine-specific tests that explicitly specify an engine.
+
+    Parameters
+    ----------
+    lazydf
+        frame to collect.
+    collect_kwargs
+        Common keyword arguments to pass to collect for both polars CPU and
+        cudf-polars.
+        Useful for controlling optimization settings.
+    polars_collect_kwargs
+        Keyword arguments to pass to collect for execution on polars CPU.
+        Overrides kwargs in collect_kwargs.
+        Useful for controlling optimization settings.
+    cudf_collect_kwargs
+        Keyword arguments to pass to collect for execution on cudf-polars.
+        Overrides kwargs in collect_kwargs.
+        Useful for controlling optimization settings.
+    check_row_order
+        Expect rows to be in same order
+    check_column_order
+        Expect columns to be in same order
+    check_dtypes
+        Expect dtypes to match
+    check_exact
+        Require exact equality for floats, if `False` compare using
+        rtol and atol.
+    rtol
+        Relative tolerance for float comparisons
+    atol
+        Absolute tolerance for float comparisons
+    categorical_as_str
+        Decat categoricals to strings before comparing
+    executor
+        The executor configuration to pass to `GPUEngine`. If not specified
+        uses the module level `Executor` attribute.
+    blocksize_mode
+        The "mode" to use for choosing the blocksize for the streaming executor.
+        If not specified, uses the module level ``DEFAULT_BLOCKSIZE_MODE`` attribute.
+        Set to "small" to configure small values for ``max_rows_per_partition``
+        and ``target_partition_size``, which will typically cause many partitions
+        to be created while executing the query.
+
+    Raises
+    ------
+    AssertionError
+        If the GPU and CPU collection do not match.
+    NotImplementedError
+        If GPU collection failed in some way.
+    """
+    # Use the default engine - no custom engine parameter allowed
+    assert_gpu_result_equal(
+        lazydf,
+        engine=None,  # Always use default engine
+        collect_kwargs=collect_kwargs,
+        polars_collect_kwargs=polars_collect_kwargs,
+        cudf_collect_kwargs=cudf_collect_kwargs,
+        check_row_order=check_row_order,
+        check_column_order=check_column_order,
+        check_dtypes=check_dtypes,
+        check_exact=check_exact,
+        rtol=rtol,
+        atol=atol,
+        categorical_as_str=categorical_as_str,
+        executor=executor,
+        blocksize_mode=blocksize_mode,
     )
 
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130
 
@@ -19,7 +19,7 @@ def test_union():
     ).lazy()
     ldf2 = ldf.select((pl.col("a") + pl.col("b")).alias("c"), pl.col("a"))
     query = pl.concat([ldf, ldf2], how="diagonal")
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 def test_concat_vertical():
@@ -32,7 +32,7 @@ def test_concat_vertical():
     ldf2 = ldf.select(pl.col("a"), pl.col("b") * 2 + pl.col("a"))
     q = pl.concat([ldf, ldf2], how="vertical")
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_concat_diagonal_empty():
@@ -41,7 +41,7 @@ def test_concat_diagonal_empty():
 
     q = pl.concat([df1, df2], how="diagonal_relaxed")
 
-    assert_gpu_result_equal(
+    assert_gpu_result_equal_default(
         q,
         collect_kwargs={"no_optimization": True}
         if POLARS_VERSION_LT_130

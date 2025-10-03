@@ -9,7 +9,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_132
@@ -89,9 +89,9 @@ def test_over(df: pl.LazyFrame, partition_by, agg_expr):
     # CPU: 1.333333333333333
     # GPU: 1.333333333333334
     # Classic floating-point gotcha: looks the same, but the test fails
-    assert_gpu_result_equal(
+    assert_gpu_result_equal_default(
         q, check_exact=False, rtol=1e-15, atol=1e-15
-    ) if "var" in str(agg_expr) else assert_gpu_result_equal(q)
+    ) if "var" in str(agg_expr) else assert_gpu_result_equal_default(q)
 
 
 def test_over_with_sort(df: pl.LazyFrame):
@@ -109,7 +109,7 @@ def test_over_mapping_strategy(df: pl.LazyFrame, mapping_strategy: str):
         [pl.col("b").rank().over(pl.col("a"), mapping_strategy=mapping_strategy)]  # type: ignore[arg-type]
     )
     if not POLARS_VERSION_LT_132 and mapping_strategy == "group_to_rows":
-        assert_gpu_result_equal(q)
+        assert_gpu_result_equal_default(q)
     else:
         assert_ir_translation_raises(q, NotImplementedError)
 
@@ -123,7 +123,7 @@ def test_rolling(df: pl.LazyFrame, agg_expr, period: str):
 
     query = df.with_columns(window_expr)
 
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 def test_rolling_unsupported(df: pl.LazyFrame, unsupported_agg_expr):
@@ -145,4 +145,4 @@ def test_rolling_closed(df: pl.LazyFrame, closed: str):
     query = df.with_columns(
         [pl.col("b").sum().rolling(period="2d", index_column="date", closed=closed)]  # type: ignore[arg-type]
     )
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)

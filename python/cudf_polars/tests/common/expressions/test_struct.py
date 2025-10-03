@@ -7,7 +7,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_131
@@ -28,7 +28,7 @@ def test_field_getitem(request, ldf):
         )
     )
     q = ldf.select(pl.col("a").struct[0])
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("fields", [("b",), ("b", "d"), ("^b.*|f.*$",)])
@@ -40,7 +40,7 @@ def test_field(request, ldf, fields):
         )
     )
     q = ldf.select(pl.col("a").struct.field(*fields))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_unnest(request, ldf):
@@ -51,7 +51,7 @@ def test_unnest(request, ldf):
         )
     )
     q = ldf.select(pl.col("a").struct.unnest())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_json_encode(request, ldf):
@@ -62,11 +62,11 @@ def test_json_encode(request, ldf):
         )
     )
     q = ldf.select(pl.col("a").struct.json_encode())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
     ldf_newlines = pl.LazyFrame({"a": [{"b": "c\nd", "d": "\r\nz"}]})
     q = ldf_newlines.select(pl.col("a").struct.json_encode())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_rename_fields(request, ldf):
@@ -77,7 +77,7 @@ def test_rename_fields(request, ldf):
         )
     )
     q = ldf.select(pl.col("a").struct.rename_fields(["1", "2", "3"]).struct.unnest())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_with_fields(ldf):
@@ -100,7 +100,7 @@ def test_prefix_suffix_fields(request, ldf, expr):
         )
     )
     q = ldf.select(expr("foo").struct.unnest())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_map_field_names(ldf):
@@ -113,13 +113,13 @@ def test_map_field_names(ldf):
 def test_value_counts(ldf, name, normalize):
     # sort=True since order is non-deterministic
     q = ldf.select(pl.col("a").value_counts(sort=True, name=name, normalize=normalize))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_value_counts_normalize_div_by_zero():
     ldf = pl.LazyFrame({"a": []}, schema={"a": pl.Int64()})
     q = ldf.select(pl.col("a").value_counts(normalize=True))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_groupby_value_counts_notimplemented():
@@ -134,16 +134,16 @@ def test_groupby_value_counts_notimplemented():
 
 def test_struct(ldf):
     q = ldf.select(pl.struct(pl.all()))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_nested_struct():
     ldf = pl.LazyFrame({"a": [{"x": {"i": 0, "j": 0}, "y": {"i": 0, "k": 1}}]})
     q = ldf.select(pl.struct(pl.all()))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_value_counts_with_nulls(ldf):
     ldf_with_nulls = ldf.select(c=pl.Series(["x", None, "y", "x", None, "x"]))
     q = ldf_with_nulls.select(pl.col("c").value_counts(sort=True))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

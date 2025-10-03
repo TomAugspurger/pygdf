@@ -10,7 +10,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130, POLARS_VERSION_LT_132
@@ -53,7 +53,7 @@ def test_rolling_datetime(time_unit):
         max_a=pl.max("a").rolling(index_column="dt", period="10d", offset="2d"),
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_rolling_date():
@@ -74,7 +74,7 @@ def test_rolling_date():
         max_a=pl.max("a").rolling(index_column="dt", period="10d", offset="2d"),
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("dtype", [pl.Int32, pl.UInt32, pl.Int64, pl.UInt64])
@@ -89,7 +89,7 @@ def test_rolling_integral_orderby(dtype):
         pl.col("values").sum().rolling("orderby", period="4i", closed="both")
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_rolling_collect_list_raises():
@@ -165,7 +165,7 @@ def test_rolling_sum_all_null_window_returns_null():
         out=pl.col("null_windows").sum().rolling("orderby", period="2i", closed="both")
     )
     # Expected: [null, null, 5, 5, 5, 1]
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -195,7 +195,7 @@ def test_rolling_sum_all_null_window_returns_null():
 )
 def test_over_group_various(df, expr):
     q = df.select(expr)
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_window_over_group_sum_all_null_group_is_zero(df):
@@ -205,7 +205,7 @@ def test_window_over_group_sum_all_null_group_is_zero(df):
         .otherwise(pl.col("x"))
         .alias("null")
     ).select(s=pl.col("null").sum().over("g"))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -232,7 +232,7 @@ def test_over_with_order_by(df, order_by, order_by_descending, order_by_nulls_la
             nulls_last=order_by_nulls_last,
         )
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("strategy", ["explode", "join"], ids=["explode", "join"])
@@ -255,7 +255,7 @@ def test_over_ternary(df):
         .over("g")
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 def test_over_broadcast_input_row_group_indices_aligned():
@@ -269,7 +269,7 @@ def test_over_broadcast_input_row_group_indices_aligned():
     )
     q = df.select(pl.col("x").sum().over("g"))
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
@@ -291,7 +291,7 @@ def test_rank_over(
         .rank(method=method, descending=descending)
         .over("g", order_by=order_by)
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
@@ -315,7 +315,7 @@ def test_rank_over_with_ties(
         .rank(method=method, descending=descending)
         .over("g", order_by=order_by)
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
@@ -339,7 +339,7 @@ def test_rank_over_with_null_values(
         .rank(method=method, descending=descending)
         .over("g", order_by=order_by)
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("method", ["ordinal", "dense", "min", "max", "average"])
@@ -361,4 +361,4 @@ def test_rank_over_with_null_group_keys(
         .rank(method=method, descending=descending)
         .over("g_null", order_by=order_by)
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

@@ -11,7 +11,7 @@ import polars as pl
 import pylibcudf as plc
 
 from cudf_polars import Translator
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 
 
 @pytest.mark.parametrize("descending", [False, True])
@@ -24,7 +24,7 @@ def test_sort_expression(descending, nulls_last):
     )
 
     query = ldf.select(pl.col("a").sort(descending=descending, nulls_last=nulls_last))
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 @pytest.mark.parametrize(
@@ -53,7 +53,7 @@ def test_sort_by_expression(descending, nulls_last, maintain_order):
             maintain_order=maintain_order,
         )
     )
-    assert_gpu_result_equal(query, check_row_order=maintain_order)
+    assert_gpu_result_equal_default(query, check_row_order=maintain_order)
 
 
 @pytest.mark.parametrize("descending", [False, True])
@@ -66,7 +66,7 @@ def test_setsorted(descending, nulls_last, with_nulls):
 
     q = df.set_sorted("a", descending=descending)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
     df = (
         Translator(q._ldf.visit(), pl.GPUEngine())

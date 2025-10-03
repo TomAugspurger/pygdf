@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 
 
 @pytest.mark.parametrize("then_scalar", [False, True])
@@ -24,4 +24,4 @@ def test_when_then(then_scalar, otherwise_scalar, expr):
     then = pl.lit(10) if then_scalar else pl.col("a")
     otherwise = pl.lit(-2) if otherwise_scalar else pl.col("b")
     q = ldf.select(pl.when(expr).then(then).otherwise(otherwise))
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

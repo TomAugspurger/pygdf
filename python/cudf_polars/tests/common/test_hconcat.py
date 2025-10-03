@@ -1,10 +1,10 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 
 
 def test_hconcat():
@@ -16,7 +16,7 @@ def test_hconcat():
     ).lazy()
     ldf2 = ldf.select((pl.col("a") + pl.col("b")).alias("c"))
     query = pl.concat([ldf, ldf2], how="horizontal")
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 def test_hconcat_different_heights():
@@ -25,4 +25,4 @@ def test_hconcat_different_heights():
     right = pl.LazyFrame({"b": [[1], [2]], "c": ["a", "bcde"]})
 
     q = pl.concat([left, right], how="horizontal")
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

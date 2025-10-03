@@ -9,7 +9,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     assert_ir_translation_raises,
 )
 
@@ -26,7 +26,7 @@ def test_select():
         pl.col("a") + pl.col("b"), (pl.col("a") * 2 + pl.col("b")).alias("d")
     )
 
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 def test_select_decimal():
@@ -34,7 +34,7 @@ def test_select_decimal():
         {"a": pl.Series(values=[decimal.Decimal("1.0"), None], dtype=pl.Decimal(3, 1))}
     )
     query = ldf.select(pl.col("a"))
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 def test_select_decimal_precision_none_result_max_precision():
@@ -65,7 +65,7 @@ def test_select_reduce():
         (pl.col("a") * 2 + pl.col("b")).alias("d").mean(),
     )
 
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 def test_select_with_cse_no_agg():
@@ -74,7 +74,7 @@ def test_select_with_cse_no_agg():
 
     query = df.select(expr, (expr * 2).alias("b"), ((expr * 2) + 10).alias("c"))
 
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 def test_select_with_cse_with_agg():
@@ -86,7 +86,7 @@ def test_select_with_cse_with_agg():
         expr, (expr * 2).alias("b"), asum.alias("c"), (asum + 10).alias("d")
     )
 
-    assert_gpu_result_equal(query)
+    assert_gpu_result_equal_default(query)
 
 
 @pytest.mark.parametrize("fmt", ["ndjson", "csv"])
@@ -112,7 +112,7 @@ def test_select_fast_count_parquet(tmp_path):
     df.write_parquet(file)
 
     q = pl.scan_parquet(file).select(pl.len())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -129,4 +129,4 @@ def test_select_fast_count_parquet_skip_rows(request, tmp_path, zlice):
     df.write_parquet(file)
 
     q = pl.scan_parquet(file).slice(1, 5).select(pl.len())
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

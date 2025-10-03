@@ -7,7 +7,7 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 
 
 @pytest.fixture
@@ -27,11 +27,11 @@ def df():
 @pytest.mark.parametrize("k", [0, 1, 2, 3, 4])
 def test_top_k(df, col, k):
     q = df.select(pl.col(col).top_k(k))
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 @pytest.mark.parametrize("col", ["test", "bool_val", "str_value", "col_with_nulls"])
 @pytest.mark.parametrize("k", [0, 1, 2, 3, 4])
 def test_bottom_k(df, col, k):
     q = df.select(pl.col(col).bottom_k(k))
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)

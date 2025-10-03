@@ -9,7 +9,7 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130
 
 
@@ -41,7 +41,7 @@ def test_scan_drop_nulls(subset, predicate_pushdown):
     # Drop nulls are pushed into filters
     q = df.drop_nulls(subset)
 
-    assert_gpu_result_equal(
+    assert_gpu_result_equal_default(
         q,
         collect_kwargs={"predicate_pushdown": predicate_pushdown}
         if POLARS_VERSION_LT_130
@@ -65,7 +65,7 @@ def test_can_convert_lists():
         }
     )
 
-    assert_gpu_result_equal(df)
+    assert_gpu_result_equal_default(df)
 
 
 def test_dataframescan_with_decimals():
@@ -76,4 +76,4 @@ def test_dataframescan_with_decimals():
         },
         schema={"foo": pl.Int64, "bar": pl.Decimal(precision=15, scale=2)},
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)

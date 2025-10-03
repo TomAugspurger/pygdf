@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 
 
 @pytest.mark.parametrize("subset", [None, ["a"], ["a", "b"], ["b", "c"], ["c", "a"]])
@@ -27,4 +27,4 @@ def test_distinct(subset, keep, maintain_order, pre_sorted):
         ldf = ldf.sort(*keys, descending=descending)
 
     query = ldf.unique(subset=subset, keep=keep, maintain_order=maintain_order)
-    assert_gpu_result_equal(query, check_row_order=maintain_order)
+    assert_gpu_result_equal_default(query, check_row_order=maintain_order)

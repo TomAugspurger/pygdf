@@ -6,7 +6,7 @@ import pytest
 
 import polars as pl
 
-from cudf_polars.testing.asserts import assert_gpu_result_equal
+from cudf_polars.testing.asserts import assert_gpu_result_equal_default
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130
 
 
@@ -32,7 +32,7 @@ def test_filter_expression(expr, predicate_pushdown):
     )
 
     query = ldf.select(pl.col("a").filter(expr))
-    assert_gpu_result_equal(
+    assert_gpu_result_equal_default(
         query,
         collect_kwargs={"predicate_pushdown": predicate_pushdown}
         if POLARS_VERSION_LT_130

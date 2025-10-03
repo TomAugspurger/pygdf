@@ -7,7 +7,7 @@ import pytest
 import polars as pl
 
 from cudf_polars.testing.asserts import (
-    assert_gpu_result_equal,
+    assert_gpu_result_equal_default,
     get_default_engine,
 )
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130, POLARS_VERSION_LT_132
@@ -56,7 +56,7 @@ def right():
 def test_join_maintain_order(left, right, maintain_order):
     q = left.join(right, on=pl.col("a"), how="inner", maintain_order=maintain_order)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -72,7 +72,7 @@ def test_non_coalesce_join(left, right, how, nulls_equal, join_expr):
     query = left.join(
         right, on=join_expr, how=how, nulls_equal=nulls_equal, coalesce=False
     )
-    assert_gpu_result_equal(query, check_row_order=False)
+    assert_gpu_result_equal_default(query, check_row_order=False)
 
 
 @pytest.mark.parametrize(
@@ -86,7 +86,7 @@ def test_coalesce_join(left, right, how, nulls_equal, join_expr):
     query = left.join(
         right, on=join_expr, how=how, nulls_equal=nulls_equal, coalesce=True
     )
-    assert_gpu_result_equal(query, check_row_order=False)
+    assert_gpu_result_equal_default(query, check_row_order=False)
 
 
 def test_left_join_with_slice(left, right, nulls_equal, zlice):
@@ -102,14 +102,14 @@ def test_left_join_with_slice(left, right, nulls_equal, zlice):
         engine = get_default_engine()
 
         # Check the number of rows
-        assert_gpu_result_equal(q.select(pl.len()))
+        assert_gpu_result_equal_default(q.select(pl.len()))
 
         # Check that the schema matches
         result = q.collect(engine=engine)
         assert result.schema == q.collect_schema()
 
     else:
-        assert_gpu_result_equal(q, check_row_order=False)
+        assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 def test_cross_join(left, right, zlice):
@@ -117,7 +117,7 @@ def test_cross_join(left, right, zlice):
     if zlice is not None:
         q = q.slice(*zlice)
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -129,7 +129,7 @@ def test_cross_join(left, right, zlice):
 )
 def test_join_literal_key(left, right, left_on, right_on):
     q = left.join(right, left_on=left_on, right_on=right_on, how="inner")
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
 
 @pytest.mark.parametrize(
@@ -149,14 +149,14 @@ def test_join_literal_key(left, right, left_on, right_on):
 def test_join_where(left, right, conditions, zlice):
     q = left.join_where(right, *conditions)
 
-    assert_gpu_result_equal(q, check_row_order=False)
+    assert_gpu_result_equal_default(q, check_row_order=False)
 
     if zlice is not None:
         q_len = q.slice(*zlice).select(pl.len())
         # Can't compare result, since row order is not guaranteed and
         # therefore we only check the length
 
-        assert_gpu_result_equal(q_len)
+        assert_gpu_result_equal_default(q_len)
 
 
 def test_cross_join_empty_right_table(request):
@@ -170,7 +170,7 @@ def test_cross_join_empty_right_table(request):
         (pl.col("a") == pl.col("a")) & (pl.col("b") < pl.col("b"))
     )
 
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("maintain_order", ["left_right", "right_left"])
@@ -179,7 +179,7 @@ def test_join_maintain_order_inner_full(left, right, how, maintain_order, nulls_
     q = left.join(
         right, on="a", how=how, nulls_equal=nulls_equal, maintain_order=maintain_order
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("maintain_order", ["left", "left_right"])
@@ -191,7 +191,7 @@ def test_join_maintain_order_left(left, right, maintain_order, nulls_equal):
         nulls_equal=nulls_equal,
         maintain_order=maintain_order,
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("maintain_order", ["right", "right_left"])
@@ -203,7 +203,7 @@ def test_join_maintain_order_right(left, right, maintain_order, nulls_equal):
         nulls_equal=nulls_equal,
         maintain_order=maintain_order,
     )
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize("maintain_order", ["left_right", "right_left"])
@@ -211,7 +211,7 @@ def test_join_maintain_order_right(left, right, maintain_order, nulls_equal):
 @pytest.mark.parametrize("how", ["inner", "full"])
 def test_join_maintain_order_multiple_keys(left, right, how, join_expr, maintain_order):
     q = left.join(right, on=join_expr, how=how, maintain_order=maintain_order)
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -227,7 +227,7 @@ def test_join_maintain_order_multiple_keys(left, right, how, join_expr, maintain
 )
 def test_join_maintain_order_with_coalesce(left, right, maintain_order, how):
     q = left.join(right, on="a", how=how, coalesce=True, maintain_order=maintain_order)
-    assert_gpu_result_equal(q)
+    assert_gpu_result_equal_default(q)
 
 
 @pytest.mark.parametrize(
@@ -243,7 +243,7 @@ def test_join_maintain_order_with_slice(left, right, maintain_order, how, zlice)
     # Need to disable slice pushdown to make the test deterministic. We want to materialize
     # the full join result and then slice
     q = left.join(right, on="a", how=how, maintain_order=maintain_order).slice(*zlice)
-    assert_gpu_result_equal(
+    assert_gpu_result_equal_default(
         q,
         polars_collect_kwargs={"slice_pushdown": False}
         if POLARS_VERSION_LT_130
