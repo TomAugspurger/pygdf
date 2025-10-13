@@ -126,7 +126,7 @@ def test_mask_nans_float():
         dtype=dtype,
     )
     masked = column.mask_nans(stream=stream)
-    assert masked.nan_count == 0
+    assert masked.nan_count(stream=stream) == 0
     assert masked.slice((0, 2), stream=stream).null_count == 0
     assert masked.slice((2, 1), stream=stream).null_count == 1
 
