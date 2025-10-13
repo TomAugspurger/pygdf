@@ -165,8 +165,7 @@ class Column:
             "dtype": pl.polars.dtype_str_repr(self.dtype.polars_type),
         }
 
-    @functools.cached_property  # TODO(Tom): property -> method
-    def obj_scalar(self) -> plc.Scalar:
+    def obj_scalar(self, stream: Stream) -> plc.Scalar:
         """
         A copy of the column object as a pylibcudf Scalar.
 
@@ -181,7 +180,7 @@ class Column:
         """
         if not self.is_scalar:
             raise ValueError(f"Cannot convert a column of length {self.size} to scalar")
-        return plc.copying.get_element(self.obj, 0)
+        return plc.copying.get_element(self.obj, 0, stream=stream)
 
     def rename(self, name: str | None, /) -> Self:
         """

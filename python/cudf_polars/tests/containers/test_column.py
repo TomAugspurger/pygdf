@@ -24,7 +24,7 @@ def test_non_scalar_access_raises():
         dtype=dtype,
     )
     with pytest.raises(ValueError):
-        _ = column.obj_scalar
+        _ = column.obj_scalar(stream=get_cuda_stream())
 
 
 def test_check_sorted():
