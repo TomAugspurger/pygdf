@@ -551,9 +551,16 @@ class Scan(IR):
         Each path is repeated according to the number of rows read from it.
         """
         (filepaths,) = plc.filling.repeat(
-            plc.Table([plc.Column.from_arrow(pl.Series(values=map(str, paths)))]),
+            plc.Table(
+                [
+                    plc.Column.from_arrow(
+                        pl.Series(values=map(str, paths)), stream=df.stream
+                    )
+                ]
+            ),
             plc.Column.from_arrow(
-                pl.Series(values=rows_per_path, dtype=pl.datatypes.Int32())
+                pl.Series(values=rows_per_path, dtype=pl.datatypes.Int32()),
+                stream=df.stream,
             ),
             stream=df.stream,
         ).columns()
@@ -2453,6 +2460,7 @@ class Distinct(IR):
                 indices,
                 keep,
                 plc.types.NullEquality.EQUAL,
+                stream=df.stream,
             )
         else:
             distinct = (
@@ -2466,6 +2474,7 @@ class Distinct(IR):
                 keep,
                 plc.types.NullEquality.EQUAL,
                 plc.types.NanEquality.ALL_EQUAL,
+                stream=df.stream,
             )
         # TODO: Is this sortedness setting correct
         result = DataFrame(
@@ -2831,7 +2840,8 @@ class MapFunction(IR):
                         plc.Column.from_arrow(
                             pl.Series(
                                 values=pivotees, dtype=schema[variable_name].polars_type
-                            )
+                            ),
+                            stream=df.stream,
                         )
                     ]
                 ),
