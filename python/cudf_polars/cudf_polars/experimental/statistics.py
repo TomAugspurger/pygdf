@@ -61,8 +61,6 @@ def collect_statistics(
         Root IR node for collecting column statistics.
     config_options
         GPUEngine configuration options.
-    stream
-        CUDA stream used for device memory operations and kernel launches.
 
     Returns
     -------
@@ -617,11 +615,7 @@ def _(
 
 
 @update_column_stats.register(DataFrameScan)
-def _(
-    ir: DataFrameScan,
-    stats: StatsCollector,
-    config_options: ConfigOptions,
-) -> None:
+def _(ir: DataFrameScan, stats: StatsCollector, config_options: ConfigOptions) -> None:
     stream = get_cuda_stream()
     # Use datasource row-count estimate.
     if stats.column_stats[ir]:
@@ -635,9 +629,7 @@ def _(
     for column_stats in stats.column_stats[ir].values():
         if column_stats.source_info.implied_unique_count.value is None:
             # We don't have a unique-count estimate, so we need to sample the data.
-            source_unique_stats = column_stats.source_info.unique_stats(
-                force=False,
-            )
+            source_unique_stats = column_stats.source_info.unique_stats(force=False)
             if source_unique_stats.count.value is not None:
                 column_stats.unique_count = source_unique_stats.count
         else:
@@ -647,11 +639,7 @@ def _(
 
 
 @update_column_stats.register(Scan)
-def _(
-    ir: Scan,
-    stats: StatsCollector,
-    config_options: ConfigOptions,
-) -> None:
+def _(ir: Scan, stats: StatsCollector, config_options: ConfigOptions) -> None:
     # Use datasource row-count estimate.
     if stats.column_stats[ir]:
         stats.row_count[ir] = next(
