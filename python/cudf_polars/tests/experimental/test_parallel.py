@@ -22,6 +22,7 @@ from cudf_polars.experimental.parallel import (
 )
 from cudf_polars.testing.asserts import DEFAULT_CLUSTER, assert_gpu_result_equal
 from cudf_polars.utils.config import ConfigOptions
+from cudf_polars.utils.cuda_stream import get_cuda_stream
 from cudf_polars.utils.versions import POLARS_VERSION_LT_130
 
 
@@ -179,7 +180,10 @@ def test_single_cluster():
     ir = Translator(q._ldf.visit(), engine).translate_ir()
     ir, partition_info = lower_ir_graph(ir, config_options)
     graph, key = task_graph(
-        ir, partition_info, config_options, context=IRExecutionContext()
+        ir,
+        partition_info,
+        config_options,
+        context=IRExecutionContext(new_stream=get_cuda_stream),
     )
     scheduler = get_scheduler(config_options)
     cache = {}
@@ -215,7 +219,10 @@ def test_task_graph_is_pickle_serializable(engine):
     ir = Translator(q._ldf.visit(), engine).translate_ir()
     ir, partition_info = lower_ir_graph(ir, config_options)
     graph, _ = task_graph(
-        ir, partition_info, config_options, context=IRExecutionContext()
+        ir,
+        partition_info,
+        config_options,
+        context=IRExecutionContext(new_stream=get_cuda_stream),
     )
 
     pickle.loads(pickle.dumps(graph))  # no exception

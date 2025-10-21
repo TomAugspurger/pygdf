@@ -101,6 +101,8 @@ class IRExecutionContext:
     during the evaluation of IR nodes.
     """
 
+    new_stream: Callable[[], Stream]
+
 
 _BINOPS = {
     plc.binaryop.BinaryOperator.EQUAL,
@@ -619,7 +621,8 @@ class Scan(IR):
         context: IRExecutionContext,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
-        stream = get_cuda_stream()
+        stream = context.new_stream()
+
         if typ == "csv":
 
             def read_csv_header(
@@ -1297,7 +1300,7 @@ class DataFrameScan(IR):
         """Evaluate and return a dataframe."""
         if projection is not None:
             df = df.select(projection)
-        df = DataFrame.from_polars(df, stream=get_cuda_stream())
+        df = DataFrame.from_polars(df, stream=context.new_stream())
         assert all(
             c.obj.type() == dtype.plc_type
             for c, dtype in zip(df.columns, schema.values(), strict=True)
@@ -1399,7 +1402,7 @@ class Select(IR):
             and self.children[0].typ == "parquet"
             and self.children[0].predicate is None
         ):  # pragma: no cover
-            stream = get_cuda_stream()
+            stream = context.new_stream()
             scan = self.children[0]
             effective_rows = scan.fast_count()
             dtype = DataType(pl.UInt32())
@@ -3112,7 +3115,7 @@ class Empty(IR):
         cls, schema: Schema, *, context: IRExecutionContext
     ) -> DataFrame:  # pragma: no cover
         """Evaluate and return a dataframe."""
-        stream = get_cuda_stream()
+        stream = context.new_stream()
         return DataFrame(
             [
                 Column(

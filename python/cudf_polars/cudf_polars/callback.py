@@ -27,6 +27,7 @@ from cudf_polars.dsl.ir import IRExecutionContext
 from cudf_polars.dsl.tracing import CUDF_POLARS_NVTX_DOMAIN
 from cudf_polars.dsl.translate import Translator
 from cudf_polars.utils.config import _env_get_int, get_total_device_memory
+from cudf_polars.utils.cuda_stream import get_cuda_stream
 from cudf_polars.utils.timer import Timer
 
 if TYPE_CHECKING:
@@ -220,7 +221,9 @@ def _callback(
     if timer is not None:
         assert should_time
 
-    context = IRExecutionContext()
+    context = IRExecutionContext(
+        new_stream=get_cuda_stream,
+    )
 
     with (
         nvtx.annotate(message="ExecuteIR", domain=CUDF_POLARS_NVTX_DOMAIN),

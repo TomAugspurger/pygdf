@@ -41,6 +41,7 @@ try:
     from cudf_polars.experimental.parallel import evaluate_streaming
     from cudf_polars.testing.asserts import assert_gpu_result_equal
     from cudf_polars.utils.config import ConfigOptions
+    from cudf_polars.utils.cuda_stream import get_cuda_stream
 
     CUDF_POLARS_AVAILABLE = True
 except ImportError:
@@ -541,7 +542,7 @@ def execute_query(
             if args.debug:
                 translator = Translator(q._ldf.visit(), engine)
                 ir = translator.translate_ir()
-                context = IRExecutionContext()
+                context = IRExecutionContext(new_stream=get_cuda_stream)
                 if run_config.executor == "in-memory":
                     return ir.evaluate(
                         cache={}, timer=None, context=context

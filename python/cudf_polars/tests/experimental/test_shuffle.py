@@ -15,6 +15,7 @@ from cudf_polars.experimental.parallel import evaluate_streaming, lower_ir_graph
 from cudf_polars.experimental.shuffle import Shuffle
 from cudf_polars.testing.asserts import DEFAULT_CLUSTER
 from cudf_polars.utils.config import ConfigOptions
+from cudf_polars.utils.cuda_stream import get_cuda_stream
 
 
 @pytest.fixture(scope="module", params=["tasks", None])
@@ -69,7 +70,9 @@ def test_hash_shuffle(df: pl.LazyFrame, engine: pl.GPUEngine) -> None:
     assert len([node for node in partition_info if isinstance(node, Shuffle)]) == 2
 
     # Check that streaming evaluation works
-    result = evaluate_streaming(qir3, options, context=IRExecutionContext()).to_polars()
+    result = evaluate_streaming(
+        qir3, options, context=IRExecutionContext(new_stream=get_cuda_stream)
+    ).to_polars()
     # ignore is for polars' EngineType, which isn't publicly exported.
     # https://github.com/pola-rs/polars/issues/17420
     expect = df.collect(engine="cpu")  # type: ignore[call-overload]
