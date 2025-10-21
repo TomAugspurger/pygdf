@@ -34,7 +34,10 @@ if TYPE_CHECKING:
 
 
 def explain_query(
-    q: pl.LazyFrame, engine: pl.GPUEngine, *, physical: bool = True
+    q: pl.LazyFrame,
+    engine: pl.GPUEngine,
+    *,
+    physical: bool = True,
 ) -> str:
     """
     Return a formatted string representation of the IR plan.
@@ -48,6 +51,9 @@ def explain_query(
     physical : bool, default True
         If True, show the physical (lowered) plan.
         If False, show the logical (pre-lowering) plan.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+        By default, a new CUDA stream is used.
 
     Returns
     -------

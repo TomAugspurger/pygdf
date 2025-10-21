@@ -11,7 +11,11 @@ import polars as pl
 
 import pylibcudf as plc
 
+from cudf_polars.utils.cuda_stream import get_cuda_stream
+
 if TYPE_CHECKING:
+    from rmm.pylibrmm.stream import Stream
+
     from cudf_polars.typing import ClosedInterval, Duration
 
 
@@ -75,7 +79,7 @@ def duration_to_int(
     return -value if negative else value
 
 
-def duration_to_scalar(dtype: plc.DataType, value: int) -> plc.Scalar:
+def duration_to_scalar(dtype: plc.DataType, value: int, stream: Stream) -> plc.Scalar:
     """
     Convert a raw polars duration value to a pylibcudf scalar.
 
@@ -86,6 +90,9 @@ def duration_to_scalar(dtype: plc.DataType, value: int) -> plc.Scalar:
     value
         The raw value as in integer. If `dtype` represents a timestamp
         type, this should be in nanoseconds.
+    stream
+        CUDA stream used for device memory operations and kernel launches
+        on this dataframe. The returned scalar will be valid on this stream.
 
     Returns
     -------
@@ -99,20 +106,28 @@ def duration_to_scalar(dtype: plc.DataType, value: int) -> plc.Scalar:
     """
     tid = dtype.id()
     if tid == plc.TypeId.INT64:
-        return plc.Scalar.from_py(value, dtype)
+        return plc.Scalar.from_py(value, dtype, stream=stream)
     elif tid == plc.TypeId.TIMESTAMP_NANOSECONDS:
-        return plc.Scalar.from_py(value, plc.DataType(plc.TypeId.DURATION_NANOSECONDS))
+        return plc.Scalar.from_py(
+            value, plc.DataType(plc.TypeId.DURATION_NANOSECONDS), stream=stream
+        )
     elif tid == plc.TypeId.TIMESTAMP_MICROSECONDS:
         return plc.Scalar.from_py(
-            value // 1000, plc.DataType(plc.TypeId.DURATION_MICROSECONDS)
+            value // 1000,
+            plc.DataType(plc.TypeId.DURATION_MICROSECONDS),
+            stream=stream,
         )
     elif tid == plc.TypeId.TIMESTAMP_MILLISECONDS:
         return plc.Scalar.from_py(
-            value // 1_000_000, plc.DataType(plc.TypeId.DURATION_MILLISECONDS)
+            value // 1_000_000,
+            plc.DataType(plc.TypeId.DURATION_MILLISECONDS),
+            stream=stream,
         )
     elif tid == plc.TypeId.TIMESTAMP_DAYS:
         return plc.Scalar.from_py(
-            value // 86_400_000_000_000, plc.DataType(plc.TypeId.DURATION_DAYS)
+            value // 86_400_000_000_000,
+            plc.DataType(plc.TypeId.DURATION_DAYS),
+            stream=stream,
         )
     else:
         raise NotImplementedError(
@@ -140,14 +155,23 @@ def offsets_to_windows(
     Returns
     -------
     tuple of preceding and following windows as pylibcudf scalars.
+
+    Notes
+    -----
+    The returned scalars are constructed on a new stream, which is
+    synchronized before being returned.
     """
     offset_i = duration_to_int(dtype, *offset)
     period_i = duration_to_int(dtype, *period)
     # Polars uses current_row + offset, ..., current_row + offset + period
     # Libcudf uses current_row - preceding, ..., current_row + following
-    return duration_to_scalar(dtype, -offset_i), duration_to_scalar(
-        dtype, offset_i + period_i
+    stream = get_cuda_stream()
+    result = (
+        duration_to_scalar(dtype, -offset_i, stream=stream),
+        duration_to_scalar(dtype, offset_i + period_i, stream=stream),
     )
+    stream.synchronize()
+    return result
 
 
 def range_window_bounds(

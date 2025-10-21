@@ -121,7 +121,10 @@ class DataSourceInfo:
         """Data source row-count estimate."""
         raise NotImplementedError("Sub-class must implement row_count.")
 
-    def unique_stats(self, column: str) -> UniqueStats:  # pragma: no cover
+    def unique_stats(
+        self,
+        column: str,
+    ) -> UniqueStats:  # pragma: no cover
         """Return unique-value statistics for a column."""
         raise NotImplementedError("Sub-class must implement unique_stats.")
 
@@ -207,6 +210,8 @@ class ColumnSourceInfo:
         force
             If True, return unique-value statistics even if the column
             wasn't marked as needing unique-value information.
+        stream
+            CUDA stream used for device memory operations and kernel launches.
         """
         if (force or self.is_unique_stats_column) and len(self.table_source_pairs) == 1:
             # Single table source.
