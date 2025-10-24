@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from rmm.pylibrmm.stream import DEFAULT_STREAM
+from rmm.pylibrmm.stream import DEFAULT_STREAM, Stream
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -22,7 +22,7 @@ def get_dask_cuda_stream() -> Stream:
 
 def get_cuda_stream() -> Stream:
     """Get the default CUDA stream for the current thread."""
-    return DEFAULT_STREAM
+    return Stream()
 
 
 def join_cuda_streams(

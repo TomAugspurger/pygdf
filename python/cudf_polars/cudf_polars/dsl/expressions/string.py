@@ -190,6 +190,7 @@ class StringFunction(Expr):
                         "Regex contains only supports a scalar pattern"
                     )
                 pattern = self.children[1].value
+                # breakpoint()
                 self._regex_program = self._create_regex_program(pattern)
         elif self.name is StringFunction.Name.Extract:
             (group_index,) = self.options
@@ -446,8 +447,10 @@ class StringFunction(Expr):
                 )
 
         elif self.name is StringFunction.Name.Contains:
+            import nvtx
             child, arg = self.children
-            column = child.evaluate(df, context=context)
+            with nvtx.annotate("child.evaluate"):
+                column = child.evaluate(df, context=context)
 
             literal, _ = self.options
             if literal:
@@ -462,12 +465,13 @@ class StringFunction(Expr):
                     dtype=self.dtype,
                 )
             else:
-                return Column(
-                    plc.strings.contains.contains_re(
-                        column.obj, self._regex_program, stream=df.stream
-                    ),
-                    dtype=self.dtype,
-                )
+                with nvtx.annotate("contains_re"):
+                    return Column(
+                        plc.strings.contains.contains_re(
+                            column.obj, self._regex_program, stream=df.stream
+                        ),
+                        dtype=self.dtype,
+                    )
         elif self.name is StringFunction.Name.ContainsAny:
             (ascii_case_insensitive,) = self.options
             child, arg = self.children

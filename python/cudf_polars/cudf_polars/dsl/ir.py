@@ -854,10 +854,15 @@ class Scan(IR):
         if predicate is None:
             return df
         else:
-            (mask,) = broadcast(
-                predicate.evaluate(df), target_length=df.num_rows, stream=df.stream
-            )
-            return df.filter(mask)
+            import nvtx
+            with nvtx.annotate("evaluate"):
+                p2 = predicate.evaluate(df)
+            with nvtx.annotate("broadcast"):
+                (mask,) = broadcast(
+                    p2, target_length=df.num_rows, stream=df.stream
+                )
+            with nvtx.annotate("filter"):
+                return df.filter(mask)
 
 
 class Sink(IR):
