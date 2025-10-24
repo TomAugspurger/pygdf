@@ -39,6 +39,7 @@ from cudf_polars.dsl.to_ast import to_ast, to_parquet_filter
 from cudf_polars.dsl.tracing import log_do_evaluate, nvtx_annotate_cudf_polars
 from cudf_polars.dsl.utils.reshape import broadcast
 from cudf_polars.dsl.utils.windows import (
+    offsets_to_windows,
     range_window_bounds,
 )
 from cudf_polars.utils import dtypes
@@ -1464,17 +1465,19 @@ class Rolling(IR):
     __slots__ = (
         "agg_requests",
         "closed_window",
-        "following",
+        "following_ordinal",
         "index",
+        "index_dtype",
         "keys",
-        "preceding",
+        "preceding_ordinal",
         "zlice",
     )
     _non_child = (
         "schema",
         "index",
-        "preceding",
-        "following",
+        "index_dtype",
+        "preceding_ordinal",
+        "following_ordinal",
         "closed_window",
         "keys",
         "agg_requests",
@@ -1482,10 +1485,12 @@ class Rolling(IR):
     )
     index: expr.NamedExpr
     """Column being rolled over."""
-    preceding: plc.Scalar
-    """Preceding window extent defining start of window."""
-    following: plc.Scalar
-    """Following window extent defining end of window."""
+    index_dtype: plc.DataType
+    """Datatype of the index column."""
+    preceding_ordinal: int
+    """Preceding window extent defining start of window as a host integer."""
+    following_ordinal: int
+    """Following window extent defining end of window as a host integer."""
     closed_window: ClosedInterval
     """Treatment of window endpoints."""
     keys: tuple[expr.NamedExpr, ...]
@@ -1499,8 +1504,9 @@ class Rolling(IR):
         self,
         schema: Schema,
         index: expr.NamedExpr,
-        preceding: plc.Scalar,
-        following: plc.Scalar,
+        index_dtype: plc.DataType,
+        preceding_ordinal: int,
+        following_ordinal: int,
         closed_window: ClosedInterval,
         keys: Sequence[expr.NamedExpr],
         agg_requests: Sequence[expr.NamedExpr],
@@ -1509,8 +1515,9 @@ class Rolling(IR):
     ):
         self.schema = schema
         self.index = index
-        self.preceding = preceding
-        self.following = following
+        self.index_dtype = index_dtype
+        self.preceding_ordinal = preceding_ordinal
+        self.following_ordinal = following_ordinal
         self.closed_window = closed_window
         self.keys = tuple(keys)
         self.agg_requests = tuple(agg_requests)
@@ -1533,8 +1540,9 @@ class Rolling(IR):
         self.children = (df,)
         self._non_child_args = (
             index,
-            preceding,
-            following,
+            index_dtype,
+            preceding_ordinal,
+            following_ordinal,
             closed_window,
             keys,
             agg_requests,
@@ -1547,8 +1555,9 @@ class Rolling(IR):
     def do_evaluate(
         cls,
         index: expr.NamedExpr,
-        preceding: plc.Scalar,
-        following: plc.Scalar,
+        index_dtype: plc.DataType,
+        preceding_ordinal: int,
+        following_ordinal: int,
         closed_window: ClosedInterval,
         keys_in: Sequence[expr.NamedExpr],
         aggs: Sequence[expr.NamedExpr],
@@ -1574,8 +1583,13 @@ class Rolling(IR):
             )
         else:
             orderby_obj = orderby.obj
+
+        preceding_scalar, following_scalar = offsets_to_windows(
+            index_dtype, preceding_ordinal, following_ordinal, stream=df.stream
+        )
+
         preceding_window, following_window = range_window_bounds(
-            preceding, following, closed_window
+            preceding_scalar, following_scalar, closed_window
         )
         if orderby.obj.null_count() != 0:
             raise RuntimeError(
@@ -1903,22 +1917,35 @@ class ConditionalJoin(IR):
         """Serializable wrapper for a predicate expression."""
 
         predicate: expr.Expr
-        ast: plc.expressions.Expression
 
         def __init__(self, predicate: expr.Expr):
             self.predicate = predicate
-            stream = get_cuda_stream()
-            ast_result = to_ast(predicate, stream=stream)
-            stream.synchronize()
-            if ast_result is None:
-                raise NotImplementedError(
-                    f"Conditional join with predicate {predicate}"
-                )  # pragma: no cover; polars never delivers expressions we can't handle
-            self.ast = ast_result
 
         def __reduce__(self) -> tuple[Any, ...]:
             """Pickle a Predicate object."""
             return (type(self), (self.predicate,))
+
+        def ast(self, stream: Stream) -> plc.expressions.Expression:
+            """
+            Convert ``self.predicate`` to libcudf AST nodes suitable for conditional join.
+
+            Parameters
+            ----------
+            stream
+                CUDA stream used for device memory operations and kernel launches.
+
+            Returns
+            -------
+            plc.expressions.Expression
+                A pylibcudf AST expression representing the predicate.
+            """
+            stream = get_cuda_stream()
+            ast_result = to_ast(self.predicate, stream=stream)
+            if ast_result is None:
+                raise NotImplementedError(
+                    f"Conditional join with predicate {self.predicate}"
+                )  # pragma: no cover; polars never delivers expressions we can't handle
+            return ast_result
 
     __slots__ = ("ast_predicate", "options", "predicate")
     _non_child = ("schema", "predicate", "options")
@@ -1995,7 +2022,7 @@ class ConditionalJoin(IR):
         lg, rg = plc.join.conditional_inner_join(
             _apply_casts(left, left_casts).table,
             _apply_casts(right, right_casts).table,
-            predicate_wrapper.ast,
+            predicate_wrapper.ast(stream),
             stream=stream,
         )
         left = DataFrame.from_table(
