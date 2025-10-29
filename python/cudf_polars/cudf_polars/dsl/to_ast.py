@@ -102,10 +102,15 @@ class ASTState(TypedDict):
     for_parquet
         Indicator for whether this transformation should provide an expression
         suitable for use in parquet filters.
+    stream
+        CUDA stream used for device memory operations and kernel launches.
+    validate_only
+        If True, only validate the expression, don't convert it to an AST.
     """
 
     for_parquet: bool
-    stream: Stream
+    stream: Stream | None
+    validate_only: bool
 
 
 class ExprTransformerState(TypedDict):
@@ -173,6 +178,8 @@ def _(node: expr.ColRef, self: Transformer) -> plc_expr.Expression:
 
 @_to_ast.register
 def _(node: expr.Literal, self: Transformer) -> plc_expr.Expression:
+    if self.state["validate_only"]:
+        return None
     return plc_expr.Literal(
         plc.Scalar.from_py(node.value, node.dtype.plc_type, stream=self.state["stream"])
     )
@@ -232,19 +239,25 @@ def _(node: expr.BooleanFunction, self: Transformer) -> plc_expr.Expression:
                 plc_dtype = DataType(haystack.dtype.polars_type.inner).plc_type
             else:
                 plc_dtype = haystack.dtype.plc_type  # pragma: no cover
-            values = (
-                plc_expr.Literal(
-                    plc.Scalar.from_py(val, plc_dtype, stream=self.state["stream"])
+            if self.state["validate_only"]:
+                return None
+
+            else:
+                values = (
+                    plc_expr.Literal(
+                        plc.Scalar.from_py(val, plc_dtype, stream=self.state["stream"])
+                    )
+                    for val in haystack.value
                 )
-                for val in haystack.value
-            )
-            return reduce(
-                partial(plc_expr.Operation, plc_expr.ASTOperator.LOGICAL_OR),
-                (
-                    plc_expr.Operation(plc_expr.ASTOperator.EQUAL, needle_ref, value)
-                    for value in values
-                ),
-            )
+                return reduce(
+                    partial(plc_expr.Operation, plc_expr.ASTOperator.LOGICAL_OR),
+                    (
+                        plc_expr.Operation(
+                            plc_expr.ASTOperator.EQUAL, needle_ref, value
+                        )
+                        for value in values
+                    ),
+                )
     if self.state["for_parquet"] and isinstance(node.children[0], expr.Col):
         raise NotImplementedError(
             f"Parquet filters don't support {node.name} on columns"
@@ -288,7 +301,7 @@ def to_parquet_filter(node: expr.Expr, stream: Stream) -> plc_expr.Expression | 
     pylibcudf Expression if conversion is possible, otherwise None.
     """
     mapper: Transformer = CachingVisitor(
-        _to_ast, state={"for_parquet": True, "stream": stream}
+        _to_ast, state={"for_parquet": True, "stream": stream, "validate_only": False}
     )
     try:
         return mapper(node)
@@ -296,7 +309,9 @@ def to_parquet_filter(node: expr.Expr, stream: Stream) -> plc_expr.Expression | 
         return None
 
 
-def to_ast(node: expr.Expr, stream: Stream) -> plc_expr.Expression | None:
+def to_ast(
+    node: expr.Expr, stream: Stream, validate_only: bool = False
+) -> plc_expr.Expression | None:
     """
     Convert an expression to libcudf AST nodes suitable for compute_column.
 
@@ -306,6 +321,8 @@ def to_ast(node: expr.Expr, stream: Stream) -> plc_expr.Expression | None:
         Expression to convert.
     stream
         CUDA stream used for device memory operations and kernel launches.
+    validate_only
+        If True, only validate the expression, don't convert it to an AST.
 
     Notes
     -----
@@ -318,12 +335,16 @@ def to_ast(node: expr.Expr, stream: Stream) -> plc_expr.Expression | None:
     pylibcudf Expression if conversion is possible, otherwise None.
     """
     mapper: Transformer = CachingVisitor(
-        _to_ast, state={"for_parquet": False, "stream": stream}
+        _to_ast,
+        state={"for_parquet": False, "stream": stream, "validate_only": validate_only},
     )
     try:
         return mapper(node)
     except (KeyError, NotImplementedError):
-        return None
+        if validate_only:
+            raise
+        else:
+            return None
 
 
 def _insert_colrefs(node: expr.Expr, rec: ExprTransformer) -> expr.Expr:
