@@ -103,6 +103,15 @@ class Record:
 
 
 @dataclasses.dataclass
+class QueryPlan:
+    """A query plan."""
+
+    query: int
+    logical_plan: str | None
+    physical_plan: str | None
+
+
+@dataclasses.dataclass
 class VersionInfo:
     """Information about the commit of the software used to run the query."""
 
@@ -236,6 +245,7 @@ class RunConfig:
         default_factory=PackageVersions.collect
     )
     records: dict[int, list[Record]] = dataclasses.field(default_factory=dict)
+    plans: list[QueryPlan] = dataclasses.field(default_factory=list)
     dataset_path: Path
     scale_factor: int | float
     shuffle: Literal["rapidsmpf", "tasks"] | None = None
@@ -470,27 +480,36 @@ def print_query_plan(
     args: argparse.Namespace,
     run_config: RunConfig,
     engine: None | pl.GPUEngine = None,
-) -> None:
+    *,
+    print_plans: bool = True,
+) -> tuple[str | None, str | None]:
     """Print the query plan."""
+    logical_plan = plan = None
     if run_config.executor == "cpu":
         if args.explain_logical:
-            print(f"\nQuery {q_id} - Logical plan\n")
-            print(q.explain())
+            logical_plan = q.explain()
         if args.explain:
-            print(f"\nQuery {q_id} - Physical plan\n")
-            print(q.show_graph(engine="streaming", plan_stage="physical"))
+            plan = q.show_graph(engine="streaming", plan_stage="physical")
     elif CUDF_POLARS_AVAILABLE:
         assert isinstance(engine, pl.GPUEngine)
         if args.explain_logical:
-            print(f"\nQuery {q_id} - Logical plan\n")
-            print(explain_query(q, engine, physical=False))
+            logical_plan = explain_query(q, engine, physical=False)
         if args.explain and run_config.executor == "streaming":
-            print(f"\nQuery {q_id} - Physical plan\n")
-            print(explain_query(q, engine))
+            plan = explain_query(q, engine)
     else:
         raise RuntimeError(
             "Cannot provide the logical or physical plan because cudf_polars is not installed."
         )
+
+    if print_plans:
+        if logical_plan:
+            print(f"\nQuery {q_id} - Logical plan\n")
+            print(logical_plan)
+        if plan:
+            print(f"\nQuery {q_id} - Physical plan\n")
+            print(plan)
+
+    return logical_plan, plan
 
 
 def initialize_dask_cluster(run_config: RunConfig, args: argparse.Namespace):  # type: ignore[no-untyped-def]
@@ -846,6 +865,12 @@ def parse_args(
         default=False,
     )
     parser.add_argument(
+        "--print-plans",
+        action=argparse.BooleanOptionalAction,
+        help="Print the query plans",
+        default=True,
+    )
+    parser.add_argument(
         "--validate",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -896,6 +921,7 @@ def run_polars(
     client = initialize_dask_cluster(run_config, args)
 
     records: defaultdict[int, list[Record]] = defaultdict(list)
+    plans: list[QueryPlan] = []
     engine: pl.GPUEngine | None = None
 
     if run_config.executor != "cpu":
@@ -916,7 +942,13 @@ def run_polars(
         except AttributeError as err:
             raise NotImplementedError(f"Query {q_id} not implemented.") from err
 
-        print_query_plan(q_id, q, args, run_config, engine)
+        logical_plan, plan = print_query_plan(
+            q_id, q, args, run_config, engine, print_plans=args.print_plans
+        )
+        if logical_plan or plan:
+            plans.append(
+                QueryPlan(query=q_id, logical_plan=logical_plan, physical_plan=plan)
+            )
 
         records[q_id] = []
         for i in range(args.iterations):
@@ -971,7 +1003,7 @@ def run_polars(
             )
             records[q_id].append(record)
 
-    run_config = dataclasses.replace(run_config, records=dict(records))
+    run_config = dataclasses.replace(run_config, records=dict(records), plans=plans)
 
     # consolidate logs
     if _HAS_STRUCTLOG and run_config.collect_traces:
