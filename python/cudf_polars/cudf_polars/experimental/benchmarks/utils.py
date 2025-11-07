@@ -266,6 +266,7 @@ class RunConfig:
     query_set: str
     collect_traces: bool = False
     stats_planning: bool
+    nsys_profile: str | None = None
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.gather_shuffle_stats and self.shuffle != "rapidsmpf":
@@ -373,6 +374,7 @@ class RunConfig:
             query_set=args.query_set,
             collect_traces=args.collect_traces,
             stats_planning=args.stats_planning,
+            nsys_profile=args.nsys_profile,
         )
 
     def serialize(self, engine: pl.GPUEngine | None) -> dict:
@@ -382,6 +384,8 @@ class RunConfig:
         if engine is not None:
             config_options = ConfigOptions.from_polars_engine(engine)
             result["config_options"] = dataclasses.asdict(config_options)
+        if self.nsys_profile is None:
+            del result["nsys_profile"]
         return result
 
     def summarize(self) -> None:
@@ -895,6 +899,12 @@ def parse_args(
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable statistics planning.",
+    )
+    parser.add_argument(
+        "--nsys-profile",
+        type=str,
+        default=None,
+        help="Optional path where the nsys profile will be saved.",
     )
 
     parsed_args = parser.parse_args(args)
