@@ -120,6 +120,8 @@ def evaluate_logical_plan(
     result = df.to_polars()
     stream.synchronize()
 
+    del nodes, output, messages, chunks, dfs, df, stream
+
     return result
 
 
