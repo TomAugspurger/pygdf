@@ -38,6 +38,7 @@ from cudf_polars.experimental.io import _clear_source_info_cache
 from cudf_polars.experimental.repartition import Repartition
 from cudf_polars.experimental.statistics import collect_statistics
 from cudf_polars.experimental.utils import _concat, _contains_over, _lower_ir_fallback
+from cudf_polars.utils.config import CUDAStreamPoolConfig
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
@@ -243,9 +244,57 @@ def evaluate_rapidsmpf(
     -------
     A cudf-polars DataFrame object.
     """
+    from rapidsmpf.buffer.buffer import MemoryType
+    from rapidsmpf.buffer.resource import BufferResource, LimitAvailableMemory
+    from rapidsmpf.communicator.single import new_communicator
+    from rapidsmpf.config import Options, get_environment_variables
+    from rapidsmpf.rmm_resource_adaptor import RmmResourceAdaptor
+    from rapidsmpf.streaming.core.context import Context
+
+    import rmm.mr
+
     from cudf_polars.experimental.rapidsmpf.core import evaluate_logical_plan
 
-    return evaluate_logical_plan(ir, config_options)
+    # Configure the context.
+    # TODO: Multi-GPU version will be different. The rest of this function
+    #       will be executed on each rank independently.
+    # TODO: Need a way to configure options specific to the rapidmspf engine.
+    options = Options(get_environment_variables())
+    comm = new_communicator(options)
+    mr = RmmResourceAdaptor(rmm.mr.get_current_device_resource())
+    rmm.mr.set_current_device_resource(mr)
+    memory_available: MutableMapping[MemoryType, LimitAvailableMemory] | None = None
+    assert config_options.executor.name == "streaming", "Executor must be streaming"
+    single_spill_device = config_options.executor.client_device_threshold
+    if single_spill_device > 0.0 and single_spill_device < 1.0:
+        total_memory = rmm.mr.available_device_memory()[1]
+        memory_available = {
+            MemoryType.DEVICE: LimitAvailableMemory(
+                mr, limit=int(total_memory * single_spill_device)
+            )
+        }
+
+    # We have a couple of cases to consider here:
+    # 1: we want to use the same stream pool for cudf-polars and rapidsmpf
+    # 2: rapidsmpf uses its own pool and cudf-polars uses the default stream
+    if isinstance(config_options.cuda_stream_policy, CUDAStreamPoolConfig):
+        stream_pool = config_options.cuda_stream_policy.build()
+    else:
+        stream_pool = None
+
+    br = BufferResource(mr, memory_available=memory_available, stream_pool=stream_pool)
+    rmpf_context = Context(comm, br, options)
+
+    # Create the IR execution context.
+    if stream_pool is not None:
+        # both cudf-polars and rapidsmpf are using the same stream pool
+        ir_context = IRExecutionContext(
+            get_cuda_stream=rmpf_context.get_stream_from_pool
+        )
+    else:
+        ir_context = IRExecutionContext.from_config_options(config_options)
+
+    return evaluate_logical_plan(ir, config_options, rmpf_context, ir_context)
 
 
 def evaluate_streaming(
