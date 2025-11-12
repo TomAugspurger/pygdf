@@ -114,8 +114,8 @@ def evaluate_logical_plan(
     else:
         stream_pool = None
 
-    br = BufferResource(mr, memory_available=memory_available, stream_pool=stream_pool)
     stats = Statistics(enable=True, mr=mr)
+    br = BufferResource(mr, memory_available=memory_available, stream_pool=stream_pool, statistics=stats)
     rmpf_context = Context(comm, br, options, statistics=stats)
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpse")
