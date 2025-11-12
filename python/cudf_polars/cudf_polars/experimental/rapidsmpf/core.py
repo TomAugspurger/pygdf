@@ -15,6 +15,7 @@ from rapidsmpf.config import Options, get_environment_variables
 from rapidsmpf.rmm_resource_adaptor import RmmResourceAdaptor
 from rapidsmpf.streaming.core.context import Context
 from rapidsmpf.streaming.core.leaf_node import pull_from_channel
+from rapidsmpf.statistics import Statistics
 from rapidsmpf.streaming.core.node import (
     run_streaming_pipeline,
 )
@@ -114,7 +115,8 @@ def evaluate_logical_plan(
         stream_pool = None
 
     br = BufferResource(mr, memory_available=memory_available, stream_pool=stream_pool)
-    rmpf_context = Context(comm, br, options)
+    stats = Statistics(enable=True, mr=mr)
+    rmpf_context = Context(comm, br, options, statistics=stats)
 
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="cpse")
 
@@ -168,6 +170,7 @@ def evaluate_logical_plan(
     # Now we need to drop *all* GPU data. This ensures that no cudaFreeAsync runs
     # before the Context, which ultimately contains the rmm MR, goes out of scope.
     del nodes, output, messages, chunks, dfs, df
+    print(stats.report())
 
     return result
 
