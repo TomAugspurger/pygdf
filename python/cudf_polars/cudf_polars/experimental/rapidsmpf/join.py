@@ -79,7 +79,7 @@ async def broadcast_join_node(
     target_partition_size
         The target partition size in bytes.
     """
-    async with shutdown_on_error(context, ch_left, ch_right, ch_out):
+    async with shutdown_on_error(context, ir, ch_left, ch_right, ch_out):
         # Receive metadata.
         left_metadata, right_metadata = await asyncio.gather(
             recv_metadata(ch_left, context),

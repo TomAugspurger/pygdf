@@ -23,6 +23,7 @@ from cudf_polars.dsl.ir import (
     _parquet_physical_types,
 )
 from cudf_polars.dsl.to_ast import to_parquet_filter
+from cudf_polars.dsl.tracing import bound_contextvars
 from cudf_polars.experimental.base import (
     IOPartitionFlavor,
     IOPartitionPlan,
@@ -166,7 +167,7 @@ async def dataframescan_node(
         Estimated size of each chunk in bytes. Used for memory reservation
         with block spilling to avoid thrashing.
     """
-    async with shutdown_on_error(context, ch_out):
+    async with shutdown_on_error(context, ir, ch_out):
         # Find local partition count.
         nrows = ir.df.shape()[0]
         global_count = math.ceil(nrows / rows_per_partition) if nrows > 0 else 0
@@ -342,7 +343,10 @@ async def read_chunk(
         Estimated size of the chunk in bytes. Used for memory reservation
         with block spilling to avoid thrashing.
     """
-    with opaque_reservation(context, estimated_chunk_bytes):
+    with (
+        opaque_reservation(context, estimated_chunk_bytes),
+        bound_contextvars(sequence_number=seq_num),
+    ):
         df = await asyncio.to_thread(
             scan.do_evaluate,
             *scan._non_child_args,
@@ -396,7 +400,8 @@ async def scan_node(
         Estimated size of each chunk in bytes. Used for memory reservation
         with block spilling to avoid thrashing.
     """
-    async with shutdown_on_error(context, ch_out):
+    # TODO: figure out how this integrates with tracing.
+    async with shutdown_on_error(context, ir, ch_out):
         # Build a list of local Scan operations
         scans: list[Scan | SplitScan] = []
         if plan.flavor == IOPartitionFlavor.SPLIT_FILES:

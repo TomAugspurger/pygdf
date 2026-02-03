@@ -1,10 +1,11 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
 """Utilities for tracing and monitoring IR execution."""
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 import time
@@ -21,6 +22,7 @@ from cudf_polars.utils.config import _bool_converter, get_device_handle
 
 try:
     import structlog
+    import structlog.contextvars
 except ImportError:
     _HAS_STRUCTLOG = False
 else:
@@ -44,7 +46,7 @@ nvtx_annotate_cudf_polars = functools.partial(
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Generator, Sequence
 
     import cudf_polars.containers
     from cudf_polars.dsl import ir
@@ -208,3 +210,18 @@ def log_do_evaluate(
             return result
 
         return wrapper
+
+
+@contextlib.contextmanager
+def bound_contextvars(**kwargs: Any) -> Generator[None, None, None]:
+    """
+    Bind context variables for tracing, when tracing is enabled.
+
+    Parameters
+    ----------
+    kwargs
+        The context variables to bind for the duration of the context manager.
+    """
+    if LOG_TRACES and _HAS_STRUCTLOG:
+        with structlog.contextvars.bound_contextvars(**kwargs):
+            yield

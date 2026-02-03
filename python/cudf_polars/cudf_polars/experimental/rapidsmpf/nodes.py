@@ -16,6 +16,7 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Cache, Empty, Filter, Projection
+from cudf_polars.dsl.tracing import bound_contextvars
 from cudf_polars.experimental.rapidsmpf.dispatch import (
     generate_ir_sub_network,
 )
@@ -71,7 +72,7 @@ async def default_node_single(
     -----
     Chunks are processed in the order they are received.
     """
-    async with shutdown_on_error(context, ch_in, ch_out):
+    async with shutdown_on_error(context, ir, ch_in, ch_out):
         # Recv/send metadata.
         metadata_in = await recv_metadata(ch_in, context)
         partitioning = None
@@ -111,7 +112,10 @@ async def default_node_single(
             del msg
 
             input_bytes = chunk.data_alloc_size(MemoryType.DEVICE)
-            with opaque_reservation(context, input_bytes):
+            with (
+                opaque_reservation(context, input_bytes),
+                bound_contextvars(duplicated=metadata_in.duplicated),
+            ):
                 df = await asyncio.to_thread(
                     ir.do_evaluate,
                     *ir._non_child_args,
@@ -166,7 +170,7 @@ async def default_node_multi(
         Index of the input channel to preserve partitioning information for.
         If None, no partitioning information is preserved.
     """
-    async with shutdown_on_error(context, *chs_in, ch_out):
+    async with shutdown_on_error(context, ir, *chs_in, ch_out):
         # Merge and forward basic metadata.
         local_count = 1
         duplicated = True
@@ -246,7 +250,10 @@ async def default_node_multi(
                 chunk.data_alloc_size(MemoryType.DEVICE)
                 for chunk in cast(list[TableChunk], ready_chunks)
             )
-            with opaque_reservation(context, input_bytes):
+            with (
+                opaque_reservation(context, input_bytes),
+                bound_contextvars(duplicated=duplicated),
+            ):
                 df = await asyncio.to_thread(
                     ir.do_evaluate,
                     *ir._non_child_args,
@@ -295,7 +302,7 @@ async def fanout_node_bounded(
     """
     # TODO: Use rapidsmpf fanout node once available.
     # See: https://github.com/rapidsai/rapidsmpf/issues/560
-    async with shutdown_on_error(context, ch_in, *chs_out):
+    async with shutdown_on_error(context, None, ch_in, *chs_out):
         # Forward metadata to all outputs.
         metadata = await recv_metadata(ch_in, context)
         await asyncio.gather(*(send_metadata(ch, context, metadata) for ch in chs_out))
@@ -354,7 +361,7 @@ async def fanout_node_unbounded(
     """
     # TODO: Use rapidsmpf fanout node once available.
     # See: https://github.com/rapidsai/rapidsmpf/issues/560
-    async with shutdown_on_error(context, ch_in, *chs_out):
+    async with shutdown_on_error(context, None, ch_in, *chs_out):
         # Forward metadata to all outputs.
         metadata = await recv_metadata(ch_in, context)
         await asyncio.gather(*(send_metadata(ch, context, metadata) for ch in chs_out))
@@ -587,7 +594,7 @@ async def empty_node(
     ch_out
         The output Channel[TableChunk].
     """
-    async with shutdown_on_error(context, ch_out):
+    async with shutdown_on_error(context, ir, ch_out):
         # Send metadata indicating a single empty chunk
         await send_metadata(
             ch_out,
@@ -688,7 +695,10 @@ async def metadata_feeder_node(
     metadata
         The metadata to add to the output channel.
     """
-    async with shutdown_on_error(context, ch_in, ch_out):
+    # TODO: figure out how this works.
+    # There isn't an IR.do_evaluate call here.
+    # Possibly related to "native" nodes for parquet?
+    async with shutdown_on_error(context, None, ch_in, ch_out):
         await send_metadata(ch_out, context, metadata)
         while (msg := await ch_in.recv(context)) is not None:
             await ch_out.send(context, msg)
@@ -724,7 +734,7 @@ async def metadata_drain_node(
         This list will be mutated when the network is executed.
         If None, metadata will not be collected.
     """
-    async with shutdown_on_error(context, ch_in, ch_out):
+    async with shutdown_on_error(context, ir, ch_in, ch_out):
         # Drain metadata channel (we don't need it after this point)
         metadata = await recv_metadata(ch_in, context)
         send_empty = metadata.duplicated and context.comm().rank != 0

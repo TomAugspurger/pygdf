@@ -162,7 +162,7 @@ async def shuffle_node(
     collective_id
         The collective ID.
     """
-    async with shutdown_on_error(context, ch_in, ch_out):
+    async with shutdown_on_error(context, ir, ch_in, ch_out):
         # Receive and send updated metadata.
         _ = await recv_metadata(ch_in, context)
         output_metadata = ChannelMetadata(

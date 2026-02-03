@@ -14,6 +14,7 @@ from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 from cudf_polars.containers import DataFrame
+from cudf_polars.dsl.tracing import bound_contextvars
 from cudf_polars.experimental.rapidsmpf.collectives.allgather import AllGatherManager
 from cudf_polars.experimental.rapidsmpf.dispatch import generate_ir_sub_network
 from cudf_polars.experimental.rapidsmpf.nodes import shutdown_on_error
@@ -76,7 +77,7 @@ async def concatenate_node(
     collective_id
         Pre-allocated collective ID for this operation.
     """
-    async with shutdown_on_error(context, ch_in, ch_out):
+    async with shutdown_on_error(context, ir, ch_in, ch_out):
         # Receive metadata.
         input_metadata = await recv_metadata(ch_in, context)
         nranks = context.comm().nranks
@@ -188,7 +189,13 @@ async def concatenate_node(
                     input_bytes = sum(
                         chunk.data_alloc_size(MemoryType.DEVICE) for chunk in chunks
                     )
-                    with opaque_reservation(context, input_bytes):
+                    with (
+                        opaque_reservation(context, input_bytes),
+                        bound_contextvars(
+                            duplicated=output_duplicated, sequence_number=seq_num
+                        ),
+                    ):
+                        # this calls Union.do_evaluate, which will emit a log
                         df = _concat(
                             *(
                                 DataFrame.from_table(

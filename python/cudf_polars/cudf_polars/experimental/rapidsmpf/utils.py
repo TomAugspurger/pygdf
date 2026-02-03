@@ -21,6 +21,7 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 import pylibcudf as plc
 
 from cudf_polars.containers import DataFrame
+from cudf_polars.dsl.tracing import bound_contextvars
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Iterator, Mapping
@@ -37,9 +38,16 @@ if TYPE_CHECKING:
     from cudf_polars.typing import DataType
 
 
+try:
+    import structlog
+    import structlog.contextvars
+except ImportError:
+    structlog = None
+
+
 @asynccontextmanager
 async def shutdown_on_error(
-    context: Context, *channels: Channel[Any]
+    context: Context, ir: IR | None, *channels: Channel[Any]
 ) -> AsyncIterator[None]:
     """
     Shutdown on error for rapidsmpf.
@@ -48,15 +56,23 @@ async def shutdown_on_error(
     ----------
     context
         The rapidsmpf context.
+    ir
+        The ir node.
     channels
         The channels to shutdown.
     """
     # TODO: This probably belongs in rapidsmpf.
-    try:
-        yield
-    except BaseException:
-        await asyncio.gather(*(ch.shutdown(context) for ch in channels))
-        raise
+    # assert isinstance(ir, IR), f"Expected IR, got {type(ir)}."
+    if ir is not None:
+        kwargs = {"ir_id": ir.get_stable_id()}
+    else:
+        kwargs = {}
+    with bound_contextvars(**kwargs):
+        try:
+            yield
+        except BaseException:
+            await asyncio.gather(*(ch.shutdown(context) for ch in channels))
+            raise
 
 
 def remap_partitioning(
