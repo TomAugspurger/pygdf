@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 
@@ -511,12 +512,15 @@ def test_serialize_query():
         .group_by("a")
         .agg(pl.col("b").sum(), pl.col("c").max())
     )
-    engine = pl.GPUEngine(executor="streaming")
+    engine = pl.GPUEngine(executor="streaming", raise_on_fail=True)
     dag = serialize_query(q, engine)
 
     # We don't know the exact node IDs, but we can check the structure.
     assert len(dag.roots) == 1
-    assert len(dag.nodes) == 5
+    node_types = sorted({x.type for x in dag.nodes.values()})
+    assert node_types == ["DataFrameScan", "GroupBy", "Join", "Select"]
+    # On some systems (CI), this can apparently be length 6.
+    assert len(dag.nodes) >= 5
     assert len(dag.partition_info) == 5
     node_ids = set(dag.nodes)
 
@@ -557,4 +561,4 @@ def test_serialize_query():
                 assert node_id not in dag.roots
 
     # smoke test to ensure that the output is JSON serializable
-    json.dumps(dag.to_dict())
+    json.dumps(dataclasses.asdict(dag))
