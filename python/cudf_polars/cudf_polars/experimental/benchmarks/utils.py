@@ -396,6 +396,7 @@ class RunConfig:
     fallback_mode: str | None = None
     validation_method: ValidationMethod | None = None
     io_mode: Literal["cold", "lukewarm", "hot"] = "lukewarm"
+    capture_env: list[str] | None = None
 
     def __post_init__(self) -> None:  # noqa: D105
         if self.gather_shuffle_stats and self.shuffle != "rapidsmpf":
@@ -407,6 +408,13 @@ class RunConfig:
                 "--io-mode hot requires at least 2 iterations: "
                 "iteration 0 warms the cache, iterations 1+ are the hot measurements."
             )
+
+        if self.capture_env is not None:
+            self.extra_info.setdefault("environment", {})
+            for env_var in self.capture_env:
+                self.extra_info["environment"][env_var].setdefault(
+                    os.environ.get(env_var)
+                )
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> RunConfig:
@@ -509,6 +517,11 @@ class RunConfig:
         else:
             validation_method = None
 
+        if args.capture_env is not None:
+            capture_env = args.capture_env.split(",")
+        else:
+            capture_env = None
+
         return cls(
             queries=args.query,
             executor=executor,
@@ -543,6 +556,7 @@ class RunConfig:
             fallback_mode=args.fallback_mode,
             validation_method=validation_method,
             io_mode=args.io_mode,
+            capture_env=capture_env,
         )
 
     def serialize(self, engine: pl.GPUEngine | None) -> dict:
@@ -1262,6 +1276,12 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
         type=json.loads,
         default={},
         help="Extra information to add to the output file (e.g. version information). Must be JSON-serializable.",
+    )
+    parser.add_argument(
+        "--capture-env",
+        help="Additional environment variables to capture and add to the `extra_info.environment` field.",
+        type=str,
+        default=None,
     )
     parser.add_argument(
         "--fallback-mode",
