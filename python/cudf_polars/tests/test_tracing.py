@@ -31,6 +31,30 @@ def fixture_configure_structlog(log_output):
     structlog.configure(processors=[log_output])
 
 
+def test_tracing_enabled_context_manager() -> None:
+    """With tracing_enabled(), tracing is on inside the block and restored after."""
+    import rmm
+
+    from cudf_polars.dsl import tracing
+
+    assert not tracing.LOG_TRACES
+
+    with tracing.tracing_enabled():
+        assert tracing.LOG_TRACES
+        with structlog.testing.capture_logs() as cap:
+            q = pl.DataFrame({"a": [1, 2, 3]}).lazy().select(pl.col("a").sum())
+            q.collect(
+                engine=pl.GPUEngine(
+                    memory_resource=rmm.mr.ManagedMemoryResource(),
+                )
+            )
+        execute_ir_logs = [e for e in cap if e.get("event") == "Execute IR"]
+        assert len(execute_ir_logs) >= 1
+        assert execute_ir_logs[0].get("scope") == "evaluate_ir_node"
+
+    assert not tracing.LOG_TRACES
+
+
 def test_trace_basic(
     log_output: Any,
     monkeypatch: pytest.MonkeyPatch,
