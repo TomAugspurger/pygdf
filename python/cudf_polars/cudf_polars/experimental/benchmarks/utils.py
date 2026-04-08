@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import dataclasses
 import importlib
 import io
@@ -770,6 +771,77 @@ def initialize_dask_cluster(run_config: RunConfig, args: argparse.Namespace):  #
     return client
 
 
+# Default for --nsys-cuda-profile-range when CUDF_POLARS_BENCHMARK_NSYS_CUDA_PROFILER is set.
+_NSYS_CUDA_PROFILER_ENV = "CUDF_POLARS_BENCHMARK_NSYS_CUDA_PROFILER"
+
+
+def _env_truthy(name: str) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return False
+    return v.strip().lower() in ("1", "true", "yes")
+
+
+@contextlib.contextmanager
+def _nsys_cuda_profiler_range(
+    args: argparse.Namespace,
+    *,
+    use_gpu: bool,
+) -> Generator[None, None, None]:
+    """
+    Call CUDA Profiler API start/stop around a timed query for Nsight Systems.
+
+    Intended for use under ``nsys profile`` with ``-c cudaProfilerApi`` (or
+    ``--capture-range=cudaProfilerApi``) and ``--capture-range-end=repeat`` so
+    each timed iteration can be captured without relaunching the process.
+    Whether each start/stop pair becomes its own ``.nsys-rep`` depends on the
+    Nsight Systems build; see ``nsys profile --help`` and the User Guide (some
+    versions describe extra switches or an interactive ``nsys start`` /
+    ``nsys launch`` flow). No-ops when disabled, on CPU executor, or when CUDA
+    is unavailable.
+    """
+    if not use_gpu or not args.nsys_cuda_profile_range:
+        yield
+        return
+
+    try:
+        from cuda.bindings import runtime as cuda_rt
+    except ImportError:
+        warnings.warn(
+            "nsys CUDA profiler range requested but cuda.bindings.runtime "
+            "is not available; skipping cudaProfilerStart/Stop.",
+            stacklevel=2,
+        )
+        yield
+        return
+
+    (err,) = cuda_rt.cudaProfilerStart()
+    if err != cuda_rt.cudaError_t.cudaSuccess:
+        warnings.warn(
+            f"cudaProfilerStart failed ({err}); continuing without profiler hooks.",
+            stacklevel=2,
+        )
+        yield
+        return
+    try:
+        yield
+    finally:
+        if args.nsys_cuda_profile_synchronize:
+            (sync_err,) = cuda_rt.cudaDeviceSynchronize()
+            if sync_err != cuda_rt.cudaError_t.cudaSuccess:
+                warnings.warn(
+                    f"cudaDeviceSynchronize failed ({sync_err}) before "
+                    "cudaProfilerStop.",
+                    stacklevel=2,
+                )
+        (stop_err,) = cuda_rt.cudaProfilerStop()
+        if stop_err != cuda_rt.cudaError_t.cudaSuccess:
+            warnings.warn(
+                f"cudaProfilerStop failed ({stop_err}).",
+                stacklevel=2,
+            )
+
+
 def drop_file_page_cache_recursively(path: os.PathLike | str) -> None:
     """Drop the Linux page cache for all files under `path`."""
     try:
@@ -800,10 +872,15 @@ def execute_query(
     if run_config.io_mode == "cold":
         drop_file_page_cache_recursively(run_config.dataset_path)
 
-    with nvtx.annotate(
-        message=f"Query {q_id} - Iteration {i}",
-        domain="cudf_polars",
-        color="green",
+    use_gpu = run_config.executor != "cpu"
+
+    with (
+        _nsys_cuda_profiler_range(args, use_gpu=use_gpu),
+        nvtx.annotate(
+            message=f"Query {q_id} - Iteration {i}",
+            domain="cudf_polars",
+            color="green",
+        ),
     ):
         if run_config.executor == "cpu":
             t0 = time.monotonic()
@@ -998,6 +1075,28 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
         default=1,
         type=int,
         help="Number of times to run the same query.",
+    )
+    parser.add_argument(
+        "--nsys-cuda-profile-range",
+        action=argparse.BooleanOptionalAction,
+        default=_env_truthy(_NSYS_CUDA_PROFILER_ENV),
+        help=textwrap.dedent("""\
+            Wrap each GPU timed query iteration with cudaProfilerStart/cudaProfilerStop
+            for Nsight Systems (no effect for --executor cpu). Typical invocation:
+              nsys profile -c cudaProfilerApi --capture-range-end=repeat \\
+                --kill none --flush-on-cudaprofilerstop true \\
+                ... your benchmark command ...
+            For Dask or other multi-process setups, nsys only instruments this process;
+            profile worker processes separately to capture their GPU activity."""),
+    )
+    parser.add_argument(
+        "--nsys-cuda-profile-synchronize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "When --nsys-cuda-profile-range is on, call cudaDeviceSynchronize before "
+            "cudaProfilerStop (recommended so work launched in-range is included)."
+        ),
     )
     parser.add_argument(
         "--io-mode",
