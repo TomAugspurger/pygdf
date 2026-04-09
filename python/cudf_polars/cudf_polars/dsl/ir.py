@@ -14,6 +14,7 @@ can be considered as functions:
 from __future__ import annotations
 
 import contextlib
+import io
 import itertools
 import json
 import random
@@ -27,6 +28,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, assert_never, overload
 import polars as pl
 
 import pylibcudf as plc
+import rmm
 from pylibcudf import expressions as plc_expr
 
 import cudf_polars.dsl.expr as expr
@@ -62,6 +64,10 @@ if TYPE_CHECKING:
 
     from polars import polars  # type: ignore[attr-defined]
 
+    from pylibcudf import gpumemoryview
+    from pylibcudf.io.experimental import HybridScanReader
+    from pylibcudf.io.parquet import ParquetReaderOptions
+    from pylibcudf.io.text import ByteRangeInfo
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers.dataframe import NamedColumn
@@ -648,11 +654,126 @@ class Scan(IR):
     ) -> int:
         # Zero-width parquet files lose their row count when read through
         # pylibcudf. See https://github.com/rapidsai/cudf/issues/21428
+        # TODO: I don't like how we read the parquet metadata here.
+        # I'd prefer that we only read it once.
         meta = plc.io.parquet_metadata.read_parquet_metadata(plc.io.SourceInfo(paths))
         num_rows = meta.num_rows() - skip_rows
         if n_rows != -1:
             num_rows = min(num_rows, n_rows)
         return max(num_rows, 0)
+
+    @staticmethod
+    def _parquet_scan_reads_file_columns(
+        schema: Schema,
+        with_columns: list[str] | None,
+        row_index: tuple[str, int] | None,
+        include_file_paths: str | None,
+    ) -> bool:
+        """
+        True if this scan reads at least one column from the Parquet file(s).
+
+        Used to avoid the hybrid-scan path when there are no column chunks (libcudf
+        requires at least one selected column). Inferred from Polars' schema and
+        projection — no extra storage I/O.
+        """
+        if with_columns is not None:
+            return len(with_columns) > 0
+        synthetic: set[str] = set()
+        if row_index is not None:
+            synthetic.add(row_index[0])
+        if include_file_paths is not None:
+            synthetic.add(include_file_paths)
+        return any(name not in synthetic for name in schema)
+
+    @staticmethod
+    def _read_parquet_footer_bytes(path: str) -> bytes:
+        """Read the Parquet footer bytes from a local file."""
+        suffix_len = 8  # 4-byte footer length + 4-byte PAR1 magic
+        with Path(path).open("rb") as f:
+            f.seek(-suffix_len, io.SEEK_END)
+            suffix = f.read(suffix_len)
+        footer_size = int.from_bytes(suffix[:4], byteorder="little")
+        with Path(path).open("rb") as f:
+            f.seek(-(footer_size + suffix_len), io.SEEK_END)
+            return f.read(footer_size)
+
+    @staticmethod
+    def _parquet_ranges_to_device_spans(
+        path: Path,
+        ranges: list[ByteRangeInfo],
+        stream: Stream,
+    ) -> list[gpumemoryview]:
+        """Read Parquet file byte ranges into device buffers for hybrid-scan filters."""
+        plc_stream = plc.utils._get_stream(stream)
+        spans: list[gpumemoryview] = []
+        with path.open("rb") as fb:
+            for r in ranges:
+                fb.seek(r.offset)
+                chunk = fb.read(r.size)
+                spans.append(
+                    plc.gpumemoryview(rmm.DeviceBuffer.to_device(chunk, plc_stream))
+                )
+        stream.synchronize()
+        return spans
+
+    @staticmethod
+    def _hybrid_scan_apply_secondary_row_group_filters(
+        path: Path,
+        hybrid_reader: HybridScanReader,
+        row_groups: list[int],
+        per_file_options: ParquetReaderOptions,
+        stream: Stream,
+    ) -> list[int]:
+        """
+        Prune row groups using dictionary pages and bloom filters after stats.
+
+        Follows libcudf ``apply_hybrid_scan_filters`` in ``hybrid_scan_composer.cpp``:
+        stats (caller), then dictionary pages, then bloom filters.
+        """
+        if not row_groups:
+            return row_groups
+        bloom_ranges, dict_ranges = hybrid_reader.secondary_filters_byte_ranges(
+            row_groups, per_file_options
+        )
+        current = row_groups
+        if dict_ranges and current:
+            dict_data = Scan._parquet_ranges_to_device_spans(path, dict_ranges, stream)
+            current = hybrid_reader.filter_row_groups_with_dictionary_pages(
+                dict_data, current, per_file_options, stream  # type: ignore[arg-type]
+            )
+        if bloom_ranges and current:
+            bloom_data = Scan._parquet_ranges_to_device_spans(
+                path, bloom_ranges, stream
+            )
+            current = hybrid_reader.filter_row_groups_with_bloom_filters(
+                bloom_data, current, per_file_options, stream  # type: ignore[arg-type]
+            )
+        return current
+
+    @staticmethod
+    def _parquet_table_apply_skip_rows_num_rows(
+        tbl: plc.Table, skip_rows: int, n_rows: int, stream: Any
+    ) -> plc.Table:
+        """
+        Apply global ``skip_rows`` / ``n_rows`` to a materialized Parquet table.
+
+        ``read_parquet`` applies these bounds across sources in file order. The
+        hybrid-scan ``materialize_all_columns`` path may decode a larger row
+        set, so we slice the result to match.
+        """
+        # TODO: this shouldn't be necessary. Figure out how to use
+        # the hybrid reader properly to not read unnecessary bytes.
+        if skip_rows == 0 and n_rows == -1:
+            return tbl
+        n = tbl.num_rows()
+        start = skip_rows if skip_rows <= n else n
+        if n_rows == -1:
+            end = n
+        else:
+            end = min(start + n_rows, n)
+        if start >= end:
+            return plc.copying.slice(tbl, [0, 0], stream=stream)[0]
+        return plc.copying.slice(tbl, [start, end], stream=stream)[0]
 
     @classmethod
     @log_do_evaluate
@@ -794,77 +915,206 @@ class Scan(IR):
                     ),
                     stream=stream,
                 )
-            parquet_reader_options = (
-                plc.io.parquet.ParquetReaderOptions.builder(plc.io.SourceInfo(paths))
-                .decimal_width(plc.TypeId.DECIMAL128)
-                .build()
+            use_hybrid_scan = (
+                parquet_options.reader == "hybrid-scan"
+                and cls._parquet_scan_reads_file_columns(
+                    schema, with_columns, row_index, include_file_paths
+                )
             )
-
-            if with_columns is not None:
-                parquet_reader_options.set_column_names(with_columns)
-            if filters is not None:
-                parquet_reader_options.set_filter(filters)
-            if n_rows != -1:
-                parquet_reader_options.set_num_rows(n_rows)
-            if skip_rows != 0:
-                parquet_reader_options.set_skip_rows(skip_rows)
-            if parquet_options.chunked:
-                reader = plc.io.parquet.ChunkedParquetReader(
-                    parquet_reader_options,
-                    chunk_read_limit=parquet_options.chunk_read_limit,
-                    pass_read_limit=parquet_options.pass_read_limit,
-                    stream=stream,
+            if use_hybrid_scan and any(
+                plc.io.SourceInfo._is_remote_uri(p) for p in paths
+            ):
+                raise NotImplementedError(
+                    "The hybrid-scan Parquet reader requires local file paths."
                 )
-                chunk = reader.read_chunk()
-                # TODO: Nested column names
-                names = chunk.column_names(include_children=False)
-                concatenated_columns = chunk.tbl.columns()
-                while reader.has_next():
-                    columns = reader.read_chunk().tbl.columns()
-                    # Discard columns while concatenating to reduce memory footprint.
-                    # Reverse order to avoid O(n^2) list popping cost.
-                    for i in range(len(concatenated_columns) - 1, -1, -1):
-                        concatenated_columns[i] = plc.concatenate.concatenate(
-                            [concatenated_columns[i], columns.pop()], stream=stream
+            if use_hybrid_scan:
+                # Prototype: single-shot materialize_all_columns per file; ignores
+                # chunked / chunk_read_limit / pass_read_limit.
+                # With a pushdown filter: stats, then dictionary pages, then bloom filters
+                # (see Scan._hybrid_scan_apply_secondary_row_group_filters).
+                # plc_stream = plc.utils._get_stream(stream)
+                plc_stream = stream
+                tables_w_meta: list[plc.io.types.TableWithMetadata] = []
+                for p in paths:
+                    path = Path(p)
+                    footer_bytes = cls._read_parquet_footer_bytes(p)
+                    per_file_options = (
+                        plc.io.parquet.ParquetReaderOptions.builder(
+                            plc.io.SourceInfo([p])
                         )
-                num_rows = (
-                    cls._get_parquet_row_count_from_metadata(paths, skip_rows, n_rows)
-                    if not names
-                    else None
-                )
-                df = DataFrame.from_table(
-                    plc.Table(concatenated_columns),
-                    names=names,
-                    dtypes=[schema[name] for name in names],
-                    stream=stream,
-                    num_rows=num_rows,
-                )
-                if include_file_paths is not None:
-                    df = Scan.add_file_paths(
-                        include_file_paths, paths, chunk.num_rows_per_source, df
+                        .decimal_width(plc.TypeId.DECIMAL128)
+                        .build()
                     )
-            else:
-                tbl_w_meta = plc.io.parquet.read_parquet(
-                    parquet_reader_options, stream=stream
+                    if with_columns is not None:
+                        per_file_options.set_column_names(with_columns)
+                    if filters is not None:
+                        per_file_options.set_filter(filters)
+                    if n_rows != -1:
+                        per_file_options.set_num_rows(n_rows)
+                    if skip_rows != 0:
+                        per_file_options.set_skip_rows(skip_rows)
+                    hybrid_reader = plc.io.experimental.HybridScanReader(
+                        footer_bytes, per_file_options
+                    )
+                    row_groups = hybrid_reader.all_row_groups(per_file_options)
+                    if filters is not None:
+                        row_groups = hybrid_reader.filter_row_groups_with_stats(
+                            row_groups, per_file_options, stream
+                        )
+                        row_groups = (
+                            Scan._hybrid_scan_apply_secondary_row_group_filters(
+                                path,
+                                hybrid_reader,
+                                row_groups,
+                                per_file_options,
+                                stream,
+                            )
+                        )
+                    if not row_groups:
+                        tables_w_meta.append(
+                            plc.io.parquet.read_parquet(per_file_options, stream=stream)
+                        )
+                        continue
+                    ranges = hybrid_reader.all_column_chunks_byte_ranges(
+                        row_groups, per_file_options
+                    )
+                    column_data = []
+                    with path.open("rb") as fb:
+                        for r in ranges:
+                            fb.seek(r.offset)
+                            chunk_ = fb.read(r.size)
+                            column_data.append(
+                                plc.gpumemoryview(
+                                    rmm.DeviceBuffer.to_device(chunk_, plc_stream)
+                                )
+                            )
+                    stream.synchronize()
+                    tables_w_meta.append(
+                        hybrid_reader.materialize_all_columns(
+                            row_groups,
+                            # error: Argument 2 to "materialize_all_columns" of "HybridScanReader" has incompatible type "list[gpumemoryview]"; expected "list[Span]"  [arg-type]
+                            column_data,  # type: ignore[arg-type]
+                            per_file_options,
+                            stream,
+                        )
+                    )
+                if len(tables_w_meta) == 1:
+                    tbl_w_meta = tables_w_meta[0]
+                    out_tbl = tbl_w_meta.tbl
+                    col_names = tbl_w_meta.column_names(include_children=False)
+                else:
+                    out_tbl = plc.concatenate.concatenate(
+                        [m.tbl for m in tables_w_meta], stream=stream
+                    )
+                    col_names = tables_w_meta[0].column_names(include_children=False)
+                out_tbl = cls._parquet_table_apply_skip_rows_num_rows(
+                    out_tbl, skip_rows, n_rows, stream
                 )
-                # TODO: consider nested column names?
-                col_names = tbl_w_meta.column_names(include_children=False)
-                num_rows = (
+                num_rows_meta = (
                     cls._get_parquet_row_count_from_metadata(paths, skip_rows, n_rows)
                     if not col_names
                     else None
                 )
+                if len(paths) == 1:
+                    rows_per_path = [out_tbl.num_rows()]
+                else:
+                    rows_per_path = [m.tbl.num_rows() for m in tables_w_meta]
                 df = DataFrame.from_table(
-                    tbl_w_meta.tbl,
+                    out_tbl,
                     col_names,
                     [schema[name] for name in col_names],
                     stream=stream,
-                    num_rows=num_rows,
+                    num_rows=num_rows_meta,
                 )
                 if include_file_paths is not None:
                     df = Scan.add_file_paths(
-                        include_file_paths, paths, tbl_w_meta.num_rows_per_source, df
+                        include_file_paths, paths, rows_per_path, df
                     )
+            else:
+                parquet_reader_options = (
+                    plc.io.parquet.ParquetReaderOptions.builder(
+                        plc.io.SourceInfo(paths)
+                    )
+                    .decimal_width(plc.TypeId.DECIMAL128)
+                    .build()
+                )
+
+                if with_columns is not None:
+                    parquet_reader_options.set_column_names(with_columns)
+                if filters is not None:
+                    parquet_reader_options.set_filter(filters)
+                if n_rows != -1:
+                    parquet_reader_options.set_num_rows(n_rows)
+                if skip_rows != 0:
+                    parquet_reader_options.set_skip_rows(skip_rows)
+                if parquet_options.chunked:
+                    reader = plc.io.parquet.ChunkedParquetReader(
+                        parquet_reader_options,
+                        chunk_read_limit=parquet_options.chunk_read_limit,
+                        pass_read_limit=parquet_options.pass_read_limit,
+                        stream=stream,
+                    )
+                    chunk = reader.read_chunk()
+                    # TODO: Nested column names
+                    names = chunk.column_names(include_children=False)
+                    concatenated_columns = chunk.tbl.columns()
+                    while reader.has_next():
+                        columns = reader.read_chunk().tbl.columns()
+                        # Discard columns while concatenating to reduce memory footprint.
+                        # Reverse order to avoid O(n^2) list popping cost.
+                        for i in range(len(concatenated_columns) - 1, -1, -1):
+                            concatenated_columns[i] = plc.concatenate.concatenate(
+                                [concatenated_columns[i], columns.pop()],
+                                stream=stream,
+                            )
+                    num_rows = (
+                        cls._get_parquet_row_count_from_metadata(
+                            paths, skip_rows, n_rows
+                        )
+                        if not names
+                        else None
+                    )
+                    df = DataFrame.from_table(
+                        plc.Table(concatenated_columns),
+                        names=names,
+                        dtypes=[schema[name] for name in names],
+                        stream=stream,
+                        num_rows=num_rows,
+                    )
+                    if include_file_paths is not None:
+                        df = Scan.add_file_paths(
+                            include_file_paths,
+                            paths,
+                            chunk.num_rows_per_source,
+                            df,
+                        )
+                else:
+                    tbl_w_meta = plc.io.parquet.read_parquet(
+                        parquet_reader_options, stream=stream
+                    )
+                    # TODO: consider nested column names?
+                    col_names = tbl_w_meta.column_names(include_children=False)
+                    num_rows = (
+                        cls._get_parquet_row_count_from_metadata(
+                            paths, skip_rows, n_rows
+                        )
+                        if not col_names
+                        else None
+                    )
+                    df = DataFrame.from_table(
+                        tbl_w_meta.tbl,
+                        col_names,
+                        [schema[name] for name in col_names],
+                        stream=stream,
+                        num_rows=num_rows,
+                    )
+                    if include_file_paths is not None:
+                        df = Scan.add_file_paths(
+                            include_file_paths,
+                            paths,
+                            tbl_w_meta.num_rows_per_source,
+                            df,
+                        )
             if filters is not None:
                 # Mask must have been applied.
                 return df

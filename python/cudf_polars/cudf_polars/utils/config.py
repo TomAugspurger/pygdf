@@ -226,6 +226,18 @@ def _bool_converter(v: str) -> bool:
         raise ValueError(f"Invalid boolean value: '{v}'")
 
 
+def _parquet_reader_converter(v: str) -> Literal["cudf", "hybrid-scan"]:
+    """Parse Parquet reader mode from environment or user config."""
+    normalized = v.strip().lower().replace("_", "-")
+    if normalized == "cudf":
+        return "cudf"
+    if normalized == "hybrid-scan":
+        return "hybrid-scan"
+    raise ValueError(
+        f"Invalid parquet reader value: {v!r}; expected 'cudf' or 'hybrid-scan'"
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class ParquetOptions:
     """
@@ -264,6 +276,10 @@ class ParquetOptions:
         Whether to use the native rapidsmpf node for parquet reading.
         This option is only used when the rapidsmpf runtime is enabled.
         Default is False.
+    reader
+        Which Parquet read path to use: ``"cudf"`` (default) for the standard
+        libcudf reader, or ``"hybrid-scan"`` for the experimental hybrid-scan
+        reader (local files only in the current prototype).
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -305,6 +321,11 @@ class ParquetOptions:
             default=False,
         )
     )
+    reader: Literal["cudf", "hybrid-scan"] = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__READER", _parquet_reader_converter, default="hybrid-scan"
+        )
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if not isinstance(self.chunked, bool):
@@ -321,6 +342,8 @@ class ParquetOptions:
             raise TypeError("max_row_group_samples must be an int")
         if not isinstance(self.use_rapidsmpf_native, bool):
             raise TypeError("use_rapidsmpf_native must be a bool")
+        if not isinstance(self.reader, str):
+            raise TypeError("reader must be 'cudf' or 'hybrid-scan'")
 
 
 def default_target_partition_size(cluster: str, runtime: str) -> int:

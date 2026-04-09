@@ -221,6 +221,7 @@ def test_parquet_options(executor: str) -> None:
     )
     assert config.parquet_options.chunked is True
     assert config.parquet_options.n_output_chunks == 1
+    assert config.parquet_options.reader == "cudf"
 
     config = ConfigOptions.from_polars_engine(
         pl.GPUEngine(
@@ -230,6 +231,15 @@ def test_parquet_options(executor: str) -> None:
     )
     assert config.parquet_options.chunked is False
     assert config.parquet_options.n_output_chunks == 16
+    assert config.parquet_options.reader == "cudf"
+
+    config = ConfigOptions.from_polars_engine(
+        pl.GPUEngine(
+            executor=executor,
+            parquet_options={"reader": "hybrid-scan"},
+        )
+    )
+    assert config.parquet_options.reader == "hybrid-scan"
 
 
 def test_parquet_options_from_none() -> None:
@@ -428,6 +438,7 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__MAX_FOOTER_SAMPLES", "0")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__MAX_ROW_GROUP_SAMPLES", "0")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__USE_RAPIDSMPF_NATIVE", "0")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__READER", "hybrid-scan")
 
         # Test default
         engine = pl.GPUEngine()
@@ -439,6 +450,15 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         assert config.parquet_options.max_footer_samples == 0
         assert config.parquet_options.max_row_group_samples == 0
         assert config.parquet_options.use_rapidsmpf_native is False
+        assert config.parquet_options.reader == "hybrid-scan"
+
+    with monkeypatch.context() as m:
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__READER", "not-a-reader")
+        engine = pl.GPUEngine()
+        with pytest.raises(
+            ValueError, match="Invalid parquet reader value: 'not-a-reader'"
+        ):
+            ConfigOptions.from_polars_engine(engine)
 
     with monkeypatch.context() as m:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__CHUNKED", "foo")
@@ -526,6 +546,7 @@ def test_fallback_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
         "max_footer_samples",
         "max_row_group_samples",
         "use_rapidsmpf_native",
+        "reader",
     ],
 )
 def test_validate_parquet_options(option: str) -> None:
@@ -534,6 +555,19 @@ def test_validate_parquet_options(option: str) -> None:
             pl.GPUEngine(
                 executor="streaming",
                 parquet_options={option: object()},
+            )
+        )
+
+
+def test_parquet_options_invalid_reader_string() -> None:
+    with pytest.raises(
+        TypeError,
+        match="Invalid parquet reader value: 'invalid'",
+    ):
+        ConfigOptions.from_polars_engine(
+            pl.GPUEngine(
+                executor="streaming",
+                parquet_options={"reader": "invalid"},
             )
         )
 

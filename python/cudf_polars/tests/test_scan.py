@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import zlib
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -13,6 +14,7 @@ from werkzeug import Response
 
 import polars as pl
 
+from cudf_polars.dsl.ir import Scan
 from cudf_polars.testing.asserts import (
     assert_gpu_result_equal,
     assert_ir_translation_raises,
@@ -25,8 +27,6 @@ from cudf_polars.utils.versions import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from pytest_httpserver import HTTPServer
     from werkzeug import Request
 
@@ -146,6 +146,235 @@ def test_scan(
     if columns is not None:
         q = q.select(*columns)
     assert_gpu_result_equal(q, engine=engine)
+
+
+def test_scan_parquet_hybrid_scan_reader_matches_cudf(tmp_path):
+    df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+    path = tmp_path / "t.parquet"
+    df.write_parquet(path)
+    q = pl.scan_parquet(path)
+    engine_cudf = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "cudf", "chunked": False},
+    )
+    engine_hybrid = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "hybrid-scan", "chunked": False},
+    )
+    assert q.collect(engine=engine_cudf).equals(q.collect(engine=engine_hybrid))
+
+
+def test_hybrid_scan_secondary_row_group_filters_empty_row_groups():
+    """Early exit when no row groups remain (no secondary filter I/O)."""
+    assert (
+        Scan._hybrid_scan_apply_secondary_row_group_filters(
+            Path("unused"), object(), [], object(), object()
+        )
+        == []
+    )
+
+
+def test_scan_parquet_hybrid_scan_slice_matches_cudf(tmp_path):
+    """Hybrid materialize path must apply global skip_rows / n_rows like read_parquet."""
+    df = pl.DataFrame({"a": [1, 2, 3, 4, 5]})
+    path = tmp_path / "t.parquet"
+    df.write_parquet(path, row_group_size=2)
+    q = pl.scan_parquet(path).slice(2, 2)
+    engine_cudf = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "cudf", "chunked": False},
+    )
+    engine_hybrid = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "hybrid-scan", "chunked": False},
+    )
+    assert q.collect(engine=engine_cudf).equals(q.collect(engine=engine_hybrid))
+
+
+def test_scan_parquet_hybrid_scan_slice_empty_matches_cudf(tmp_path):
+    """skip_rows past EOF yields an empty table (slice helper empty branch)."""
+    df = pl.DataFrame({"a": [1, 2, 3]})
+    path = tmp_path / "t.parquet"
+    df.write_parquet(path)
+    q = pl.scan_parquet(path).slice(100, 5)
+    engine_cudf = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "cudf", "chunked": False},
+    )
+    engine_hybrid = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "hybrid-scan", "chunked": False},
+    )
+    assert q.collect(engine=engine_cudf).equals(q.collect(engine=engine_hybrid))
+
+
+def test_scan_parquet_hybrid_scan_multi_file_matches_cudf(tmp_path):
+    df1 = pl.DataFrame({"a": [1, 2]})
+    df2 = pl.DataFrame({"a": [3, 4]})
+    p1, p2 = tmp_path / "1.parquet", tmp_path / "2.parquet"
+    df1.write_parquet(p1)
+    df2.write_parquet(p2)
+    q = pl.scan_parquet([str(p1), str(p2)])
+    engine_cudf = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "cudf", "chunked": False},
+    )
+    engine_hybrid = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "hybrid-scan", "chunked": False},
+    )
+    assert q.collect(engine=engine_cudf).equals(q.collect(engine=engine_hybrid))
+
+
+def test_scan_parquet_hybrid_scan_include_file_paths_matches_cudf(tmp_path):
+    df = pl.DataFrame({"a": [1]})
+    path = tmp_path / "t.parquet"
+    df.write_parquet(path)
+    q = pl.scan_parquet(path, include_file_paths="src")
+    engine_cudf = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "cudf", "chunked": False},
+    )
+    engine_hybrid = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "hybrid-scan", "chunked": False},
+    )
+    assert q.collect(engine=engine_cudf).equals(q.collect(engine=engine_hybrid))
+
+
+def test_scan_parquet_hybrid_scan_all_row_groups_pruned_fallback_matches_cudf(
+    tmp_path,
+):
+    """Stats prune every row group -> hybrid falls back to read_parquet for that file."""
+    df = pl.DataFrame({"a": [1, 2, 3, 4, 5, 6]})
+    path = tmp_path / "t.parquet"
+    df.write_parquet(path, row_group_size=2)
+    q = pl.scan_parquet(path).filter(pl.col("a") > 100)
+    engine_cudf = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "cudf", "chunked": False},
+    )
+    engine_hybrid = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "hybrid-scan", "chunked": False},
+    )
+    assert q.collect(engine=engine_cudf).equals(q.collect(engine=engine_hybrid))
+
+
+def test_scan_parquet_hybrid_scan_filter_dictionary_column_matches_cudf(tmp_path):
+    """Hybrid-scan secondary filters: stats then dictionary pages (libcudf hybrid path).
+
+    Aligned with ``pylibcudf`` hybrid-scan tests: multiple row groups, page index,
+    dictionary-encoded data pages, and a string *(in)equality* predicate so
+    ``secondary_filters_byte_ranges`` / ``filter_row_groups_with_dictionary_pages``
+    run after ``filter_row_groups_with_stats``. Plain UTF-8 columns (not Arrow
+    dictionary logical type) so Polars does not read the file as Categorical.
+    """
+    pa = pytest.importorskip("pyarrow")
+    pq = pytest.importorskip("pyarrow.parquet")
+
+    num_rows = 1000
+    row_group_size = 250
+    table = pa.table(
+        {
+            "col0": pa.array(list(range(num_rows)), type=pa.uint32()),
+            "col1": [f"str_{i}" for i in range(num_rows)],
+            "col2": [float(i) * 1.5 for i in range(num_rows)],
+        }
+    )
+    path = tmp_path / "hybrid_secondary.parquet"
+    pq.write_table(
+        table,
+        path,
+        row_group_size=row_group_size,
+        use_dictionary=True,
+        write_statistics=True,
+        write_page_index=True,
+    )
+
+    q = pl.scan_parquet(path).filter(pl.col("col1") == "str_300")
+    engine_cudf = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "cudf", "chunked": False},
+    )
+    engine_hybrid = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "hybrid-scan", "chunked": False},
+    )
+    assert q.collect(engine=engine_cudf).equals(q.collect(engine=engine_hybrid))
+
+
+@pytest.mark.parametrize("chunked", [False, True])
+def test_scan_parquet_hybrid_scan_remote_raises(
+    request,
+    tmp_path: Path,
+    df: pl.DataFrame,
+    httpserver: HTTPServer,
+    *,
+    chunked: bool,
+) -> None:
+    request.applymarker(
+        pytest.mark.xfail(
+            condition=POLARS_VERSION_LT_131,
+            reason="remote IO not supported",
+        )
+    )
+    path = tmp_path / "foo.parquet"
+    df.write_parquet(path)
+    bytes_ = path.read_bytes()
+    size = len(bytes_)
+
+    def head_handler(_: Request) -> Response:
+        return Response(
+            status=200,
+            headers={
+                "Content-Type": "parquet",
+                "Accept-Ranges": "bytes",
+                "Content-Length": size,
+            },
+        )
+
+    def get_handler(req: Request) -> Response:
+        rng = req.headers.get("Range")
+        if rng and rng.startswith("bytes="):
+            start, end = map(int, req.headers["Range"][6:].split("-"))
+            mv = memoryview(bytes_)[start : end + 1]
+            return Response(
+                mv.tobytes(),
+                status=206,
+                headers={
+                    "Content-Type": "parquet",
+                    "Content-Length": len(mv),
+                    "Content-Range": f"bytes {start}-{end}/{size}",
+                },
+            )
+        return Response(
+            bytes_,
+            status=200,
+            headers={
+                "Content-Type": "parquet",
+                "Accept-Ranges": "bytes",
+                "Content-Length": size,
+            },
+        )
+
+    server_path = "/foo.parquet"
+    httpserver.expect_request(server_path, method="HEAD").respond_with_handler(
+        head_handler
+    )
+    httpserver.expect_request(server_path, method="GET").respond_with_handler(
+        get_handler
+    )
+
+    q = pl.scan_parquet(httpserver.url_for(server_path))
+    engine = pl.GPUEngine(
+        raise_on_fail=True,
+        parquet_options={"reader": "hybrid-scan", "chunked": chunked},
+    )
+    with pytest.raises(
+        NotImplementedError, match="hybrid-scan Parquet reader requires local"
+    ):
+        q.collect(engine=engine)
 
 
 def test_negative_slice_pushdown_raises(tmp_path):
@@ -568,7 +797,11 @@ def test_scan_parquet_remote(
     q = pl.scan_parquet(httpserver.url_for(server_path))
 
     assert_gpu_result_equal(
-        q, engine=pl.GPUEngine(raise_on_fail=True, parquet_options={"chunked": chunked})
+        q,
+        engine=pl.GPUEngine(
+            raise_on_fail=True,
+            parquet_options={"reader": "cudf", "chunked": chunked},
+        ),
     )
 
 
