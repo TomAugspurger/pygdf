@@ -643,10 +643,11 @@ def _do_hybrid_read(
     else:
         row_groups = list(row_group_indices)
 
-    with nvtx.annotate("filter_row_groups_with_stats", domain=CUDF_POLARS_NVTX_DOMAIN):
-        row_groups = hybrid_reader.filter_row_groups_with_stats(
-            row_groups, options, stream=stream
-        )
+    if filter_expr is not None:
+        with nvtx.annotate("filter_row_groups_with_stats", domain=CUDF_POLARS_NVTX_DOMAIN):
+            row_groups = hybrid_reader.filter_row_groups_with_stats(
+                row_groups, options, stream=stream
+            )
 
     if not row_groups:
         names = with_columns if with_columns is not None else list(schema.keys())

@@ -326,9 +326,9 @@ def evaluate_pipeline(
                 if isinstance(node, Scan) and node.typ == "parquet":
                     parquet_paths.extend(node.paths)
             if parquet_paths:
-                max_workers = max(1, config_options.executor.max_io_threads)
+                # max_workers = max(1, config_options.executor.max_io_threads)
                 with ThreadPoolExecutor(
-                    max_workers=max_workers, thread_name_prefix="footer"
+                    max_workers=64, thread_name_prefix="footer"
                 ) as fetch_executor:
                     footer_cache = fetch_parquet_footers(parquet_paths, fetch_executor)
 

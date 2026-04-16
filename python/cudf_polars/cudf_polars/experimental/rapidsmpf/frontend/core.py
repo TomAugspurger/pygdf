@@ -239,7 +239,7 @@ def execute_ir_on_rank(
             parquet_paths.extend(node.paths)
     footer_cache: dict[str, tuple[bytes, int | None]] = {}
     if parquet_paths:
-        footer_cache = fetch_parquet_footers(parquet_paths, py_executor)
+        footer_cache = fetch_parquet_footers(parquet_paths, ThreadPoolExecutor(max_workers=64, thread_name_prefix="footer"))
 
     nodes, output = generate_network(
         ctx,
