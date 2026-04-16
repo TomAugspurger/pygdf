@@ -216,3 +216,45 @@ def test_hybrid_scan_non_ast_predicate(tmp_path, df_mixed, engine):
         .agg(pl.col("price").sum().alias("total_price"))
     )
     assert_gpu_result_equal(q, engine=engine, check_row_order=False, check_exact=False)
+
+
+@pytest.mark.parametrize(
+    "engine",
+    [
+        {
+            "executor_options": {"target_partition_size": 100},
+            "engine_options": {"parquet_options": {"reader": "hybrid-scan"}},
+        }
+    ],
+    indirect=True,
+)
+def test_hybrid_scan_split_more_than_row_groups(tmp_path, df_mixed, engine):
+    """SplitScan fallback must use cached metadata, not re-read from storage."""
+    make_partitioned_source(
+        df_mixed, tmp_path, "parquet", n_files=1, row_group_size=1500
+    )
+    q = pl.scan_parquet(tmp_path)
+    assert_gpu_result_equal(q, engine=engine)
+
+
+@pytest.mark.parametrize(
+    "engine",
+    [
+        {
+            "executor_options": {"target_partition_size": 100},
+            "engine_options": {"parquet_options": {"reader": "hybrid-scan"}},
+        }
+    ],
+    indirect=True,
+)
+def test_hybrid_scan_split_all_row_groups_filtered(tmp_path, engine):
+    """Splits whose row groups are all eliminated by stats must return empty frames."""
+    df = pl.DataFrame(
+        {
+            "x": list(range(300)),
+            "y": [float(i) for i in range(300)],
+        }
+    )
+    make_partitioned_source(df, tmp_path, "parquet", n_files=1, row_group_size=100)
+    q = pl.scan_parquet(tmp_path).filter(pl.col("x") < 100)
+    assert_gpu_result_equal(q, engine=engine)

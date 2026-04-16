@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import io
 import math
@@ -58,6 +57,7 @@ from cudf_polars.experimental.rapidsmpf.nodes import (
 )
 from cudf_polars.experimental.rapidsmpf.utils import (
     ChannelManager,
+    _make_empty_column,
     chunk_to_frame,
     empty_table_chunk,
     gather_in_task_group,
@@ -83,8 +83,30 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import ParquetOptions
 
 
-def _read_parquet_footer_bytes(path: str) -> bytes:
+import httpx
+
+
+def _read_parquet_footer_bytes_http(url: str, client: httpx.Client) -> bytes:
+    response = client.get(url, headers={"Range": "bytes=-8"})
+    response.raise_for_status()
+
+    if response.content[-4:] != b"PAR1":
+        raise ValueError(f"Not a valid Parquet file (bad magic): {url}")
+    footer_length = int.from_bytes(response.content[-8:-4], byteorder="little")
+    # response.content[-8-footer_length:-8]
+
+    # now get the footer bytes, from -footer_length.
+    response = client.get(url, headers={"Range": f"bytes=-{footer_length + 8}"})
+    response.raise_for_status()
+
+    return response.content[:-8]
+
+
+def _read_parquet_footer_bytes(path: str, client: httpx.Client) -> bytes:
     """Read raw Parquet footer bytes (Thrift-encoded FileMetaData) from a file."""
+    if path.startswith(("https://", "http://")):
+        return _read_parquet_footer_bytes_http(path, client)
+
     with Path(path).open("rb") as f:
         f.seek(-8, 2)
         suffix = f.read(8)
@@ -104,13 +126,14 @@ def fetch_parquet_footers(
     if not paths:
         return {}
     unique_paths = set(paths)
-    futures = {executor.submit(_read_parquet_footer_bytes, p): p for p in unique_paths}
+    client = httpx.Client()
+    futures = {
+        executor.submit(_read_parquet_footer_bytes, p, client): p for p in unique_paths
+    }
     result: dict[str, bytes] = {}
     for future in as_completed(futures):
         path = futures[future]
-        with contextlib.suppress(Exception):
-            # TODO: this should *not* suppress exceptions...
-            result[path] = future.result()
+        result[path] = future.result()
     return result
 
 
@@ -468,16 +491,45 @@ def _get_row_groups_for_split(
     return all_rgs[skip_rgs : skip_rgs + rg_stride]
 
 
+def _rowgroup_metadata_from_footer(
+    all_rgs: list[int],
+    hybrid_reader: plc.io.experimental.HybridScanReader,
+) -> list[dict[str, int]]:
+    """Build ``rowgroup_metadata`` from a :class:`HybridScanReader`."""
+    return [
+        {"num_rows": hybrid_reader.total_rows_in_row_groups([rg])} for rg in all_rgs
+    ]
+
+
 def _read_file_byte_ranges(
     path: str,
     byte_ranges: list,
 ) -> list[bytes]:
     """Read multiple byte ranges from a local file."""
     result: list[bytes] = []
+    if path.startswith(("https://", "http://")):
+        return _read_file_byte_ranges_http(path, byte_ranges)
+
     with Path(path).open("rb") as f:
         for br in byte_ranges:
             f.seek(br.offset)
             result.append(f.read(br.size))
+    return result
+
+
+def _read_file_byte_ranges_http(
+    path: str,
+    byte_ranges: list,
+) -> list[bytes]:
+    """Read multiple byte ranges from a remote file."""
+    result: list[bytes] = []
+    client = httpx.Client()
+    for br in byte_ranges:
+        response = client.get(
+            path, headers={"Range": f"bytes={br.offset}-{br.offset + br.size}"}
+        )
+        response.raise_for_status()
+        result.append(response.content)
     return result
 
 
@@ -489,6 +541,7 @@ def _to_device_spans(
     return [plc.gpumemoryview(rmm.DeviceBuffer.to_device(d, stream)) for d in data_list]
 
 
+@nvtx.annotate(message="HybridScanReader", domain=CUDF_POLARS_NVTX_DOMAIN)
 def _do_hybrid_read(
     path: str,
     footer_bytes: bytes,
@@ -525,84 +578,96 @@ def _do_hybrid_read(
     else:
         row_groups = list(row_group_indices)
 
-    if filter_expr is not None:
+    with nvtx.annotate("filter_row_groups_with_stats", domain=CUDF_POLARS_NVTX_DOMAIN):
         row_groups = hybrid_reader.filter_row_groups_with_stats(
             row_groups, options, stream=stream
         )
 
     if not row_groups:
         names = with_columns if with_columns is not None else list(schema.keys())
+        dtypes = [schema[n] for n in names]
+        empty_cols = [_make_empty_column(dt, stream) for dt in dtypes]
         return DataFrame.from_table(
-            plc.Table([]), names, [schema[n] for n in names], stream, num_rows=0
+            plc.Table(empty_cols), names, dtypes, stream, num_rows=0
         )
 
     if filter_expr is not None:
-        filter_ranges = hybrid_reader.filter_column_chunks_byte_ranges(
-            row_groups, options
-        )
-        filter_data = _read_file_byte_ranges(path, filter_ranges)
-        filter_device = _to_device_spans(filter_data, stream)
+        with nvtx.annotate("hybrid-scan-filter", domain=CUDF_POLARS_NVTX_DOMAIN):
+            filter_ranges = hybrid_reader.filter_column_chunks_byte_ranges(
+                row_groups, options
+            )
+            with nvtx.annotate(
+                "hybrid-scan-filter-read", domain=CUDF_POLARS_NVTX_DOMAIN
+            ):
+                filter_data = _read_file_byte_ranges(path, filter_ranges)
+                filter_device = _to_device_spans(filter_data, stream)
 
-        n_rows = hybrid_reader.total_rows_in_row_groups(row_groups)
-        row_mask = plc.Column.from_scalar(
-            plc.Scalar.from_py(True, stream=stream),  # noqa: FBT003
-            n_rows,
-            stream=stream,
-        )
-        filter_tbl = hybrid_reader.materialize_filter_columns(
-            row_groups,
-            filter_device,  # type: ignore[arg-type]
-            row_mask,
-            plc.io.experimental.UseDataPageMask.NO,
-            options,
-            stream=stream,
-        )
+            n_rows = hybrid_reader.total_rows_in_row_groups(row_groups)
+            row_mask = plc.Column.from_scalar(
+                plc.Scalar.from_py(True, stream=stream),  # noqa: FBT003
+                n_rows,
+                stream=stream,
+            )
+            filter_tbl = hybrid_reader.materialize_filter_columns(
+                row_groups,
+                filter_device,  # type: ignore[arg-type]
+                row_mask,
+                plc.io.experimental.UseDataPageMask.NO,
+                options,
+                stream=stream,
+            )
 
-        payload_ranges = hybrid_reader.payload_column_chunks_byte_ranges(
-            row_groups, options
-        )
-        payload_data = _read_file_byte_ranges(path, payload_ranges)
-        payload_device = _to_device_spans(payload_data, stream)
-        payload_tbl = hybrid_reader.materialize_payload_columns(
-            row_groups,
-            payload_device,  # type: ignore[arg-type]
-            row_mask,
-            plc.io.experimental.UseDataPageMask.NO,
-            options,
-            stream=stream,
-        )
+            payload_ranges = hybrid_reader.payload_column_chunks_byte_ranges(
+                row_groups, options
+            )
+            payload_data = _read_file_byte_ranges(path, payload_ranges)
+            payload_device = _to_device_spans(payload_data, stream)
+            payload_tbl = hybrid_reader.materialize_payload_columns(
+                row_groups,
+                payload_device,  # type: ignore[arg-type]
+                row_mask,
+                plc.io.experimental.UseDataPageMask.NO,
+                options,
+                stream=stream,
+            )
 
-        merged_columns = list(filter_tbl.tbl.columns()) + list(
-            payload_tbl.tbl.columns()
-        )
-        merged_names = filter_tbl.column_names(
-            include_children=False
-        ) + payload_tbl.column_names(include_children=False)
+            merged_columns = list(filter_tbl.tbl.columns()) + list(
+                payload_tbl.tbl.columns()
+            )
+            merged_names = filter_tbl.column_names(
+                include_children=False
+            ) + payload_tbl.column_names(include_children=False)
 
-        # The filter/payload split returns [filter_cols] + [payload_cols],
-        # which may differ from the requested column order.  Re-order to
-        # match ``with_columns`` (or ``schema`` when no projection).
-        target_order = with_columns if with_columns is not None else list(schema.keys())
-        if merged_names != target_order:
-            name_to_idx = {n: i for i, n in enumerate(merged_names)}
-            indices = [name_to_idx[n] for n in target_order]
-            all_columns = [merged_columns[i] for i in indices]
-            col_names = target_order
-        else:
-            all_columns = merged_columns
-            col_names = merged_names
+            # The filter/payload split returns [filter_cols] + [payload_cols],
+            # which may differ from the requested column order.  Re-order to
+            # match ``with_columns`` (or ``schema`` when no projection).
+            target_order = (
+                with_columns if with_columns is not None else list(schema.keys())
+            )
+            if merged_names != target_order:
+                name_to_idx = {n: i for i, n in enumerate(merged_names)}
+                indices = [name_to_idx[n] for n in target_order]
+                all_columns = [merged_columns[i] for i in indices]
+                col_names = target_order
+            else:
+                all_columns = merged_columns
+                col_names = merged_names
     else:
-        all_ranges = hybrid_reader.all_column_chunks_byte_ranges(row_groups, options)
-        all_data = _read_file_byte_ranges(path, all_ranges)
-        all_device = _to_device_spans(all_data, stream)
-        tbl_w_meta = hybrid_reader.materialize_all_columns(
-            row_groups,
-            all_device,  # type: ignore[arg-type]
-            options,
-            stream=stream,
-        )
-        all_columns = list(tbl_w_meta.tbl.columns())
-        col_names = tbl_w_meta.column_names(include_children=False)
+        with nvtx.annotate("hybrid-scan-all", domain=CUDF_POLARS_NVTX_DOMAIN):
+            all_ranges = hybrid_reader.all_column_chunks_byte_ranges(
+                row_groups, options
+            )
+            with nvtx.annotate("hybrid-scan-all-read", domain=CUDF_POLARS_NVTX_DOMAIN):
+                all_data = _read_file_byte_ranges(path, all_ranges)
+            all_device = _to_device_spans(all_data, stream)
+            tbl_w_meta = hybrid_reader.materialize_all_columns(
+                row_groups,
+                all_device,  # type: ignore[arg-type]
+                options,
+                stream=stream,
+            )
+            all_columns = list(tbl_w_meta.tbl.columns())
+            col_names = tbl_w_meta.column_names(include_children=False)
 
     df = DataFrame.from_table(
         plc.Table(all_columns),
@@ -781,6 +846,9 @@ async def scan_node(
                         sindex += 1
                         splits_created += 1
                 else:
+                    rg_meta: list[dict[str, int]] | None = None
+                    if all_rgs is not None and footer_bytes is not None:
+                        rg_meta = _rowgroup_metadata_from_footer(all_rgs, _rdr)
                     base_scan = Scan(
                         ir.schema,
                         ir.typ,
@@ -803,6 +871,7 @@ async def scan_node(
                                 sindex,
                                 plan.factor,
                                 parquet_options,
+                                rowgroup_metadata=rg_meta,
                             )
                         )
                         sindex += 1

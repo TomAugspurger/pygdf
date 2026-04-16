@@ -143,7 +143,7 @@ class SplitScan(IR):
         "total_splits",
         "parquet_options",
     )
-    _n_non_child_args = 13
+    _n_non_child_args = 14
     base_scan: Scan
     """Scan operation this node is based on."""
     split_index: int
@@ -160,6 +160,7 @@ class SplitScan(IR):
         split_index: int,
         total_splits: int,
         parquet_options: ParquetOptions,
+        rowgroup_metadata: list[dict[str, int]] | None = None,
     ):
         self.schema = schema
         self.base_scan = base_scan
@@ -179,6 +180,7 @@ class SplitScan(IR):
             base_scan.include_file_paths,
             base_scan.predicate,
             base_scan.parquet_options,
+            rowgroup_metadata,
         )
         self.parquet_options = parquet_options
         self.children = ()
@@ -203,6 +205,7 @@ class SplitScan(IR):
         include_file_paths: str | None,
         predicate: NamedExpr | None,
         parquet_options: ParquetOptions,
+        rowgroup_metadata: list[dict[str, int]] | None = None,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
@@ -222,9 +225,10 @@ class SplitScan(IR):
         # - We can use all this information to calculate the
         #   "skip_rows" and "n_rows" options to use locally.
 
-        rowgroup_metadata = plc.io.parquet_metadata.read_parquet_metadata(
-            plc.io.SourceInfo(paths)
-        ).rowgroup_metadata()
+        if rowgroup_metadata is None:
+            rowgroup_metadata = plc.io.parquet_metadata.read_parquet_metadata(
+                plc.io.SourceInfo(paths)
+            ).rowgroup_metadata()
         total_row_groups = len(rowgroup_metadata)
         if total_splits <= total_row_groups:
             # We have enough row-groups in the file to align
