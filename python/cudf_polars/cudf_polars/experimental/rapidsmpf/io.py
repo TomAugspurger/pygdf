@@ -35,6 +35,7 @@ from cudf_polars.dsl.ir import (
 )
 from cudf_polars.dsl.to_ast import to_parquet_filter
 from cudf_polars.dsl.tracing import CUDF_POLARS_NVTX_DOMAIN
+from cudf_polars.dsl.utils.reshape import broadcast
 from cudf_polars.experimental.base import (
     IOPartitionFlavor,
     IOPartitionPlan,
@@ -571,10 +572,25 @@ def _do_hybrid_read(
             stream=stream,
         )
 
-        all_columns = list(filter_tbl.tbl.columns()) + list(payload_tbl.tbl.columns())
-        col_names = filter_tbl.column_names(
+        merged_columns = list(filter_tbl.tbl.columns()) + list(
+            payload_tbl.tbl.columns()
+        )
+        merged_names = filter_tbl.column_names(
             include_children=False
         ) + payload_tbl.column_names(include_children=False)
+
+        # The filter/payload split returns [filter_cols] + [payload_cols],
+        # which may differ from the requested column order.  Re-order to
+        # match ``with_columns`` (or ``schema`` when no projection).
+        target_order = with_columns if with_columns is not None else list(schema.keys())
+        if merged_names != target_order:
+            name_to_idx = {n: i for i, n in enumerate(merged_names)}
+            indices = [name_to_idx[n] for n in target_order]
+            all_columns = [merged_columns[i] for i in indices]
+            col_names = target_order
+        else:
+            all_columns = merged_columns
+            col_names = merged_names
     else:
         all_ranges = hybrid_reader.all_column_chunks_byte_ranges(row_groups, options)
         all_data = _read_file_byte_ranges(path, all_ranges)
@@ -588,12 +604,20 @@ def _do_hybrid_read(
         all_columns = list(tbl_w_meta.tbl.columns())
         col_names = tbl_w_meta.column_names(include_children=False)
 
-    return DataFrame.from_table(
+    df = DataFrame.from_table(
         plc.Table(all_columns),
         col_names,
         [schema[name] for name in col_names],
         stream=stream,
     )
+
+    if filter_expr is None and predicate is not None:
+        (mask,) = broadcast(
+            predicate.evaluate(df), target_length=df.num_rows, stream=stream
+        )
+        df = df.filter(mask)
+
+    return df
 
 
 async def read_chunk_hybrid(
