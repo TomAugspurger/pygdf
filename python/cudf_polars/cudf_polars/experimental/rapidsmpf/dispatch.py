@@ -58,6 +58,8 @@ class GenState(TypedDict):
         Statistics collector.
     collective_id_map
         The mapping of IR nodes to lists of collective IDs.
+    footer_cache
+        Pre-fetched parquet footer bytes keyed by file path.
     """
 
     context: Context
@@ -69,6 +71,7 @@ class GenState(TypedDict):
     max_io_threads: int
     stats: StatsCollector
     collective_id_map: dict[IR, list[int]]
+    footer_cache: dict[str, bytes]
 
 
 SubNetGenerator: TypeAlias = GenericTransformer[

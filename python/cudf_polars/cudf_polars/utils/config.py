@@ -226,6 +226,14 @@ def _bool_converter(v: str) -> bool:
         raise ValueError(f"Invalid boolean value: '{v}'")
 
 
+def _cudf_reader_converter(v: str) -> Literal["cudf", "hybrid-scan"]:
+    lowered = v.lower()
+    if lowered in {"cudf", "hybrid-scan"}:
+        return v  # type: ignore[return-value]
+    else:
+        raise ValueError(f"Invalid reader value: '{v}'")
+
+
 @dataclasses.dataclass(frozen=True)
 class ParquetOptions:
     """
@@ -264,6 +272,8 @@ class ParquetOptions:
         Whether to use the native rapidsmpf node for parquet reading.
         This option is only used when the rapidsmpf runtime is enabled.
         Default is False.
+    reader
+        'cudf' or 'hybrid-scan'.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -305,6 +315,13 @@ class ParquetOptions:
             default=False,
         )
     )
+    reader: Literal["cudf", "hybrid-scan"] = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__READER",
+            _cudf_reader_converter,
+            default="hybrid-scan",
+        )
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if not isinstance(self.chunked, bool):
@@ -321,6 +338,8 @@ class ParquetOptions:
             raise TypeError("max_row_group_samples must be an int")
         if not isinstance(self.use_rapidsmpf_native, bool):
             raise TypeError("use_rapidsmpf_native must be a bool")
+        if self.reader not in {"cudf", "hybrid-scan"}:
+            raise TypeError("reader must 'cudf' or 'hybrid-scan'")
 
 
 def default_target_partition_size(cluster: str, runtime: str) -> int:

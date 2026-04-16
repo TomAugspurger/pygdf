@@ -5,10 +5,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
+import io
 import math
+from concurrent.futures import as_completed
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import nvtx
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.memory_reserve_or_wait import (
     reserve_memory,
@@ -18,7 +23,9 @@ from rapidsmpf.streaming.cudf.channel_metadata import ChannelMetadata
 from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 
 import pylibcudf as plc
+import rmm
 
+from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import (
     IR,
     DataFrameScan,
@@ -27,6 +34,7 @@ from cudf_polars.dsl.ir import (
     _prepare_parquet_predicate,
 )
 from cudf_polars.dsl.to_ast import to_parquet_filter
+from cudf_polars.dsl.tracing import CUDF_POLARS_NVTX_DOMAIN
 from cudf_polars.experimental.base import (
     IOPartitionFlavor,
     IOPartitionPlan,
@@ -60,6 +68,7 @@ from cudf_polars.experimental.utils import _dynamic_planning_on
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
+    from concurrent.futures import ThreadPoolExecutor
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.streaming.core.channel import Channel
@@ -71,6 +80,37 @@ if TYPE_CHECKING:
     from cudf_polars.experimental.rapidsmpf.core import SubNetGenerator
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
     from cudf_polars.utils.config import ParquetOptions
+
+
+def _read_parquet_footer_bytes(path: str) -> bytes:
+    """Read raw Parquet footer bytes (Thrift-encoded FileMetaData) from a file."""
+    with Path(path).open("rb") as f:
+        f.seek(-8, 2)
+        suffix = f.read(8)
+        if suffix[4:] != b"PAR1":
+            raise ValueError(f"Not a valid Parquet file (bad magic): {path}")
+        footer_length = int.from_bytes(suffix[:4], byteorder="little")
+        f.seek(-(8 + footer_length), 2)
+        return f.read(footer_length)
+
+
+@nvtx.annotate(message="fetch_parquet_footers", domain=CUDF_POLARS_NVTX_DOMAIN)
+def fetch_parquet_footers(
+    paths: list[str],
+    executor: ThreadPoolExecutor,
+) -> dict[str, bytes]:
+    """Concurrently read Parquet footer bytes for every path using *executor*."""
+    if not paths:
+        return {}
+    unique_paths = set(paths)
+    futures = {executor.submit(_read_parquet_footer_bytes, p): p for p in unique_paths}
+    result: dict[str, bytes] = {}
+    for future in as_completed(futures):
+        path = futures[future]
+        with contextlib.suppress(Exception):
+            # TODO: this should *not* suppress exceptions...
+            result[path] = future.result()
+    return result
 
 
 class Lineariser:
@@ -404,6 +444,199 @@ async def read_chunk(
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class _HybridScanTask:
+    """Lightweight task for reading parquet data via HybridScanReader."""
+
+    path: str
+    footer_bytes: bytes
+    row_group_indices: list[int] | None
+
+
+def _get_row_groups_for_split(
+    all_rgs: list[int],
+    split_index: int,
+    total_splits: int,
+) -> list[int]:
+    """Return row-group indices assigned to *split_index* out of *total_splits*."""
+    total_row_groups = len(all_rgs)
+    rg_stride = total_row_groups // total_splits
+    skip_rgs = rg_stride * split_index
+    if split_index == total_splits - 1:
+        return all_rgs[skip_rgs:]
+    return all_rgs[skip_rgs : skip_rgs + rg_stride]
+
+
+def _read_file_byte_ranges(
+    path: str,
+    byte_ranges: list,
+) -> list[bytes]:
+    """Read multiple byte ranges from a local file."""
+    result: list[bytes] = []
+    with Path(path).open("rb") as f:
+        for br in byte_ranges:
+            f.seek(br.offset)
+            result.append(f.read(br.size))
+    return result
+
+
+def _to_device_spans(
+    data_list: list[bytes],
+    stream: rmm.pylibrmm.stream.Stream,
+) -> list[plc.gpumemoryview]:
+    """Copy host byte buffers to the GPU and wrap as gpumemoryview."""
+    return [plc.gpumemoryview(rmm.DeviceBuffer.to_device(d, stream)) for d in data_list]
+
+
+def _do_hybrid_read(
+    path: str,
+    footer_bytes: bytes,
+    schema: dict,
+    with_columns: list[str] | None,
+    predicate: Any | None,
+    row_group_indices: list[int] | None,
+    ir_context: IRExecutionContext,
+) -> DataFrame:
+    """Read parquet data using HybridScanReader with pre-fetched footer bytes."""
+    stream = ir_context.get_cuda_stream()
+
+    options = (
+        plc.io.parquet.ParquetReaderOptions.builder(plc.io.SourceInfo([io.BytesIO()]))  # type: ignore[arg-type]
+        .decimal_width(plc.TypeId.DECIMAL128)
+        .build()
+    )
+    if with_columns is not None:
+        options.set_column_names(with_columns)
+
+    filter_expr = None
+    if predicate is not None:
+        filter_expr = to_parquet_filter(
+            _prepare_parquet_predicate(predicate.value, [path], schema, with_columns),
+            stream=stream,
+        )
+        if filter_expr is not None:
+            options.set_filter(filter_expr)
+
+    hybrid_reader = plc.io.experimental.HybridScanReader(footer_bytes, options)
+
+    if row_group_indices is None:
+        row_groups = hybrid_reader.all_row_groups(options)
+    else:
+        row_groups = list(row_group_indices)
+
+    if filter_expr is not None:
+        row_groups = hybrid_reader.filter_row_groups_with_stats(
+            row_groups, options, stream=stream
+        )
+
+    if not row_groups:
+        names = with_columns if with_columns is not None else list(schema.keys())
+        return DataFrame.from_table(
+            plc.Table([]), names, [schema[n] for n in names], stream, num_rows=0
+        )
+
+    if filter_expr is not None:
+        filter_ranges = hybrid_reader.filter_column_chunks_byte_ranges(
+            row_groups, options
+        )
+        filter_data = _read_file_byte_ranges(path, filter_ranges)
+        filter_device = _to_device_spans(filter_data, stream)
+
+        n_rows = hybrid_reader.total_rows_in_row_groups(row_groups)
+        row_mask = plc.Column.from_scalar(
+            plc.Scalar.from_py(True, stream=stream),  # noqa: FBT003
+            n_rows,
+            stream=stream,
+        )
+        filter_tbl = hybrid_reader.materialize_filter_columns(
+            row_groups,
+            filter_device,  # type: ignore[arg-type]
+            row_mask,
+            plc.io.experimental.UseDataPageMask.NO,
+            options,
+            stream=stream,
+        )
+
+        payload_ranges = hybrid_reader.payload_column_chunks_byte_ranges(
+            row_groups, options
+        )
+        payload_data = _read_file_byte_ranges(path, payload_ranges)
+        payload_device = _to_device_spans(payload_data, stream)
+        payload_tbl = hybrid_reader.materialize_payload_columns(
+            row_groups,
+            payload_device,  # type: ignore[arg-type]
+            row_mask,
+            plc.io.experimental.UseDataPageMask.NO,
+            options,
+            stream=stream,
+        )
+
+        all_columns = list(filter_tbl.tbl.columns()) + list(payload_tbl.tbl.columns())
+        col_names = filter_tbl.column_names(
+            include_children=False
+        ) + payload_tbl.column_names(include_children=False)
+    else:
+        all_ranges = hybrid_reader.all_column_chunks_byte_ranges(row_groups, options)
+        all_data = _read_file_byte_ranges(path, all_ranges)
+        all_device = _to_device_spans(all_data, stream)
+        tbl_w_meta = hybrid_reader.materialize_all_columns(
+            row_groups,
+            all_device,  # type: ignore[arg-type]
+            options,
+            stream=stream,
+        )
+        all_columns = list(tbl_w_meta.tbl.columns())
+        col_names = tbl_w_meta.column_names(include_children=False)
+
+    return DataFrame.from_table(
+        plc.Table(all_columns),
+        col_names,
+        [schema[name] for name in col_names],
+        stream=stream,
+    )
+
+
+async def read_chunk_hybrid(
+    context: Context,
+    task: _HybridScanTask,
+    ir: Scan,
+    seq_num: int,
+    ch_out: Channel[TableChunk],
+    ir_context: IRExecutionContext,
+    estimated_chunk_bytes: int,
+    tracer: ActorTracer | None = None,
+) -> None:
+    """Read a parquet chunk via HybridScanReader and send it downstream."""
+    with opaque_memory_usage(
+        await reserve_memory(
+            context,
+            size=estimated_chunk_bytes,
+            net_memory_delta=estimated_chunk_bytes,
+        )
+    ):
+        df = await asyncio.to_thread(
+            _do_hybrid_read,
+            task.path,
+            task.footer_bytes,
+            ir.schema,
+            ir.with_columns,
+            ir.predicate,
+            task.row_group_indices,
+            ir_context,
+        )
+    if tracer is not None:
+        tracer.add_chunk(table=df.table)
+    await ch_out.send(
+        context,
+        Message(
+            seq_num,
+            TableChunk.from_pylibcudf_table(
+                df.table, df.stream, exclusive_view=True, br=context.br()
+            ),
+        ),
+    )
+
+
 @define_actor()
 async def scan_node(
     context: Context,
@@ -416,6 +649,7 @@ async def scan_node(
     plan: IOPartitionPlan,
     parquet_options: ParquetOptions,
     estimated_chunk_bytes: int,
+    footer_cache: dict[str, bytes] | None = None,
 ) -> None:
     """
     Scan node for rapidsmpf.
@@ -441,12 +675,52 @@ async def scan_node(
     estimated_chunk_bytes
         Estimated size of each chunk in bytes. Used for memory reservation
         with block spilling to avoid thrashing.
+    footer_cache
+        Pre-fetched parquet footer bytes keyed by file path.  When
+        available, metadata reads are skipped and the HybridScanReader
+        path is used instead of ``Scan.do_evaluate``.
     """
+
+    async def _dispatch_task(
+        task: Scan | SplitScan | _HybridScanTask,
+        seq_num: int,
+        ch_out: Channel[TableChunk],
+    ) -> None:
+        if isinstance(task, _HybridScanTask):
+            await read_chunk_hybrid(
+                context,
+                task,
+                ir,
+                seq_num,
+                ch_out,
+                ir_context,
+                estimated_chunk_bytes,
+                tracer=tracer,
+            )
+        else:
+            await read_chunk(
+                context,
+                task,
+                seq_num,
+                ch_out,
+                ir_context,
+                estimated_chunk_bytes,
+                tracer=tracer,
+            )
+
     async with shutdown_on_error(
         context, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
-        # Build a list of local Scan operations
-        scans: list[Scan | SplitScan] = []
+        _fc: dict[str, bytes] = footer_cache or {}
+        use_hybrid = bool(
+            _fc
+            and ir.typ == "parquet"
+            and ir.row_index is None
+            and ir.include_file_paths is None
+        )
+
+        # Build a list of local tasks (Scan, SplitScan, or _HybridScanTask)
+        tasks: list[Scan | SplitScan | _HybridScanTask] = []
         if plan.flavor == IOPartitionFlavor.SPLIT_FILES:
             count = plan.factor * len(ir.paths)
             local_count = math.ceil(count / comm.nranks)
@@ -458,32 +732,57 @@ async def scan_node(
             sindex = local_offset % plan.factor
             splits_created = 0
             for path in local_paths:
-                base_scan = Scan(
-                    ir.schema,
-                    ir.typ,
-                    ir.reader_options,
-                    ir.cloud_options,
-                    [path],
-                    ir.with_columns,
-                    ir.skip_rows,
-                    ir.n_rows,
-                    ir.row_index,
-                    ir.include_file_paths,
-                    ir.predicate,
-                    parquet_options,
+                footer_bytes = _fc.get(path) if use_hybrid else None
+                all_rgs: list[int] | None = None
+                if footer_bytes is not None:
+                    _opts = plc.io.parquet.ParquetReaderOptions.builder(
+                        plc.io.SourceInfo([io.BytesIO()])  # type: ignore[arg-type]
+                    ).build()
+                    _rdr = plc.io.experimental.HybridScanReader(footer_bytes, _opts)
+                    all_rgs = _rdr.all_row_groups(_opts)
+
+                can_hybrid_split = (
+                    all_rgs is not None
+                    and footer_bytes is not None
+                    and plan.factor <= len(all_rgs)
                 )
-                while sindex < plan.factor and splits_created < local_count:
-                    scans.append(
-                        SplitScan(
-                            ir.schema,
-                            base_scan,
-                            sindex,
-                            plan.factor,
-                            parquet_options,
+                if can_hybrid_split:
+                    assert all_rgs is not None
+                    assert footer_bytes is not None
+                    while sindex < plan.factor and splits_created < local_count:
+                        rg_indices = _get_row_groups_for_split(
+                            all_rgs, sindex, plan.factor
                         )
+                        tasks.append(_HybridScanTask(path, footer_bytes, rg_indices))
+                        sindex += 1
+                        splits_created += 1
+                else:
+                    base_scan = Scan(
+                        ir.schema,
+                        ir.typ,
+                        ir.reader_options,
+                        ir.cloud_options,
+                        [path],
+                        ir.with_columns,
+                        ir.skip_rows,
+                        ir.n_rows,
+                        ir.row_index,
+                        ir.include_file_paths,
+                        ir.predicate,
+                        parquet_options,
                     )
-                    sindex += 1
-                    splits_created += 1
+                    while sindex < plan.factor and splits_created < local_count:
+                        tasks.append(
+                            SplitScan(
+                                ir.schema,
+                                base_scan,
+                                sindex,
+                                plan.factor,
+                                parquet_options,
+                            )
+                        )
+                        sindex += 1
+                        splits_created += 1
                 sindex = 0
 
         else:
@@ -494,8 +793,14 @@ async def scan_node(
             paths_offset_end = paths_offset_start + plan.factor * local_count
             for offset in range(paths_offset_start, paths_offset_end, plan.factor):
                 local_paths = ir.paths[offset : offset + plan.factor]
-                if len(local_paths) > 0:  # Only add scan if there are paths
-                    scans.append(
+                if len(local_paths) == 0:
+                    continue
+                if use_hybrid and len(local_paths) == 1 and local_paths[0] in _fc:
+                    tasks.append(
+                        _HybridScanTask(local_paths[0], _fc[local_paths[0]], None)
+                    )
+                else:
+                    tasks.append(
                         Scan(
                             ir.schema,
                             ir.typ,
@@ -516,53 +821,37 @@ async def scan_node(
         await send_metadata(
             ch_out,
             context,
-            ChannelMetadata(local_count=len(scans)),
+            ChannelMetadata(local_count=len(tasks)),
         )
 
         # If there is nothing to scan, drain the channel and return
-        if len(scans) == 0:
+        if len(tasks) == 0:
             await ch_out.drain(context)
             return
 
-        # If there is only one scan or one producer, we can
+        # If there is only one task or one producer, we can
         # skip the lineariser and read the chunks directly
-        if len(scans) == 1 or num_producers == 1:
-            for seq_num, scan in enumerate(scans):
-                await read_chunk(
-                    context,
-                    scan,
-                    seq_num,
-                    ch_out,
-                    ir_context,
-                    estimated_chunk_bytes,
-                    tracer=tracer,
-                )
+        if len(tasks) == 1 or num_producers == 1:
+            for seq_num, task in enumerate(tasks):
+                await _dispatch_task(task, seq_num, ch_out)
             await ch_out.drain(context)
             return
 
         # Use Lineariser to ensure ordered delivery
-        num_producers = min(num_producers, len(scans))
+        num_producers = min(num_producers, len(tasks))
         lineariser = Lineariser(context, ch_out, num_producers)
 
         # Assign tasks to producers using round-robin
-        producer_tasks: list[list[tuple[int, Scan | SplitScan]]] = [
+        producer_tasks: list[list[tuple[int, Scan | SplitScan | _HybridScanTask]]] = [
             [] for _ in range(num_producers)
         ]
-        for task_idx, scan in enumerate(scans):
+        for task_idx, task in enumerate(tasks):
             producer_id = task_idx % num_producers
-            producer_tasks[producer_id].append((task_idx, scan))
+            producer_tasks[producer_id].append((task_idx, task))
 
         async def _producer(producer_id: int, ch_out: Channel) -> None:
-            for task_idx, scan in producer_tasks[producer_id]:
-                await read_chunk(
-                    context,
-                    scan,
-                    task_idx,
-                    ch_out,
-                    ir_context,
-                    estimated_chunk_bytes,
-                    tracer=tracer,
-                )
+            for task_idx, task in producer_tasks[producer_id]:
+                await _dispatch_task(task, task_idx, ch_out)
             await ch_out.drain(context)
 
         async with (
@@ -756,6 +1045,7 @@ def _(
                 plan=plan,
                 parquet_options=parquet_options,
                 estimated_chunk_bytes=executor.target_partition_size,
+                footer_cache=rec.state.get("footer_cache"),
             )
         ]
     return nodes, channels

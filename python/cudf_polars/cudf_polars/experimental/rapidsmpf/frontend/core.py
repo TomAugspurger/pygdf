@@ -20,8 +20,10 @@ from rapidsmpf.streaming.cudf.table_chunk import TableChunk
 import polars as pl
 
 from cudf_polars.containers import DataFrame
-from cudf_polars.dsl.ir import IRExecutionContext
+from cudf_polars.dsl.ir import IRExecutionContext, Scan
+from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.rapidsmpf.core import generate_network
+from cudf_polars.experimental.rapidsmpf.io import fetch_parquet_footers
 from cudf_polars.experimental.rapidsmpf.utils import empty_table_chunk
 from cudf_polars.experimental.utils import _concat
 
@@ -231,6 +233,14 @@ def execute_ir_on_rank(
     ir_context = IRExecutionContext(get_cuda_stream=ctx.get_stream_from_pool)
     metadata_collector: list[ChannelMetadata] | None = [] if collect_metadata else None
 
+    parquet_paths: list[str] = []
+    for node in traversal([ir]):
+        if isinstance(node, Scan) and node.typ == "parquet":
+            parquet_paths.extend(node.paths)
+    footer_cache: dict[str, bytes] = {}
+    if parquet_paths:
+        footer_cache = fetch_parquet_footers(parquet_paths, py_executor)
+
     nodes, output = generate_network(
         ctx,
         comm,
@@ -241,6 +251,7 @@ def execute_ir_on_rank(
         ir_context=ir_context,
         collective_id_map=collective_id_map,
         metadata_collector=metadata_collector,
+        footer_cache=footer_cache,
     )
 
     run_actor_network(actors=nodes, py_executor=py_executor)

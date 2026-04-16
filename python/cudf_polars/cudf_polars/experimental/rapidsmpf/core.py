@@ -49,6 +49,7 @@ from cudf_polars.experimental.base import PartitionInfo
 from cudf_polars.experimental.dispatch import lower_ir_node
 from cudf_polars.experimental.rapidsmpf.collectives import ReserveOpIDs
 from cudf_polars.experimental.rapidsmpf.dispatch import FanoutInfo
+from cudf_polars.experimental.rapidsmpf.io import fetch_parquet_footers
 from cudf_polars.experimental.rapidsmpf.nodes import (
     generate_ir_sub_network_wrapper,
     metadata_drain_node,
@@ -314,6 +315,23 @@ def evaluate_pipeline(
         else:
             ir_context = IRExecutionContext(query_id=query_id)
 
+        # Concurrently fetch all parquet footer bytes before building
+        # the network so that scan nodes never re-read metadata.
+        # TODO: See if we can do this during an existing traversal
+        parquet_paths: list[str] = []
+        footer_cache: dict[str, bytes] = {}
+
+        if config_options.parquet_options.reader == "hybrid-scan":
+            for node in traversal([ir]):
+                if isinstance(node, Scan) and node.typ == "parquet":
+                    parquet_paths.extend(node.paths)
+            if parquet_paths:
+                max_workers = max(1, config_options.executor.max_io_threads)
+                with ThreadPoolExecutor(
+                    max_workers=max_workers, thread_name_prefix="footer"
+                ) as fetch_executor:
+                    footer_cache = fetch_parquet_footers(parquet_paths, fetch_executor)
+
         # Generate network nodes
         assert rmpf_context is not None, "RapidsMPF context must defined."
         metadata_collector: list[ChannelMetadata] | None = (
@@ -329,6 +347,7 @@ def evaluate_pipeline(
             ir_context=ir_context,
             collective_id_map=collective_id_map,
             metadata_collector=metadata_collector,
+            footer_cache=footer_cache,
         )
 
         try:
@@ -519,6 +538,7 @@ def generate_network(
     ir_context: IRExecutionContext,
     collective_id_map: dict[IR, list[int]],
     metadata_collector: list[ChannelMetadata] | None,
+    footer_cache: dict[str, bytes] | None = None,
 ) -> tuple[list[Any], DeferredMessages]:
     """
     Translate the IR graph to a RapidsMPF streaming network.
@@ -545,6 +565,8 @@ def generate_network(
         The list to collect the final metadata.
         This list will be mutated when the network is executed.
         If None, metadata will not be collected.
+    footer_cache
+        Pre-fetched parquet footer bytes keyed by file path.
 
     Returns
     -------
@@ -577,6 +599,7 @@ def generate_network(
         "max_io_threads": max_io_threads_local,
         "stats": stats,
         "collective_id_map": collective_id_map,
+        "footer_cache": footer_cache or {},
     }
     mapper: SubNetGenerator = CachingVisitor(
         generate_ir_sub_network_wrapper, state=state
