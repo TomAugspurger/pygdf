@@ -319,7 +319,7 @@ def evaluate_pipeline(
         # the network so that scan nodes never re-read metadata.
         # TODO: See if we can do this during an existing traversal
         parquet_paths: list[str] = []
-        footer_cache: dict[str, bytes] = {}
+        footer_cache: dict[str, tuple[bytes, int | None]] = {}
 
         if config_options.parquet_options.reader == "hybrid-scan":
             for node in traversal([ir]):
@@ -538,7 +538,7 @@ def generate_network(
     ir_context: IRExecutionContext,
     collective_id_map: dict[IR, list[int]],
     metadata_collector: list[ChannelMetadata] | None,
-    footer_cache: dict[str, bytes] | None = None,
+    footer_cache: dict[str, tuple[bytes, int | None]] | None = None,
 ) -> tuple[list[Any], DeferredMessages]:
     """
     Translate the IR graph to a RapidsMPF streaming network.
@@ -566,7 +566,8 @@ def generate_network(
         This list will be mutated when the network is executed.
         If None, metadata will not be collected.
     footer_cache
-        Pre-fetched parquet footer bytes keyed by file path.
+        Pre-fetched parquet footer bytes and file sizes keyed by file
+        path.  Each value is ``(footer_bytes, file_size)``.
 
     Returns
     -------

@@ -84,27 +84,73 @@ if TYPE_CHECKING:
 
 
 import httpx
+import kvikio
+import numpy as np
 
 
-def _read_parquet_footer_bytes_http(url: str, client: httpx.Client) -> bytes:
-    response = client.get(url, headers={"Range": "bytes=-8"})
-    response.raise_for_status()
-
-    if response.content[-4:] != b"PAR1":
-        raise ValueError(f"Not a valid Parquet file (bad magic): {url}")
-    footer_length = int.from_bytes(response.content[-8:-4], byteorder="little")
-    # response.content[-8-footer_length:-8]
-
-    # now get the footer bytes, from -footer_length.
-    response = client.get(url, headers={"Range": f"bytes=-{footer_length + 8}"})
-    response.raise_for_status()
-
-    return response.content[:-8]
+def _parse_file_size_from_content_range(response: httpx.Response) -> int | None:
+    """Extract total file size from a ``Content-Range`` header, if present."""
+    cr = response.headers.get("content-range", "")
+    if "/" in cr:
+        try:
+            return int(cr.rsplit("/", 1)[1])
+        except (ValueError, IndexError):
+            pass
+    return None
 
 
-def _read_parquet_footer_bytes(path: str, client: httpx.Client) -> bytes:
-    """Read raw Parquet footer bytes (Thrift-encoded FileMetaData) from a file."""
-    if path.startswith(("https://", "http://")):
+def _read_parquet_footer_bytes_http(
+    url: str, client: httpx.Client
+) -> tuple[bytes, int | None]:
+    if url.startswith("s3://"):
+        remote = kvikio.RemoteFile.open_s3_url(url)
+        file_size = remote.nbytes()
+        suffix_buffer = np.empty(8, dtype=np.uint8)
+        remote.read(suffix_buffer, 8, file_offset=file_size - 8)
+
+        if suffix_buffer[-4:].tobytes() != b"PAR1":
+            raise ValueError(f"Not a valid Parquet file (bad magic): {url}")
+        footer_length = int.from_bytes(suffix_buffer[-8:-4], byteorder="little")
+
+        footer_buffer = np.empty(footer_length - 8, dtype=np.uint8)
+        remote.read(
+            footer_buffer,
+            footer_length - 8,
+            file_offset=file_size - (footer_length + 8),
+        )
+        footer_bytes = footer_buffer.tobytes()
+    else:
+        response = client.get(url, headers={"Range": "bytes=-8"})
+        response.raise_for_status()
+
+        file_size = _parse_file_size_from_content_range(response)
+
+        if response.content[-4:] != b"PAR1":
+            raise ValueError(f"Not a valid Parquet file (bad magic): {url}")
+        footer_length = int.from_bytes(response.content[-8:-4], byteorder="little")
+
+        response = client.get(url, headers={"Range": f"bytes=-{footer_length + 8}"})
+        response.raise_for_status()
+
+        if file_size is None:
+            file_size = _parse_file_size_from_content_range(response)
+
+        footer_bytes = response.content[:-8]
+
+    return footer_bytes, file_size
+
+
+def _read_parquet_footer_bytes(
+    path: str, client: httpx.Client
+) -> tuple[bytes, int | None]:
+    """
+    Read raw Parquet footer bytes (Thrift-encoded FileMetaData) from a file.
+
+    Returns ``(footer_bytes, file_size)`` where *file_size* is extracted
+    from the HTTP ``Content-Range`` header for remote files, or from
+    ``os.path.getsize`` for local files.
+    """
+    if path.startswith(("https://", "http://", "s3://")):
         return _read_parquet_footer_bytes_http(path, client)
 
     with Path(path).open("rb") as f:
@@ -114,15 +160,22 @@ def _read_parquet_footer_bytes(path: str, client: httpx.Client) -> bytes:
             raise ValueError(f"Not a valid Parquet file (bad magic): {path}")
         footer_length = int.from_bytes(suffix[:4], byteorder="little")
         f.seek(-(8 + footer_length), 2)
-        return f.read(footer_length)
+        file_size = Path(path).stat().st_size
+        return f.read(footer_length), file_size
 
 
 @nvtx.annotate(message="fetch_parquet_footers", domain=CUDF_POLARS_NVTX_DOMAIN)
 def fetch_parquet_footers(
     paths: list[str],
     executor: ThreadPoolExecutor,
-) -> dict[str, bytes]:
-    """Concurrently read Parquet footer bytes for every path using *executor*."""
+) -> dict[str, tuple[bytes, int | None]]:
+    """
+    Concurrently read Parquet footer bytes for every path using *executor*.
+
+    Returns a mapping of ``{path: (footer_bytes, file_size)}``.  The
+    *file_size* is obtained from the HTTP ``Content-Range`` header for
+    remote files and from ``os.path.getsize`` for local files.
+    """
     if not paths:
         return {}
     unique_paths = set(paths)
@@ -130,7 +183,7 @@ def fetch_parquet_footers(
     futures = {
         executor.submit(_read_parquet_footer_bytes, p, client): p for p in unique_paths
     }
-    result: dict[str, bytes] = {}
+    result: dict[str, tuple[bytes, int | None]] = {}
     for future in as_completed(futures):
         path = futures[future]
         result[path] = future.result()
@@ -475,6 +528,7 @@ class _HybridScanTask:
     path: str
     footer_bytes: bytes
     row_group_indices: list[int] | None
+    file_size: int | None = None
 
 
 def _get_row_groups_for_split(
@@ -504,12 +558,13 @@ def _rowgroup_metadata_from_footer(
 def _read_file_byte_ranges(
     path: str,
     byte_ranges: list,
+    file_size: int | None = None,
 ) -> list[bytes]:
-    """Read multiple byte ranges from a local file."""
-    result: list[bytes] = []
-    if path.startswith(("https://", "http://")):
-        return _read_file_byte_ranges_http(path, byte_ranges)
+    """Read multiple byte ranges from a local or remote file."""
+    if path.startswith(("https://", "http://", "s3://")):
+        return _read_file_byte_ranges_http(path, byte_ranges, file_size=file_size)
 
+    result: list[bytes] = []
     with Path(path).open("rb") as f:
         for br in byte_ranges:
             f.seek(br.offset)
@@ -520,16 +575,25 @@ def _read_file_byte_ranges(
 def _read_file_byte_ranges_http(
     path: str,
     byte_ranges: list,
+    file_size: int | None = None,
 ) -> list[bytes]:
-    """Read multiple byte ranges from a remote file."""
+    """
+    Read multiple byte ranges from a remote file.
+
+    When *file_size* is provided, uses ``kvikio.RemoteFile`` to avoid
+    an extra HEAD request for the file length.  Falls back to plain
+    ``httpx`` range requests when kvikio is unavailable or *file_size*
+    is unknown.
+    """
+    if path.startswith("s3://"):
+        remote = kvikio.RemoteFile.open_s3_url(path, nbytes=file_size)
+    else:
+        remote = kvikio.RemoteFile.open_http(path, nbytes=file_size)
     result: list[bytes] = []
-    client = httpx.Client()
     for br in byte_ranges:
-        response = client.get(
-            path, headers={"Range": f"bytes={br.offset}-{br.offset + br.size}"}
-        )
-        response.raise_for_status()
-        result.append(response.content)
+        buf = bytearray(br.size)
+        remote.read(buf, br.size, file_offset=br.offset)
+        result.append(bytes(buf))
     return result
 
 
@@ -550,6 +614,7 @@ def _do_hybrid_read(
     predicate: Any | None,
     row_group_indices: list[int] | None,
     ir_context: IRExecutionContext,
+    file_size: int | None = None,
 ) -> DataFrame:
     """Read parquet data using HybridScanReader with pre-fetched footer bytes."""
     stream = ir_context.get_cuda_stream()
@@ -599,7 +664,9 @@ def _do_hybrid_read(
             with nvtx.annotate(
                 "hybrid-scan-filter-read", domain=CUDF_POLARS_NVTX_DOMAIN
             ):
-                filter_data = _read_file_byte_ranges(path, filter_ranges)
+                filter_data = _read_file_byte_ranges(
+                    path, filter_ranges, file_size=file_size
+                )
                 filter_device = _to_device_spans(filter_data, stream)
 
             n_rows = hybrid_reader.total_rows_in_row_groups(row_groups)
@@ -620,7 +687,9 @@ def _do_hybrid_read(
             payload_ranges = hybrid_reader.payload_column_chunks_byte_ranges(
                 row_groups, options
             )
-            payload_data = _read_file_byte_ranges(path, payload_ranges)
+            payload_data = _read_file_byte_ranges(
+                path, payload_ranges, file_size=file_size
+            )
             payload_device = _to_device_spans(payload_data, stream)
             payload_tbl = hybrid_reader.materialize_payload_columns(
                 row_groups,
@@ -658,7 +727,7 @@ def _do_hybrid_read(
                 row_groups, options
             )
             with nvtx.annotate("hybrid-scan-all-read", domain=CUDF_POLARS_NVTX_DOMAIN):
-                all_data = _read_file_byte_ranges(path, all_ranges)
+                all_data = _read_file_byte_ranges(path, all_ranges, file_size=file_size)
             all_device = _to_device_spans(all_data, stream)
             tbl_w_meta = hybrid_reader.materialize_all_columns(
                 row_groups,
@@ -712,6 +781,7 @@ async def read_chunk_hybrid(
             ir.predicate,
             task.row_group_indices,
             ir_context,
+            file_size=task.file_size,
         )
     if tracer is not None:
         tracer.add_chunk(table=df.table)
@@ -738,7 +808,7 @@ async def scan_node(
     plan: IOPartitionPlan,
     parquet_options: ParquetOptions,
     estimated_chunk_bytes: int,
-    footer_cache: dict[str, bytes] | None = None,
+    footer_cache: dict[str, tuple[bytes, int | None]] | None = None,
 ) -> None:
     """
     Scan node for rapidsmpf.
@@ -765,7 +835,8 @@ async def scan_node(
         Estimated size of each chunk in bytes. Used for memory reservation
         with block spilling to avoid thrashing.
     footer_cache
-        Pre-fetched parquet footer bytes keyed by file path.  When
+        Pre-fetched parquet footer bytes and file sizes keyed by file
+        path.  Each value is ``(footer_bytes, file_size)``.  When
         available, metadata reads are skipped and the HybridScanReader
         path is used instead of ``Scan.do_evaluate``.
     """
@@ -800,7 +871,7 @@ async def scan_node(
     async with shutdown_on_error(
         context, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
-        _fc: dict[str, bytes] = footer_cache or {}
+        _fc: dict[str, tuple[bytes, int | None]] = footer_cache or {}
         use_hybrid = bool(
             _fc
             and ir.typ == "parquet"
@@ -821,7 +892,12 @@ async def scan_node(
             sindex = local_offset % plan.factor
             splits_created = 0
             for path in local_paths:
-                footer_bytes = _fc.get(path) if use_hybrid else None
+                cached = _fc.get(path) if use_hybrid else None
+                footer_bytes: bytes | None = None
+                file_size: int | None = None
+                if cached is not None:
+                    footer_bytes, file_size = cached
+
                 all_rgs: list[int] | None = None
                 if footer_bytes is not None:
                     _opts = plc.io.parquet.ParquetReaderOptions.builder(
@@ -842,7 +918,9 @@ async def scan_node(
                         rg_indices = _get_row_groups_for_split(
                             all_rgs, sindex, plan.factor
                         )
-                        tasks.append(_HybridScanTask(path, footer_bytes, rg_indices))
+                        tasks.append(
+                            _HybridScanTask(path, footer_bytes, rg_indices, file_size)
+                        )
                         sindex += 1
                         splits_created += 1
                 else:
@@ -889,9 +967,8 @@ async def scan_node(
                 if len(local_paths) == 0:
                     continue
                 if use_hybrid and len(local_paths) == 1 and local_paths[0] in _fc:
-                    tasks.append(
-                        _HybridScanTask(local_paths[0], _fc[local_paths[0]], None)
-                    )
+                    fb, fs = _fc[local_paths[0]]
+                    tasks.append(_HybridScanTask(local_paths[0], fb, None, fs))
                 else:
                     tasks.append(
                         Scan(

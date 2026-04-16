@@ -237,7 +237,7 @@ def execute_ir_on_rank(
     for node in traversal([ir]):
         if isinstance(node, Scan) and node.typ == "parquet":
             parquet_paths.extend(node.paths)
-    footer_cache: dict[str, bytes] = {}
+    footer_cache: dict[str, tuple[bytes, int | None]] = {}
     if parquet_paths:
         footer_cache = fetch_parquet_footers(parquet_paths, py_executor)
 
