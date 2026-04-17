@@ -676,30 +676,33 @@ def _do_hybrid_read(
                 n_rows,
                 stream=stream,
             )
-            filter_tbl = hybrid_reader.materialize_filter_columns(
-                row_groups,
-                filter_device,  # type: ignore[arg-type]
-                row_mask,
-                plc.io.experimental.UseDataPageMask.NO,
-                options,
-                stream=stream,
-            )
+            with nvtx.annotate("hybrid-scan-filter-materialize-filter", domain=CUDF_POLARS_NVTX_DOMAIN):
+                filter_tbl = hybrid_reader.materialize_filter_columns(
+                    row_groups,
+                    filter_device,  # type: ignore[arg-type]
+                    row_mask,
+                    plc.io.experimental.UseDataPageMask.NO,
+                    options,
+                    stream=stream,
+                )
 
-            payload_ranges = hybrid_reader.payload_column_chunks_byte_ranges(
-                row_groups, options
-            )
-            payload_data = _read_file_byte_ranges(
-                path, payload_ranges, file_size=file_size
-            )
-            payload_device = _to_device_spans(payload_data, stream)
-            payload_tbl = hybrid_reader.materialize_payload_columns(
-                row_groups,
-                payload_device,  # type: ignore[arg-type]
-                row_mask,
-                plc.io.experimental.UseDataPageMask.NO,
-                options,
-                stream=stream,
-            )
+            with nvtx.annotate("hybrid-scan-payload-ranges", domain=CUDF_POLARS_NVTX_DOMAIN):
+                payload_ranges = hybrid_reader.payload_column_chunks_byte_ranges(
+                    row_groups, options
+                )
+                payload_data = _read_file_byte_ranges(
+                    path, payload_ranges, file_size=file_size
+                )
+                payload_device = _to_device_spans(payload_data, stream)
+            with nvtx.annotate("hybrid-scan-payload-materialize-payload", domain=CUDF_POLARS_NVTX_DOMAIN):
+                payload_tbl = hybrid_reader.materialize_payload_columns(
+                    row_groups,
+                    payload_device,  # type: ignore[arg-type]
+                    row_mask,
+                    plc.io.experimental.UseDataPageMask.NO,
+                    options,
+                    stream=stream,
+                )
 
             merged_columns = list(filter_tbl.tbl.columns()) + list(
                 payload_tbl.tbl.columns()
