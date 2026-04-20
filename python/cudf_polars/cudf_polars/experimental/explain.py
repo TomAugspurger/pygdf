@@ -81,13 +81,14 @@ def explain_query(
     config = ConfigOptions.from_polars_engine(engine)
     ir = Translator(q._ldf.visit(), engine).translate_ir()
 
+    stats = collect_statistics(ir, config)
     if physical:
-        lowered_ir, partition_info, _ = lower_ir_graph(ir, config)
+        lowered_ir, partition_info = lower_ir_graph(ir, config, stats)
         return _repr_ir_tree(lowered_ir, partition_info)
     else:
         if config.executor.name == "streaming":
             # Include row-count statistics for the logical plan
-            return _repr_ir_tree(ir, stats=collect_statistics(ir, config))
+            return _repr_ir_tree(ir, stats=stats)
         else:
             return _repr_ir_tree(ir)
 
@@ -446,7 +447,8 @@ class SerializablePlan:
         """
         partition_info_dict: dict[str, SerializablePartitionInfo] | None = None
         if lowered:
-            ir, partition_info_d, _ = lower_ir_graph(ir, config_options)
+            stats = collect_statistics(ir, config_options)
+            ir, partition_info_d = lower_ir_graph(ir, config_options, stats)
             partition_info_dict = {}
 
         nodes: dict[str, SerializableIRNode] = {}

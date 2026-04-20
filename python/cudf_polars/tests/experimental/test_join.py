@@ -16,6 +16,7 @@ from cudf_polars.experimental.base import PartitionInfo
 from cudf_polars.experimental.parallel import lower_ir_graph
 from cudf_polars.experimental.rapidsmpf.join import _use_pwise_join
 from cudf_polars.experimental.shuffle import Shuffle
+from cudf_polars.experimental.statistics import collect_statistics
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
@@ -322,12 +323,12 @@ def test_broadcast_join_limit(left, right, broadcast_join_limit):
     )
 
     q = left.join(right, on="y", how="inner")
+    qir = Translator(q._ldf.visit(), engine).translate_ir()
+    config = ConfigOptions.from_polars_engine(engine)
+    stats = collect_statistics(qir, config)
     shuffle_nodes = [
         type(node)
-        for node in lower_ir_graph(
-            Translator(q._ldf.visit(), engine).translate_ir(),
-            ConfigOptions.from_polars_engine(engine),
-        )[1]
+        for node in lower_ir_graph(qir, config, stats)[1]
         if isinstance(node, Shuffle)
     ]
 
@@ -366,7 +367,8 @@ def test_cache_preserves_partitioning_join():
 
     config_options = ConfigOptions.from_polars_engine(engine)
     ir = Translator(q._ldf.visit(), engine).translate_ir()
-    lowered_ir, partition_info, _ = lower_ir_graph(ir, config_options)
+    stats = collect_statistics(ir, config_options)
+    lowered_ir, partition_info = lower_ir_graph(ir, config_options, stats)
 
     # Cache should preserve partitioning on 'key'
     cache_partitioning = [

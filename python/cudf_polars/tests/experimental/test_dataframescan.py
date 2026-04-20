@@ -12,6 +12,7 @@ import polars as pl
 from cudf_polars import Translator
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.parallel import lower_ir_graph
+from cudf_polars.experimental.statistics import collect_statistics
 from cudf_polars.testing.asserts import assert_gpu_result_equal
 from cudf_polars.utils.config import ConfigOptions
 
@@ -51,7 +52,8 @@ def test_parallel_dataframescan(df, max_rows_per_partition, engine):
         executor_options={"max_rows_per_partition": max_rows_per_partition},
     )
     qir = Translator(df._ldf.visit(), _engine).translate_ir()
-    ir, info, _ = lower_ir_graph(qir, ConfigOptions.from_polars_engine(_engine))
+    stats = collect_statistics(qir, ConfigOptions.from_polars_engine(_engine))
+    ir, info = lower_ir_graph(qir, ConfigOptions.from_polars_engine(_engine), stats)
     count = info[ir].count
     if max_rows_per_partition < total_row_count:
         assert count > 1
@@ -77,10 +79,10 @@ def test_join_in_memory_lazy_stable_id_pickle():
     )
     left = pl.LazyFrame({"k": [1, 2, 3], "x": [10, 20, 30]}).collect().lazy()
     right = pl.LazyFrame({"k": [2, 3, 4], "y": [1, 2, 3]}).collect().lazy()
-    ir, _, _ = lower_ir_graph(
-        Translator(left.join(right, on="k")._ldf.visit(), engine).translate_ir(),
-        ConfigOptions.from_polars_engine(engine),
-    )
+    qir = Translator(left.join(right, on="k")._ldf.visit(), engine).translate_ir()
+    config = ConfigOptions.from_polars_engine(engine)
+    stats = collect_statistics(qir, config)
+    ir, _ = lower_ir_graph(qir, config, stats)
     _assert_stable_ids_match(ir, pickle.loads(pickle.dumps(ir)))
 
 
@@ -91,7 +93,9 @@ def test_dataframescan_pickle(df):
         executor_options={"max_rows_per_partition": 1_000},
     )
     qir = Translator(df._ldf.visit(), _engine).translate_ir()
-    ir, _, _ = lower_ir_graph(qir, ConfigOptions.from_polars_engine(_engine))
+    config = ConfigOptions.from_polars_engine(_engine)
+    stats = collect_statistics(qir, config)
+    ir, _ = lower_ir_graph(qir, config, stats)
 
     # Pickle and unpickle the IR (which contains DataFrameScan)
     pickled = pickle.dumps(ir)

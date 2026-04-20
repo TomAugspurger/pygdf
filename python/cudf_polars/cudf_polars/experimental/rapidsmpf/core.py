@@ -56,6 +56,7 @@ from cudf_polars.experimental.rapidsmpf.nodes import (
 from cudf_polars.experimental.rapidsmpf.tracing import log_query_plan
 from cudf_polars.experimental.rapidsmpf.utils import empty_table_chunk
 from cudf_polars.experimental.repartition import Repartition
+from cudf_polars.experimental.statistics import collect_statistics
 from cudf_polars.utils.config import CUDAStreamPoolConfig
 
 if TYPE_CHECKING:
@@ -103,7 +104,8 @@ def evaluate_logical_plan(
     assert config_options.executor.runtime == "rapidsmpf", "Runtime must be rapidsmpf"
 
     # Lower the IR graph on the client process (for now).
-    ir, partition_info, stats = lower_ir_graph(ir, config_options)
+    stats = collect_statistics(ir, config_options)
+    ir, partition_info = lower_ir_graph(ir, config_options, stats)
 
     # Dask may return chunks in arbitrary order.
     # Make sure we always finish with a Repartition for now.
