@@ -17,6 +17,7 @@ import pprint
 import statistics
 import sys
 import textwrap
+import threading
 import time
 import traceback
 import uuid
@@ -395,6 +396,8 @@ class RunConfig:
     iterations: int
     io_mode: Literal["cold", "lukewarm", "hot"] = "lukewarm"
     collect_traces: bool = False
+    streaming_logs: bool = False
+    resource_monitor_interval: float = 0.0
     native_parquet: bool = True
     max_io_threads: int = 2
     # All streaming/rapidsmpf/engine knobs
@@ -425,6 +428,9 @@ class RunConfig:
     )
 
     def __post_init__(self) -> None:  # noqa: D105
+        if self.streaming_logs:
+            self.collect_traces = True
+
         if self.io_mode == "hot" and self.iterations < 2:
             raise ValueError(
                 "--io-mode hot requires at least 2 iterations: "
@@ -514,6 +520,8 @@ class RunConfig:
             iterations=args.iterations,
             io_mode=args.io_mode,
             collect_traces=args.collect_traces,
+            streaming_logs=args.streaming_logs,
+            resource_monitor_interval=args.resource_monitor_interval,
             native_parquet=args.native_parquet,
             max_io_threads=args.max_io_threads,
             streaming_options=streaming_options,
@@ -538,6 +546,8 @@ class RunConfig:
             "iterations": self.iterations,
             "io_mode": self.io_mode,
             "collect_traces": self.collect_traces,
+            "streaming_logs": self.streaming_logs,
+            "resource_monitor_interval": self.resource_monitor_interval,
             "native_parquet": self.native_parquet,
             "max_io_threads": self.max_io_threads,
             "n_workers": self.n_workers,
@@ -935,9 +945,14 @@ def run_polars_query(
 
     for i in range(args.iterations):
         if _HAS_STRUCTLOG and run_config.collect_traces:
-            setup_logging(q_id, i)
+            logging_kwargs = {
+                "streaming_logs": run_config.streaming_logs,
+                "run_id": run_config.run_id,
+                "resource_monitor_interval": run_config.resource_monitor_interval,
+            }
+            setup_logging(q_id, i, **logging_kwargs)
             if engine is not None:
-                engine._run(setup_logging, q_id, i)
+                engine._run(setup_logging, q_id, i, **logging_kwargs)
 
         try:
             record = run_polars_query_iteration(
@@ -1124,6 +1139,8 @@ def run_polars_spmd(
         if engine.rank > 0:
             sys.exit(1 if (query_failures or validation_failures) else 0)
         run_config = dataclasses.replace(run_config, records=dict(records), plans=plans)
+        stop_resource_monitor()
+        engine._run(stop_resource_monitor)
         run_config = _consolidate_logs(
             run_config, engine=engine, gather_client_logs=False
         )
@@ -1173,6 +1190,8 @@ def run_polars_ray(
             validation_files,
         )
         run_config = dataclasses.replace(run_config, records=dict(records), plans=plans)
+        stop_resource_monitor()
+        engine._run(stop_resource_monitor)
         run_config = _consolidate_logs(run_config, engine=engine)
 
     _finalize_benchmark_run(args, run_config, validation_failures, query_failures)
@@ -1232,6 +1251,8 @@ def run_polars_dask(
             run_config = dataclasses.replace(
                 run_config, records=dict(records), plans=plans
             )
+            stop_resource_monitor()
+            engine._run(stop_resource_monitor)
             run_config = _consolidate_logs(run_config, engine)
     finally:
         if dask_client is not None:
@@ -1239,7 +1260,26 @@ def run_polars_dask(
     _finalize_benchmark_run(args, run_config, validation_failures, query_failures)
 
 
-def setup_logging(query_id: int, iteration: int) -> None:
+_resource_monitor: ResourceMonitor | None = None
+
+
+def stop_resource_monitor() -> None:
+    """Stop the module-level resource monitor, if one is running."""
+    global _resource_monitor  # noqa: PLW0603
+    if _resource_monitor is not None:
+        _resource_monitor.stop()
+        _resource_monitor = None
+
+
+def setup_logging(
+    query_id: int,
+    iteration: int,
+    *,
+    streaming_logs: bool = False,
+    run_id: uuid.UUID | None = None,
+    resource_monitor_interval: float = 0.0,
+) -> None:
+    global _resource_monitor  # noqa: PLW0603
     import cudf_polars.dsl.tracing
 
     if not cudf_polars.dsl.tracing.LOG_TRACES:
@@ -1289,19 +1329,32 @@ def setup_logging(query_id: int, iteration: int) -> None:
             structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S.%f", utc=False),
         ]
 
-        # For logging to a file
         json_renderer = structlog.processors.JSONRenderer()
+        proc_fmt = structlog.stdlib.ProcessorFormatter
 
         stream = io.StringIO()
-        json_file_handler = logging.StreamHandler(stream)
-        json_file_handler.setFormatter(
-            structlog.stdlib.ProcessorFormatter(
+        memory_handler = logging.StreamHandler(stream)
+        memory_handler.setFormatter(
+            proc_fmt(
                 processor=json_renderer,
                 foreign_pre_chain=shared_processors,
             )
         )
 
-        logging.basicConfig(level=logging.INFO, handlers=[json_file_handler])
+        handlers: list[logging.Handler] = [memory_handler]
+        if streaming_logs:
+            ndjson_handler = logging.FileHandler(
+                f"logs-{run_id}-{os.getpid()}.ndjson", mode="a", encoding="utf-8"
+            )
+            ndjson_handler.setFormatter(
+                proc_fmt(
+                    processor=json_renderer,
+                    foreign_pre_chain=shared_processors,
+                )
+            )
+            handlers.append(ndjson_handler)
+
+        logging.basicConfig(level=logging.INFO, handlers=handlers)
 
         structlog.configure(
             processors=[
@@ -1312,6 +1365,76 @@ def setup_logging(query_id: int, iteration: int) -> None:
             wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
             cache_logger_on_first_use=True,
         )
+
+    if resource_monitor_interval > 0 and _resource_monitor is None:
+        _resource_monitor = ResourceMonitor(
+            interval=resource_monitor_interval,
+            run_id=run_id,
+        )
+        _resource_monitor.start()
+
+
+class ResourceMonitor:
+    """Periodically sample host and device resource utilization in a background thread."""
+
+    def __init__(self, interval: float, run_id: uuid.UUID) -> None:
+        self.interval = interval
+        self.run_id = run_id
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Start the background sampling thread."""
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Signal the background thread to stop and wait for it."""
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.interval + 1)
+
+    def __enter__(self) -> ResourceMonitor:
+        self.start()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.stop()
+
+    def _run(self) -> None:
+        log = structlog.get_logger()
+        while not self._stop_event.wait(self.interval):
+            log.info("resource_monitor", **self._sample())
+
+    def _sample(self) -> dict[str, Any]:
+        import psutil
+
+        pid = os.getpid()
+        record: dict[str, Any] = {
+            "scope": "resource_monitor",
+            "timestamp": time.time(),
+            "pid": pid,
+        }
+        record["host_cpu_percent"] = psutil.cpu_percent()
+        mem = psutil.virtual_memory()
+        record["host_memory_available"] = mem.available
+        record["host_memory_total"] = mem.total
+        record["host_memory_percent"] = mem.percent
+        proc_mem = psutil.Process(pid).memory_info()
+        record["process_rss"] = proc_mem.rss
+
+        pynvml.nvmlInit()
+        for i in range(pynvml.nvmlDeviceGetCount()):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            gpu_mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            record[f"gpu_{i}_memory_total"] = gpu_mem.total
+            processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+            for proc in processes:
+                if proc.pid == pid:
+                    record[f"gpu_{i}_memory_used"] = proc.usedGpuMemory
+                    break
+
+        return record
 
 
 def _consolidate_logs(
@@ -1721,6 +1844,18 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Collect data tracing cudf-polars execution.",
+    )
+    parser.add_argument(
+        "--streaming-logs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Stream trace logs to an NDJSON file in addition to collecting in memory.",
+    )
+    parser.add_argument(
+        "--resource-monitor-interval",
+        type=float,
+        default=0.0,
+        help="Interval in seconds for periodic resource utilization sampling. 0 to disable.",
     )
     parser.add_argument(
         "--debug",
