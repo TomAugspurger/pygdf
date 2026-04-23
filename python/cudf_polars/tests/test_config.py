@@ -61,6 +61,13 @@ def rapidsmpf_distributed_available(request, monkeypatch):
     return request.param
 
 
+@pytest.fixture
+def default_parquet_options_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CUDF_POLARS__PARQUET_OPTIONS__CHUNKED", raising=False)
+    monkeypatch.delenv("CUDF_POLARS__PARQUET_OPTIONS__USE_HYBRID_SCAN", raising=False)
+    monkeypatch.delenv("CUDF_POLARS__PARQUET_OPTIONS__N_OUTPUT_CHUNKS", raising=False)
+
+
 def test_polars_verbose_warns(monkeypatch):
     def raise_unimplemented(self, *args):
         raise NotImplementedError("We don't support this")
@@ -213,6 +220,7 @@ def test_nested_memory_resource_config():
 
 
 @pytest.mark.parametrize("executor", ["streaming", "in-memory"])
+@pytest.mark.usefixtures("default_parquet_options_env")
 def test_parquet_options(executor: str) -> None:
     config = ConfigOptions.from_polars_engine(
         pl.GPUEngine(
@@ -221,17 +229,24 @@ def test_parquet_options(executor: str) -> None:
     )
     assert config.parquet_options.chunked is True
     assert config.parquet_options.n_output_chunks == 1
+    assert config.parquet_options.use_hybrid_scan is False
 
     config = ConfigOptions.from_polars_engine(
         pl.GPUEngine(
             executor=executor,
-            parquet_options={"chunked": False, "n_output_chunks": 16},
+            parquet_options={
+                "chunked": False,
+                "n_output_chunks": 16,
+                "use_hybrid_scan": True,
+            },
         )
     )
     assert config.parquet_options.chunked is False
     assert config.parquet_options.n_output_chunks == 16
+    assert config.parquet_options.use_hybrid_scan is True
 
 
+@pytest.mark.usefixtures("default_parquet_options_env")
 def test_parquet_options_from_none() -> None:
     config = ConfigOptions.from_polars_engine(
         pl.GPUEngine(
@@ -240,6 +255,7 @@ def test_parquet_options_from_none() -> None:
         )
     )
     assert config.parquet_options.chunked is True
+    assert config.parquet_options.use_hybrid_scan is False
 
 
 def test_validate_streaming_executor_shuffle_method(
@@ -427,6 +443,7 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__PASS_READ_LIMIT", "200")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__MAX_FOOTER_SAMPLES", "0")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__MAX_ROW_GROUP_SAMPLES", "0")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__USE_HYBRID_SCAN", "1")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__USE_RAPIDSMPF_NATIVE", "0")
 
         # Test default
@@ -438,6 +455,7 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         assert config.parquet_options.pass_read_limit == 200
         assert config.parquet_options.max_footer_samples == 0
         assert config.parquet_options.max_row_group_samples == 0
+        assert config.parquet_options.use_hybrid_scan is True
         assert config.parquet_options.use_rapidsmpf_native is False
 
     with monkeypatch.context() as m:
@@ -525,6 +543,7 @@ def test_fallback_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
         "pass_read_limit",
         "max_footer_samples",
         "max_row_group_samples",
+        "use_hybrid_scan",
         "use_rapidsmpf_native",
     ],
 )

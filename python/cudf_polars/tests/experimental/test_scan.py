@@ -55,6 +55,23 @@ def test_scan_parquet_use_rapidsmpf_native(tmp_path, df, streaming_engine):
     assert_gpu_result_equal(pl.scan_parquet(tmp_path), engine=streaming_engine)
 
 
+@pytest.mark.parametrize(
+    "engine",
+    [
+        {
+            "executor_options": {"target_partition_size": 1_000},
+            "engine_options": {"parquet_options": {"use_hybrid_scan": True}},
+        }
+    ],
+    indirect=True,
+)
+def test_scan_parquet_use_hybrid_scan(tmp_path, df, engine, monkeypatch):
+    make_partitioned_source(df, tmp_path, "parquet", n_files=2)
+    query = pl.scan_parquet(tmp_path).filter(pl.col("x") < 1_000)
+
+    assert_gpu_result_equal(query, engine=engine)
+
+
 # ---------------------------------------------------------------------------
 # Tests migrated from tests/experimental/test_scan.py
 # ---------------------------------------------------------------------------
@@ -69,6 +86,35 @@ def test_split_scan_aligns_to_row_group_boundaries(tmp_path, df, streaming_engin
     make_partitioned_source(df, tmp_path, "parquet", n_files=1, row_group_size=10)
     q = pl.scan_parquet(tmp_path)
     assert_gpu_result_equal(q, engine=streaming_engine)
+
+
+@pytest.mark.parametrize(
+    "engine",
+    [
+        {
+            "executor_options": {"target_partition_size": 1_000},
+            "engine_options": {"parquet_options": {"use_hybrid_scan": True}},
+        }
+    ],
+    indirect=True,
+)
+def test_split_scan_uses_hybrid_scan(tmp_path, df, engine):
+    make_partitioned_source(df, tmp_path, "parquet", n_files=1, row_group_size=10)
+    query = pl.scan_parquet(tmp_path).filter(pl.col("x") < 1_000)
+
+    _engine = pl.GPUEngine(
+        raise_on_fail=True,
+        executor="streaming",
+        executor_options={"target_partition_size": 1_000},
+        parquet_options={"use_hybrid_scan": True},
+    )
+    qir = Translator(query._ldf.visit(), _engine).translate_ir()
+    config_options = ConfigOptions.from_polars_engine(_engine)
+    lowered_ir, info = lower_ir_graph(
+        qir, config_options, collect_statistics(qir, config_options)
+    )
+    assert info[lowered_ir].count > 1
+    assert_gpu_result_equal(query, engine=engine)
 
 
 @pytest.mark.parametrize("mask", [None, pl.col("x") < 1_000])

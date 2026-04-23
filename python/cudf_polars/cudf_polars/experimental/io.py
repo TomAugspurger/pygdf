@@ -25,7 +25,9 @@ from cudf_polars.dsl.ir import (
     Scan,
     Sink,
     Union,
+    _prepare_parquet_predicate,
 )
+from cudf_polars.dsl.to_ast import to_parquet_filter
 from cudf_polars.experimental.base import (
     IOPartitionFlavor,
     IOPartitionPlan,
@@ -36,6 +38,10 @@ from cudf_polars.experimental.base import (
 from cudf_polars.experimental.dispatch import generate_ir_tasks, lower_ir_node
 from cudf_polars.utils.config import Cluster
 from cudf_polars.utils.cuda_stream import get_cuda_stream
+from cudf_polars.utils.parquet import (
+    build_parquet_metadata_from_footer_bytes,
+    read_parquet_footer_bytes,
+)
 from cudf_polars.utils.versions import POLARS_VERSION_LT_137
 
 if TYPE_CHECKING:
@@ -227,9 +233,8 @@ class SplitScan(IR):
         # - We can use all this information to calculate the
         #   "skip_rows" and "n_rows" options to use locally.
 
-        rowgroup_metadata = plc.io.parquet_metadata.read_parquet_metadata(
-            plc.io.SourceInfo(paths)
-        ).rowgroup_metadata()
+        rowgroup_metadata = context.parquet_metadata[tuple(paths)].rowgroup_metadata()
+
         total_row_groups = len(rowgroup_metadata)
         if total_splits <= total_row_groups:
             # We have enough row-groups in the file to align
@@ -244,6 +249,48 @@ class SplitScan(IR):
                 rg["num_rows"]
                 for rg in rowgroup_metadata[skip_rgs : skip_rgs + rg_stride]
             )
+            if parquet_options.use_hybrid_scan and Scan._should_use_hybrid_scan(
+                parquet_options,
+                paths,
+                with_columns,
+                0,
+                -1,
+                row_index,
+                context,
+            ):
+                stream = context.get_cuda_stream()
+                parquet_filter = (
+                    None
+                    if predicate is None
+                    else to_parquet_filter(
+                        _prepare_parquet_predicate(
+                            predicate.value,
+                            paths,
+                            schema,
+                            with_columns,
+                            metadata=context.parquet_metadata[tuple(paths)],
+                        ),
+                        stream=stream,
+                    )
+                )
+                if predicate is not None and parquet_filter is None:
+                    # Preserve the existing fallback path for predicates that
+                    # cannot be pushed into the parquet reader.
+                    pass
+                else:
+                    row_groups = list(range(skip_rgs, skip_rgs + rg_stride))
+                    if split_index == (total_splits - 1):
+                        row_groups = list(range(skip_rgs, total_row_groups))
+                    return Scan._read_parquet_hybrid(
+                        schema,
+                        paths,
+                        with_columns,
+                        include_file_paths,
+                        parquet_filter,
+                        stream,
+                        context,
+                        row_groups_by_path={paths[0]: row_groups},
+                    )
         else:
             # There are not enough row-groups to align
             # all "total_splits" of our reads with row-group
@@ -701,8 +748,8 @@ class ParquetMetadata:
 
         total_file_count = len(self.paths)
         sampled_file_count = len(self.sample_paths)
-        sample_metadata = plc.io.parquet_metadata.read_parquet_metadata(
-            plc.io.SourceInfo(list(self.sample_paths))
+        sample_metadata = build_parquet_metadata_from_footer_bytes(
+            [read_parquet_footer_bytes(path) for path in self.sample_paths]
         )
 
         if total_file_count == sampled_file_count:

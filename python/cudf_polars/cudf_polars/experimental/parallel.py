@@ -101,6 +101,7 @@ def lower_ir_graph(
     state: State = {
         "config_options": config_options,
         "stats": stats,
+        # "context": IRExecutionContext(),  # TODO: pass this in properly
     }
     mapper: LowerIRTransformer = CachingVisitor(lower_ir_node, state=state)
     return mapper(ir)
@@ -145,7 +146,11 @@ def task_graph(
     --------
     generate_ir_tasks
     """
+    from cudf_polars.io import collect_parquet_metadata
+
     context = IRExecutionContext()
+    context = collect_parquet_metadata(ir, context)
+
     graph = reduce(
         operator.or_,
         (

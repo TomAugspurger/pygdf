@@ -27,6 +27,7 @@ from cudf_polars.dsl.ir import (
     _prepare_parquet_predicate,
 )
 from cudf_polars.dsl.to_ast import to_parquet_filter
+from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.base import (
     IOPartitionFlavor,
     IOPartitionPlan,
@@ -59,7 +60,7 @@ from cudf_polars.experimental.rapidsmpf.utils import (
 from cudf_polars.experimental.utils import _dynamic_planning_on
 
 if TYPE_CHECKING:
-    from collections.abc import MutableMapping
+    from collections.abc import Iterator, MutableMapping
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.streaming.core.channel import Channel
@@ -71,6 +72,160 @@ if TYPE_CHECKING:
     from cudf_polars.experimental.rapidsmpf.core import SubNetGenerator
     from cudf_polars.experimental.rapidsmpf.tracing import ActorTracer
     from cudf_polars.utils.config import ParquetOptions
+
+
+@dataclasses.dataclass(frozen=True)
+class ReadSpec:
+    """Concrete rank-local read derived from a lowered ``Scan`` node."""
+
+    source_ir: Scan
+    paths: tuple[str, ...]
+    split_index: int | None = None
+    total_splits: int | None = None
+
+    def __post_init__(self) -> None:
+        """Validate split-read metadata."""
+        if (self.split_index is None) != (self.total_splits is None):
+            raise ValueError(
+                "split_index and total_splits must either both be set or both be None"
+            )
+        if self.split_index is not None and len(self.paths) != 1:
+            raise ValueError("Split reads must reference exactly one parquet path")
+
+    @property
+    def metadata_key(self) -> tuple[str, ...]:
+        """Return the key used to cache parquet metadata for this read."""
+        return self.paths
+
+    def materialize(self, parquet_options: ParquetOptions) -> Scan | SplitScan:
+        """Construct the executable Scan/SplitScan object for this read."""
+        base_scan = Scan(
+            self.source_ir.schema,
+            self.source_ir.typ,
+            self.source_ir.reader_options,
+            self.source_ir.cloud_options,
+            list(self.paths),
+            self.source_ir.with_columns,
+            self.source_ir.skip_rows,
+            self.source_ir.n_rows,
+            self.source_ir.row_index,
+            self.source_ir.include_file_paths,
+            self.source_ir.predicate,
+            parquet_options,
+        )
+        if self.split_index is None:
+            return base_scan
+        total_splits = self.total_splits
+        assert total_splits is not None
+        return SplitScan(
+            self.source_ir.schema,
+            base_scan,
+            self.split_index,
+            total_splits,
+            parquet_options,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class RankReadPlan:
+    """Per-rank IO plan keyed by lowered ``Scan`` node."""
+
+    by_scan: dict[Scan, tuple[ReadSpec, ...]]
+
+    def parquet_metadata_keys(self) -> tuple[tuple[str, ...], ...]:
+        """Return unique parquet metadata keys in deterministic order."""
+        seen: set[tuple[str, ...]] = set()
+        keys: list[tuple[str, ...]] = []
+        for scan, specs in self.by_scan.items():
+            if scan.typ != "parquet":
+                continue
+            for spec in specs:
+                if spec.metadata_key not in seen:
+                    seen.add(spec.metadata_key)
+                    keys.append(spec.metadata_key)
+        return tuple(keys)
+
+    def parquet_paths(self) -> tuple[str, ...]:
+        """Return unique parquet file paths in deterministic order."""
+        seen: set[str] = set()
+        paths: list[str] = []
+        for scan, specs in self.by_scan.items():
+            if scan.typ != "parquet":
+                continue
+            for spec in specs:
+                for path in spec.paths:
+                    if path not in seen:
+                        seen.add(path)
+                        paths.append(path)
+        return tuple(paths)
+
+    def iter_specs(self) -> Iterator[ReadSpec]:
+        """Yield all read specs in plan order."""
+        for specs in self.by_scan.values():
+            yield from specs
+
+
+def build_local_read_specs(
+    ir: Scan,
+    plan: IOPartitionPlan,
+    comm: Communicator,
+) -> tuple[ReadSpec, ...]:
+    """Build the concrete read layout for one rank of a lowered ``Scan``."""
+    specs: list[ReadSpec] = []
+    if plan.flavor == IOPartitionFlavor.SPLIT_FILES:
+        count = plan.factor * len(ir.paths)
+        local_count = math.ceil(count / comm.nranks)
+        local_offset = local_count * comm.rank
+        path_offset = local_offset // plan.factor
+        path_end = math.ceil((local_offset + local_count) / plan.factor)
+        path_count = path_end - path_offset
+        local_paths = ir.paths[path_offset : path_offset + path_count]
+        sindex = local_offset % plan.factor
+        splits_created = 0
+        for path in local_paths:
+            while sindex < plan.factor and splits_created < local_count:
+                specs.append(
+                    ReadSpec(
+                        ir,
+                        (path,),
+                        split_index=sindex,
+                        total_splits=plan.factor,
+                    )
+                )
+                sindex += 1
+                splits_created += 1
+            sindex = 0
+    else:
+        count = math.ceil(len(ir.paths) / plan.factor)
+        local_count = math.ceil(count / comm.nranks)
+        local_offset = local_count * comm.rank
+        paths_offset_start = local_offset * plan.factor
+        paths_offset_end = paths_offset_start + plan.factor * local_count
+        for offset in range(paths_offset_start, paths_offset_end, plan.factor):
+            grouped_paths: tuple[str, ...] = tuple(
+                ir.paths[offset : offset + plan.factor]
+            )
+            if grouped_paths:
+                specs.append(ReadSpec(ir, grouped_paths))
+
+    return tuple(specs)
+
+
+def build_rank_read_plan(
+    root: IR,
+    partition_info: MutableMapping[IR, PartitionInfo],
+    comm: Communicator,
+) -> RankReadPlan:
+    """Build the per-rank concrete read plan for the lowered IR graph."""
+    by_scan: dict[Scan, tuple[ReadSpec, ...]] = {}
+    for node in traversal([root]):
+        if not isinstance(node, Scan):
+            continue
+        info = partition_info.get(node)
+        if info is None or info.io_plan is None:
+            continue
+        by_scan[node] = build_local_read_specs(node, info.io_plan, comm)
+    return RankReadPlan(by_scan)
 
 
 class Lineariser:
@@ -407,13 +562,12 @@ async def read_chunk(
 @define_actor()
 async def scan_node(
     context: Context,
-    comm: Communicator,
     ir: Scan,
     ir_context: IRExecutionContext,
     ch_out: Channel[TableChunk],
     *,
     num_producers: int,
-    plan: IOPartitionPlan,
+    read_specs: tuple[ReadSpec, ...],
     parquet_options: ParquetOptions,
     estimated_chunk_bytes: int,
 ) -> None:
@@ -424,8 +578,6 @@ async def scan_node(
     ----------
     context
         The rapidsmpf context.
-    comm
-        The communicator.
     ir
         The Scan node.
     ir_context
@@ -434,8 +586,8 @@ async def scan_node(
         The output Channel[TableChunk].
     num_producers
         The number of producers to use for the scan node.
-    plan
-        The partitioning plan.
+    read_specs
+        Concrete rank-local reads to execute for this scan node.
     parquet_options
         The Parquet options.
     estimated_chunk_bytes
@@ -445,72 +597,7 @@ async def scan_node(
     async with shutdown_on_error(
         context, ch_out, trace_ir=ir, ir_context=ir_context
     ) as tracer:
-        # Build a list of local Scan operations
-        scans: list[Scan | SplitScan] = []
-        if plan.flavor == IOPartitionFlavor.SPLIT_FILES:
-            count = plan.factor * len(ir.paths)
-            local_count = math.ceil(count / comm.nranks)
-            local_offset = local_count * comm.rank
-            path_offset = local_offset // plan.factor
-            path_end = math.ceil((local_offset + local_count) / plan.factor)
-            path_count = path_end - path_offset
-            local_paths = ir.paths[path_offset : path_offset + path_count]
-            sindex = local_offset % plan.factor
-            splits_created = 0
-            for path in local_paths:
-                base_scan = Scan(
-                    ir.schema,
-                    ir.typ,
-                    ir.reader_options,
-                    ir.cloud_options,
-                    [path],
-                    ir.with_columns,
-                    ir.skip_rows,
-                    ir.n_rows,
-                    ir.row_index,
-                    ir.include_file_paths,
-                    ir.predicate,
-                    parquet_options,
-                )
-                while sindex < plan.factor and splits_created < local_count:
-                    scans.append(
-                        SplitScan(
-                            ir.schema,
-                            base_scan,
-                            sindex,
-                            plan.factor,
-                            parquet_options,
-                        )
-                    )
-                    sindex += 1
-                    splits_created += 1
-                sindex = 0
-
-        else:
-            count = math.ceil(len(ir.paths) / plan.factor)
-            local_count = math.ceil(count / comm.nranks)
-            local_offset = local_count * comm.rank
-            paths_offset_start = local_offset * plan.factor
-            paths_offset_end = paths_offset_start + plan.factor * local_count
-            for offset in range(paths_offset_start, paths_offset_end, plan.factor):
-                local_paths = ir.paths[offset : offset + plan.factor]
-                if len(local_paths) > 0:  # Only add scan if there are paths
-                    scans.append(
-                        Scan(
-                            ir.schema,
-                            ir.typ,
-                            ir.reader_options,
-                            ir.cloud_options,
-                            local_paths,
-                            ir.with_columns,
-                            ir.skip_rows,
-                            ir.n_rows,
-                            ir.row_index,
-                            ir.include_file_paths,
-                            ir.predicate,
-                            parquet_options,
-                        )
-                    )
+        scans = [spec.materialize(parquet_options) for spec in read_specs]
 
         # Send basic metadata
         await send_metadata(
@@ -688,6 +775,7 @@ def _(
     parquet_options = config_options.parquet_options
     partition_info = rec.state["partition_info"][ir]
     num_producers = rec.state["max_io_threads"]
+    local_read_specs = rec.state["scan_read_specs"][ir]
     channels: dict[IR, ChannelManager] = {ir: ChannelManager(rec.state["context"])}
 
     assert partition_info.io_plan is not None, "Scan node must have a partition plan"
@@ -705,6 +793,7 @@ def _(
     native_node: Any = None
     if (
         parquet_options.use_rapidsmpf_native
+        and not parquet_options.use_hybrid_scan
         and (partition_info.count > 1 or _dynamic_planning_on(config_options))
         and ir.typ == "parquet"
         and ir.row_index is None
@@ -734,9 +823,7 @@ def _(
             ch_in,
             ch_out,
             ChannelMetadata(
-                # partition_info.count is the estimated "global" count.
-                # Just estimate the local count as well.
-                local_count=math.ceil(partition_info.count / rec.state["comm"].nranks),
+                local_count=len(local_read_specs),
             ),
             rec.state["ir_context"],
         )
@@ -748,12 +835,11 @@ def _(
         nodes[ir] = [
             scan_node(
                 rec.state["context"],
-                rec.state["comm"],
                 ir,
                 rec.state["ir_context"],
                 ch_out,
                 num_producers=num_producers,
-                plan=plan,
+                read_specs=local_read_specs,
                 parquet_options=parquet_options,
                 estimated_chunk_bytes=executor.target_partition_size,
             )

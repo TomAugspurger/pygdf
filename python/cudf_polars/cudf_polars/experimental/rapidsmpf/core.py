@@ -76,6 +76,7 @@ if TYPE_CHECKING:
         GenState,
         SubNetGenerator,
     )
+    from cudf_polars.experimental.rapidsmpf.io import ReadSpec
     from cudf_polars.utils.config import StreamingExecutor
 
 
@@ -294,7 +295,9 @@ def evaluate_pipeline(
                 get_cuda_stream=rmpf_context.get_stream_from_pool, query_id=query_id
             )
         else:
-            ir_context = IRExecutionContext(query_id=query_id)
+            ir_context = IRExecutionContext(
+                query_id=query_id, rapidsmpf_context=rmpf_context
+            )
 
         # Generate network nodes
         assert rmpf_context is not None, "RapidsMPF context must defined."
@@ -310,6 +313,9 @@ def evaluate_pipeline(
             stats,
             ir_context=ir_context,
             collective_id_map=collective_id_map,
+            scan_read_specs=cudf_polars.experimental.rapidsmpf.io.build_rank_read_plan(
+                ir, partition_info, comm
+            ).by_scan,
             metadata_collector=metadata_collector,
         )
 
@@ -457,6 +463,7 @@ def generate_network(
     *,
     ir_context: IRExecutionContext,
     collective_id_map: dict[IR, list[int]],
+    scan_read_specs: dict[Scan, tuple[ReadSpec, ...]],
     metadata_collector: list[ChannelMetadata] | None,
 ) -> tuple[list[Any], DeferredMessages]:
     """
@@ -480,6 +487,8 @@ def generate_network(
         The execution context for the IR node.
     collective_id_map
         The mapping of IR nodes to lists of collective IDs.
+    scan_read_specs
+        Per-rank concrete reads for each lowered ``Scan`` node.
     metadata_collector
         The list to collect the final metadata.
         This list will be mutated when the network is executed.
@@ -516,6 +525,7 @@ def generate_network(
         "max_io_threads": max_io_threads_local,
         "stats": stats,
         "collective_id_map": collective_id_map,
+        "scan_read_specs": scan_read_specs,
     }
     mapper: SubNetGenerator = CachingVisitor(
         generate_ir_sub_network_wrapper, state=state

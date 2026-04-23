@@ -9,6 +9,7 @@ import dataclasses
 import json
 import os
 import socket
+from concurrent.futures import as_completed
 from typing import TYPE_CHECKING, Any, Self, TypeVar
 
 import cuda.core
@@ -22,15 +23,21 @@ import polars as pl
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IRExecutionContext
+from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.experimental.base import StatsCollector
 from cudf_polars.experimental.parallel import lower_ir_graph
 from cudf_polars.experimental.rapidsmpf.collectives import ReserveOpIDs
 from cudf_polars.experimental.rapidsmpf.collectives.common import reserve_op_id
 from cudf_polars.experimental.rapidsmpf.core import generate_network
+from cudf_polars.experimental.rapidsmpf.io import build_rank_read_plan
 from cudf_polars.experimental.rapidsmpf.tracing import log_query_plan
 from cudf_polars.experimental.rapidsmpf.utils import empty_table_chunk
 from cudf_polars.experimental.statistics import collect_statistics
 from cudf_polars.experimental.utils import _concat
+from cudf_polars.utils.parquet import (
+    build_parquet_metadata_from_footer_bytes,
+    read_parquet_footer_bytes,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, MutableMapping
@@ -44,6 +51,7 @@ if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR
     from cudf_polars.experimental.base import PartitionInfo
     from cudf_polars.experimental.parallel import ConfigOptions
+    from cudf_polars.experimental.rapidsmpf.io import RankReadPlan
     from cudf_polars.utils.config import StreamingExecutor
 
 
@@ -242,6 +250,47 @@ class StreamingEngine(pl.GPUEngine):
         raise NotImplementedError
 
 
+@nvtx_annotate_cudf_polars(message="collect_parquet_metadata")
+def collect_parquet_metadata(
+    ir_context: IRExecutionContext,
+    read_plan: RankReadPlan,
+    py_executor: ThreadPoolExecutor,
+    *,
+    read_footer_bytes: Callable[[str], bytes] = read_parquet_footer_bytes,
+    build_metadata_from_footer_bytes: Callable[
+        [list[bytes]], Any
+    ] = build_parquet_metadata_from_footer_bytes,
+) -> IRExecutionContext:
+    """Return a new IR execution context with parquet footer bytes prefetched."""
+    new_parquet_footer_bytes = dict(ir_context.parquet_footer_bytes)
+    new_parquet_metadata = dict(ir_context.parquet_metadata)
+    missing_paths = [
+        path
+        for path in read_plan.parquet_paths()
+        if path not in new_parquet_footer_bytes
+    ]
+    futures = {
+        py_executor.submit(
+            read_footer_bytes,
+            path,
+        ): path
+        for path in missing_paths
+    }
+    for future in as_completed(futures):
+        new_parquet_footer_bytes[futures[future]] = future.result()
+
+    for paths in read_plan.parquet_metadata_keys():
+        if paths not in new_parquet_metadata:
+            new_parquet_metadata[paths] = build_metadata_from_footer_bytes(
+                [new_parquet_footer_bytes[path] for path in paths]
+            )
+    return dataclasses.replace(
+        ir_context,
+        parquet_footer_bytes=new_parquet_footer_bytes,
+        parquet_metadata=new_parquet_metadata,
+    )
+
+
 def execute_ir_on_rank(
     ctx: Context,
     comm: Communicator,
@@ -251,6 +300,7 @@ def execute_ir_on_rank(
     config_options: ConfigOptions[StreamingExecutor],
     stats: StatsCollector,
     collective_id_map: dict[IR, list[int]],
+    read_plan: RankReadPlan,
     *,
     collect_metadata: bool = False,
 ) -> tuple[pl.DataFrame, list[ChannelMetadata] | None]:
@@ -279,6 +329,8 @@ def execute_ir_on_rank(
         Statistics collector.
     collective_id_map
         Mapping from IR nodes to their pre-allocated collective operation IDs.
+    read_plan
+        Concrete per-rank parquet/file reads derived from the lowered IR.
     collect_metadata
         Whether to collect channel metadata during execution.
 
@@ -291,6 +343,8 @@ def execute_ir_on_rank(
         otherwise ``None``.
     """
     ir_context = IRExecutionContext(get_cuda_stream=ctx.get_stream_from_pool)
+    ir_context = collect_parquet_metadata(ir_context, read_plan, py_executor)
+
     metadata_collector: list[ChannelMetadata] | None = [] if collect_metadata else None
 
     nodes, output = generate_network(
@@ -302,6 +356,7 @@ def execute_ir_on_rank(
         stats,
         ir_context=ir_context,
         collective_id_map=collective_id_map,
+        scan_read_specs=read_plan.by_scan,
         metadata_collector=metadata_collector,
     )
 
@@ -504,7 +559,10 @@ def evaluate_on_rank(
         otherwise ``None``.
     """
     stats = allgather_stats(comm, ctx.br(), ir, config_options)
-    ir, partition_info = lower_ir_graph(ir, config_options, stats)
+    with nvtx_annotate_cudf_polars(message="lower_ir_graph"):
+        ir, partition_info = lower_ir_graph(ir, config_options, stats)
+    with nvtx_annotate_cudf_polars(message="build_rank_read_plan"):
+        read_plan = build_rank_read_plan(ir, partition_info, comm)
 
     if comm.rank == 0:
         # At least for now, the query plan is identical on all ranks,
@@ -521,5 +579,6 @@ def evaluate_on_rank(
             config_options,
             stats,
             collective_id_map,
+            read_plan,
             collect_metadata=collect_metadata,
         )

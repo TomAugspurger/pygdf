@@ -301,7 +301,10 @@ def _callback(
         ),
     ):
         if config_options.executor.name == "in-memory":
+            from cudf_polars.io import collect_parquet_metadata
+
             context = IRExecutionContext()
+            context = collect_parquet_metadata(ir, context)
             df = ir.evaluate(cache={}, timer=timer, context=context).to_polars()
             if timer is None:
                 return df

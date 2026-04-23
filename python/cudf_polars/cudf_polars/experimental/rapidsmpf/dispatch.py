@@ -15,11 +15,12 @@ if TYPE_CHECKING:
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.streaming.core.context import Context
 
-    from cudf_polars.dsl.ir import IR, IRExecutionContext
+    from cudf_polars.dsl.ir import IR, IRExecutionContext, Scan
     from cudf_polars.experimental.base import (
         PartitionInfo,
         StatsCollector,
     )
+    from cudf_polars.experimental.rapidsmpf.io import ReadSpec
     from cudf_polars.experimental.rapidsmpf.utils import ChannelManager
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
@@ -58,6 +59,8 @@ class GenState(TypedDict):
         Statistics collector.
     collective_id_map
         The mapping of IR nodes to lists of collective IDs.
+    scan_read_specs
+        Per-rank concrete reads for each lowered ``Scan`` node.
     """
 
     context: Context
@@ -69,6 +72,7 @@ class GenState(TypedDict):
     max_io_threads: int
     stats: StatsCollector
     collective_id_map: dict[IR, list[int]]
+    scan_read_specs: dict[Scan, tuple[ReadSpec, ...]]
 
 
 SubNetGenerator: TypeAlias = GenericTransformer[

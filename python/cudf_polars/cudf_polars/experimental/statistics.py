@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from cudf_polars.dsl.ir import DataFrameScan, Scan
+from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.experimental.base import StatsCollector
 from cudf_polars.experimental.io import _build_source_info
@@ -17,6 +18,7 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 
+@nvtx_annotate_cudf_polars(message="collect_statistics")
 def collect_statistics(
     root: IR,
     config_options: ConfigOptions[StreamingExecutor],
