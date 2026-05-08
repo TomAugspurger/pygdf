@@ -35,6 +35,8 @@ from typing import (
     overload,
 )
 
+import nvtx
+
 import polars as pl
 
 import pylibcudf as plc
@@ -74,6 +76,7 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
     from cudf_polars.containers.dataframe import NamedColumn
+    from cudf_polars.experimental.rapidsmpf.hybrid_scan import CachedParquetMetadata
     from cudf_polars.typing import CSECache, ClosedInterval, Schema, Slice as Zlice
     from cudf_polars.utils.config import ParquetOptions
     from cudf_polars.utils.timer import Timer
@@ -127,11 +130,16 @@ class IRExecutionContext:
         A zero-argument callable that returns a CUDA stream.
     query_id
         Identifier for the query being executed.
+    parquet_metadata
+        Query-lifetime cache for parquet metadata keyed by scan paths.
     """
 
     py_executor: ThreadPoolExecutor | None = field(default=None)
     get_cuda_stream: Callable[[], Stream] = field(default=get_cuda_stream)
     query_id: uuid.UUID = field(default_factory=uuid.uuid4)
+    parquet_metadata: dict[tuple[str, ...], CachedParquetMetadata] = field(
+        default_factory=dict
+    )
 
     async def to_thread(
         self, func: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs
@@ -352,9 +360,14 @@ _COMPARISON_BINOPS = {
 
 @nvtx_annotate_cudf_polars(message="_parquet_physical_types")
 def _parquet_physical_types(
-    paths: list[str], columns: list[str] | None
+    paths: list[str],
+    columns: list[str] | None,
+    metadata: plc.io.parquet_metadata.ParquetMetadata | None = None,
 ) -> dict[str, plc.DataType]:
-    metadata = plc.io.parquet_metadata.read_parquet_metadata(plc.io.SourceInfo(paths))
+    if metadata is None:
+        metadata = plc.io.parquet_metadata.read_parquet_metadata(
+            plc.io.SourceInfo(paths)
+        )
     column_types = metadata.schema().column_types()
 
     if columns is not None:
@@ -408,11 +421,12 @@ def _prepare_parquet_predicate(
     paths: list[str],
     schema: Schema,
     columns: list[str] | None,
+    metadata: plc.io.parquet_metadata.ParquetMetadata | None = None,
 ) -> expr.Expr:
     cols = columns or list(schema.keys())
     if any(isinstance(schema[c].polars_type, pl.Decimal) for c in cols if c in schema):
         return _cast_literals_to_physical_types(
-            predicate, _parquet_physical_types(paths, cols)
+            predicate, _parquet_physical_types(paths, cols, metadata)
         )
     return predicate
 
@@ -660,6 +674,9 @@ class Scan(IR):
             total_rows = min(total_rows, self.n_rows)
         return max(total_rows, 0)
 
+    @nvtx.annotate(
+        "get_parquet_row_count_from_metadata", domain="cudf_polars", color="red"
+    )
     @staticmethod
     @nvtx_annotate_cudf_polars(message="Scan._get_parquet_row_count_from_metadata")
     def _get_parquet_row_count_from_metadata(
@@ -804,12 +821,39 @@ class Scan(IR):
                     df,
                 )
         elif typ == "parquet":
+            cached_metadata = None
+            if parquet_options.use_hybrid_scan:
+                from cudf_polars.experimental.rapidsmpf.hybrid_scan import (
+                    get_cached_parquet_metadata,
+                )
+
+                if parquet_options.chunked:
+                    raise NotImplementedError(
+                        "Hybrid scan does not support chunked parquet reads."
+                    )
+                if skip_rows != 0 or n_rows != -1:
+                    raise NotImplementedError(
+                        "Hybrid scan does not support parquet scans with row limits."
+                    )
+                try:
+                    cached_metadata = get_cached_parquet_metadata(paths, context)
+                except KeyError as err:
+                    raise RuntimeError(
+                        "Hybrid scan parquet metadata was not prefetched."
+                    ) from err
+
             filters = None
             if predicate is not None and row_index is None:
                 # Can't apply filters during read if we have a row index.
                 filters = to_parquet_filter(
                     _prepare_parquet_predicate(
-                        predicate.value, paths, schema, with_columns
+                        predicate.value,
+                        paths,
+                        schema,
+                        with_columns,
+                        None
+                        if cached_metadata is None
+                        else cached_metadata.parquet_metadata,
                     ),
                     stream=stream,
                 )
@@ -827,7 +871,47 @@ class Scan(IR):
                 parquet_reader_options.set_num_rows(n_rows)
             if skip_rows != 0:
                 parquet_reader_options.set_skip_rows(skip_rows)
-            if parquet_options.chunked:
+            if parquet_options.use_hybrid_scan:
+                from cudf_polars.experimental.rapidsmpf.hybrid_scan import (
+                    read_parquet_with_hybrid_scan,
+                )
+
+                if cached_metadata is None:  # pragma: no cover
+                    raise AssertionError("Expected cached metadata for hybrid scan")
+                result = read_parquet_with_hybrid_scan(
+                    paths,
+                    with_columns,
+                    filters,
+                    cached_metadata,
+                    stream,
+                    parquet_options,
+                )
+                col_names = result.column_names
+                if result.table is None:
+                    if with_columns is None:
+                        col_names = list(schema)
+                    columns = [
+                        dtypes.make_empty_column(schema[name], stream)
+                        for name in col_names
+                    ]
+                    table = plc.Table(columns)
+                else:
+                    table = result.table
+                df = DataFrame.from_table(
+                    table,
+                    col_names,
+                    [schema[name] for name in col_names],
+                    stream=stream,
+                    num_rows=0 if table.num_columns() == 0 else None,
+                )
+                if include_file_paths is not None:
+                    df = Scan.add_file_paths(
+                        include_file_paths,
+                        paths,
+                        result.rows_per_source,
+                        df,
+                    )
+            elif parquet_options.chunked:
                 reader = plc.io.parquet.ChunkedParquetReader(
                     parquet_reader_options,
                     chunk_read_limit=parquet_options.chunk_read_limit,

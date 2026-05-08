@@ -1456,9 +1456,19 @@ def _consolidate_logs(
     all_logs = "\n".join(parts)
 
     parsed_logs = [json.loads(log) for log in all_logs.splitlines() if log]
+
+    # grab the io logs
+    io_logs = [log for log in parsed_logs if log.get("category") == "IO"]
+    Path("io_logs.json").write_text(json.dumps(io_logs))
+
     # Some other log records can end up in here. Filter those out.
     scope_values = {s.value for s in Scope}
-    parsed_logs = [log for log in parsed_logs if log.get("scope") in scope_values]
+    parsed_logs = [
+        log
+        for log in parsed_logs
+        if log.get("scope") in scope_values
+        # or log.get("event") == "Hybrid Scan Byte Ranges"
+    ]
     # Now we want to augment the existing Records with the trace data.
 
     def group_key(x: dict) -> int:
