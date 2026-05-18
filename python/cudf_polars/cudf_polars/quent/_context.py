@@ -8,7 +8,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import uuid
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 from cudf_polars.quent._plan import (
     build_parent_operators_map,
@@ -17,6 +17,7 @@ from cudf_polars.quent._plan import (
 from cudf_polars.quent._types import (
     Engine,
     Implementation,
+    Processor,
     Query,
     QueryGroup,
 )
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
     from cudf_polars.dsl.ir import IR
     from cudf_polars.quent._logging import QuentLogger
     from cudf_polars.quent._types import (
+        Channel,
+        Memory,
+        Network,
         Operator,
         Plan,
         Port,
@@ -39,7 +43,7 @@ __all__ = [
 ]
 
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+@dataclasses.dataclass(kw_only=True)
 class QuentContext:
     """
     A Quent context that is globally valid for a query.
@@ -55,7 +59,8 @@ class QuentContext:
     query: Query = dataclasses.field(default_factory=Query)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "_query_group_cache_", set())
+        self._query_group_cache_: set[uuid.UUID] = set()
+        self._processor_map_: dict[int, Processor] = {}
 
     def serialize(self) -> bytes:
         """
@@ -116,7 +121,7 @@ class QuentContext:
 
     @property
     def _query_group_cache(self) -> set[uuid.UUID]:
-        return self._query_group_cache_  # type: ignore[attr-defined]
+        return self._query_group_cache_
 
     def _emit_engine_init_events(self, logger: QuentLogger) -> None:
         """Emit a Quent Engine init event."""
@@ -285,16 +290,86 @@ class QuentContext:
             parent_operators_by_node_id=parent_operators_by_node_id,
         )
 
+    def get_or_declare_processor(
+        self, quent_logger: QuentLogger, thread_ident: int, pool_id: uuid.UUID
+    ) -> Processor:
+        """Get (or declare a new) Quent Processor for a CPU thread."""
+        if thread_ident in self._processor_map_:
+            return self._processor_map_[thread_ident]
 
-@dataclasses.dataclass(frozen=True, kw_only=True)
+        processor = Processor(pool_id=pool_id)
+        self._processor_map_[thread_ident] = processor
+        quent_logger.emit(processor.initializing())
+        quent_logger.emit(processor.operating())
+        return processor
+
+    # def get_or_declare_memory(
+    #     self, quent_logger: QuentLogger, worker_id: uuid.UUID
+    # ) -> Memory:
+    #     """Get (or declare a new) Quent Memory resource for a worker."""
+    #     if worker_id in self._memory_map_:
+    #         return self._memory_map_[worker_id]
+
+    #     memory = Memory(
+    #         instance_name=f"Worker {worker_id.hex[:8]} memory",
+    #         resource_type_name="memory",
+    #         parent_group_id=worker_id,
+    #     )
+    #     self._memory_map_[worker_id] = memory
+    #     quent_logger.emit(memory.initializing())
+    #     quent_logger.emit(memory.operating(capacity_bytes=0))
+    #     return memory
+
+    def emit_resource_exit_events(self, quent_logger: QuentLogger) -> None:
+        """Emit finalizing/exit events for declared resources."""
+        for processor in self._processor_map_.values():
+            quent_logger.emit(processor.finalizing())
+            quent_logger.emit(processor.exit())
+
+
+@dataclasses.dataclass(kw_only=True)
 class LocalQuentContext:
     """
-    A Quent Context that is only ever used locally.
+    Quent execution context that is only used locally.
 
-    This can contain non-serializable objects (like a QuentLogger)
-    and entities that are only valid on the local rank.
+    This is just a bag we use to pass around things until we get to generating
+    actors for an individual IR node. At that point, we build a
+    ``QuentIRExecutionContext`` with the operator bound too, which is passed into
+    ``IRExecutionContext``.
+
+    This class includes the union of fields needed by both pre- and post-rebase
+    callsites.
     """
 
     context: QuentContext
     worker: Worker
     logger: QuentLogger
+    thread_pool_id: uuid.UUID
+    device_memory: Memory
+    disk_to_device_channel: Channel | None = None
+    network: Network | None = None
+    link_channels: dict[int, Channel] = dataclasses.field(default_factory=dict)
+
+
+@dataclasses.dataclass(kw_only=True)
+class QuentIRExecutionContext(LocalQuentContext):
+    """Like ``LocalQuentContext``, but with a Quent Operator bound too."""
+
+    quent_operator: Operator
+
+    @classmethod
+    def from_execution_context(
+        cls, execution_context: LocalQuentContext, quent_operator: Operator
+    ) -> Self:
+        """Create a ``QuentIRExecutionContext`` from a ``LocalQuentContext``."""
+        return cls(
+            quent_operator=quent_operator,
+            context=execution_context.context,
+            worker=execution_context.worker,
+            logger=execution_context.logger,
+            thread_pool_id=execution_context.thread_pool_id,
+            device_memory=execution_context.device_memory,
+            disk_to_device_channel=execution_context.disk_to_device_channel,
+            network=execution_context.network,
+            link_channels=execution_context.link_channels,
+        )

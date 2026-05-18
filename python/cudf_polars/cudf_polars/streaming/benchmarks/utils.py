@@ -1518,7 +1518,12 @@ def _write_quent_traces(engine: StreamingEngine, run_id: uuid.UUID) -> None:
         for log in quent_logs:
             f.write(json.dumps(log))
             f.write("\n")
+
     print(f"Wrote {len(quent_logs)} Quent trace events to {output_path}")
+    import shutil
+
+    shutil.copy(output_path, "../quent/data/")
+    print(f"View at http://localhost:5173/profiles/{run_id}")
 
 
 def _consolidate_logs(

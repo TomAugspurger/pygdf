@@ -5,8 +5,10 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import json
+from typing import TYPE_CHECKING, cast
 
+from cudf_polars.dsl.traversal import traversal
 from cudf_polars.quent._types import (
     Edge,
     Operator,
@@ -25,6 +27,34 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 _JOIN_TYPES = frozenset({"Join", "ConditionalJoin"})
+
+
+def _quent_attribute_value(value: object) -> dict[str, object]:
+    """Convert a Python value into Quent's tagged attribute union."""
+    if isinstance(value, bool):
+        # Quent attribute values are numeric/string/list/struct tagged unions.
+        return {"String": str(value).lower()}
+    if isinstance(value, int):
+        if value >= 0:
+            return {"U64": value}
+        return {"I64": value}
+    if isinstance(value, float):
+        return {"F64": value}
+    if isinstance(value, str):
+        return {"String": value}
+    if value is None:
+        return {"String": "null"}
+    return {"String": json.dumps(value, sort_keys=True)}
+
+
+def _quent_custom_attributes(
+    properties: dict[str, object],
+) -> list[dict[str, object]]:
+    """Build Quent custom attributes from serializable operator properties."""
+    return [
+        {"key": key, "value": _quent_attribute_value(value)}
+        for key, value in properties.items()
+    ]
 
 
 def build_plan(
@@ -90,6 +120,9 @@ def build_plan(
             parent_operators=parent_ops.get(node_id, []),
             instance_name=f"{serializable_node.type}-{node_id}",
             type_name=serializable_node.type,
+            custom_attributes=_quent_custom_attributes(
+                cast("dict[str, object]", serializable_node.properties)
+            ),
         )
         operator_by_ir_id[node_id] = operator
         operators.append(operator)
@@ -134,6 +167,9 @@ def port_names_for_node(node: SerializableIRNode) -> list[str]:
         return ["out"] + [f"in_{i}" for i in range(n_children)]
 
 
+# TODO: Think about just putting UUIDs on the IR node instances?
+
+
 def build_parent_operators_map(
     node_map: dict[str, list[str]],
     logical_op_by_id: dict[str, Operator],
@@ -161,4 +197,18 @@ def build_parent_operators_map(
         ]
         if parents:
             result[physical_sid] = parents
+    return result
+
+
+def build_quent_operator_map(
+    ir: IR,
+    physical_op_by_id: dict[str, Operator],
+) -> dict[IR, Operator]:
+    """Build a map from IR nodes to Quent operator IDs."""
+    result: dict[IR, Operator] = {}
+    for node in traversal([ir]):
+        stable_id = str(node.get_stable_id())
+        if stable_id in physical_op_by_id:
+            result[node] = physical_op_by_id[stable_id]
+
     return result

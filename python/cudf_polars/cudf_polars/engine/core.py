@@ -25,10 +25,12 @@ from rapidsmpf.memory.packed_data import PackedData
 from rapidsmpf.statistics import Statistics
 from rapidsmpf.streaming.core.actor import run_actor_network
 
+import cudf_polars.quent
 import cudf_polars.quent._logging
+import cudf_polars.quent._types
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IRExecutionContext
-from cudf_polars.quent._plan import build_plan
+from cudf_polars.quent._plan import build_plan, build_quent_operator_map
 from cudf_polars.streaming.actor_graph.collectives import ReserveOpIDs
 from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.core import generate_network
@@ -50,7 +52,6 @@ if TYPE_CHECKING:
     from rapidsmpf.memory.buffer_resource import BufferResource
     from rapidsmpf.streaming.core.context import Context
 
-    import cudf_polars.quent
     from cudf_polars.dsl.ir import IR
     from cudf_polars.streaming.base import PartitionInfo
     from cudf_polars.streaming.parallel import ConfigOptions
@@ -427,6 +428,8 @@ def execute_ir_on_rank(
     collective_id_map: dict[IR, list[int]],
     *,
     query_id: uuid.UUID,
+    physical_op_by_id: dict[str, cudf_polars.quent.Operator] | None = None,
+    local_quent_context: cudf_polars.quent.LocalQuentContext,
 ) -> tuple[pl.DataFrame, list[ChannelMetadata]]:
     """
     Execute a Polars IR query on a single rank's GPU.
@@ -455,6 +458,10 @@ def execute_ir_on_rank(
         Mapping from IR nodes to their pre-allocated collective operation IDs.
     query_id
         A unique identifier for the query.
+    physical_op_by_id
+        The mapping of IR nodes to Quent operator IDs.
+    local_quent_context
+        The execution context for the Quent operator, used for tracing.
 
     Returns
     -------
@@ -463,10 +470,16 @@ def execute_ir_on_rank(
     metadata
         Collected channel metadata.
     """
+    # We'll bind all the quent stuff later.
     ir_context = IRExecutionContext(
         py_executor, get_cuda_stream=ctx.br().stream_pool.get_stream, query_id=query_id
     )
+
     metadata_collector: list[ChannelMetadata] = []
+    if physical_op_by_id is not None:
+        quent_operator_map = build_quent_operator_map(ir, physical_op_by_id)
+    else:
+        quent_operator_map = None
 
     nodes, output = generate_network(
         ctx,
@@ -478,6 +491,8 @@ def execute_ir_on_rank(
         ir_context=ir_context,
         collective_id_map=collective_id_map,
         metadata_collector=metadata_collector,
+        quent_operator_map=quent_operator_map,
+        quent_execution_context=local_quent_context,
     )
 
     try:
@@ -654,6 +669,45 @@ def allgather_stats(
     return StatsCollector.deserialize(json.loads(all_data[0]), ir)
 
 
+def _declare_network_channels(
+    comm: Communicator,
+    local_quent_context: cudf_polars.quent.LocalQuentContext,
+) -> None:
+    """
+    Declare network link channels for inter-rank communication.
+
+    Creates a Network resource group and one Channel per remote rank,
+    emitting their lifecycle events to the quent logger. Mutates
+    ``local_quent_context`` in place by setting ``network`` and
+    ``link_channels``.
+    """
+    if comm.nranks <= 1:
+        return
+
+    network = cudf_polars.quent._types.Network(
+        engine_id=local_quent_context.context.engine.id,
+    )
+    local_quent_context.logger.emit(network.declare())
+    local_quent_context.network = network
+
+    link_channels: dict[int, cudf_polars.quent._types.Channel] = {}
+    for target_rank in range(comm.nranks):
+        if target_rank == comm.rank:
+            continue
+        link = cudf_polars.quent._types.Channel(
+            instance_name=f"rank-{comm.rank} -> rank-{target_rank}",
+            resource_type_name="Link",
+            parent_group_id=network.id,
+            source=local_quent_context.device_memory,
+            target=local_quent_context.device_memory,
+        )
+        local_quent_context.logger.emit(link.initializing())
+        local_quent_context.logger.emit(link.operating())
+        link_channels[target_rank] = link
+
+    local_quent_context.link_channels = link_channels
+
+
 def evaluate_on_rank(
     ctx: Context,
     comm: Communicator,
@@ -661,7 +715,6 @@ def evaluate_on_rank(
     ir: IR,
     config_options: ConfigOptions[StreamingExecutor],
     *,
-    collect_metadata: bool = False,
     local_quent_context: cudf_polars.quent.LocalQuentContext,
     query_id: uuid.UUID,
 ) -> tuple[pl.DataFrame, list[ChannelMetadata]]:
@@ -688,8 +741,6 @@ def evaluate_on_rank(
         Root of the **pre-lowered** IR graph.
     config_options
         Executor configuration forwarded from the client.
-    collect_metadata
-        Whether to collect channel metadata during execution.
     local_quent_context
         The local Quent context for this rank.
     query_id
@@ -703,6 +754,7 @@ def evaluate_on_rank(
         Collected channel metadata.
     """
     stats = allgather_stats(comm, ctx.br(), ir, config_options, py_executor)
+    _declare_network_channels(comm, local_quent_context)
     logical_plan_id = ir.get_stable_plan_id()
 
     physical_plan_id = uuid.uuid4()
@@ -727,7 +779,7 @@ def evaluate_on_rank(
     )
 
     log_query_plan(ir, config_options)
-    local_quent_context.context._emit_physical_plan_events(
+    physical_op_by_id = local_quent_context.context.emit_physical_plan_events(
         local_quent_context.logger,
         ir,
         config_options,
@@ -739,7 +791,7 @@ def evaluate_on_rank(
     )
 
     with ReserveOpIDs(ir, config_options) as collective_id_map:
-        return execute_ir_on_rank(
+        result = execute_ir_on_rank(
             ctx,
             comm,
             py_executor,
@@ -749,4 +801,12 @@ def evaluate_on_rank(
             stats,
             collective_id_map,
             query_id=query_id,
+            physical_op_by_id=physical_op_by_id,
+            local_quent_context=local_quent_context,
         )
+
+    for link in local_quent_context.link_channels.values():
+        local_quent_context.logger.emit(link.finalizing())
+        local_quent_context.logger.emit(link.exit())
+
+    return result

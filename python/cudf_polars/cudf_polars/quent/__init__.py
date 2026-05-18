@@ -5,15 +5,36 @@
 
 from __future__ import annotations
 
-from cudf_polars.quent._context import LocalQuentContext, QuentContext
-from cudf_polars.quent._types import Engine, Implementation, Query, QueryGroup, Worker
+from cudf_polars.quent._context import (
+    LocalQuentContext,
+    QuentContext,
+    QuentIRExecutionContext,
+)
+from cudf_polars.quent._types import (
+    Channel,
+    Engine,
+    Implementation,
+    Network,
+    Operator,
+    Query,
+    QueryGroup,
+    Statistics,
+    Task,
+    Worker,
+)
 
 __all__ = [
+    "Channel",
     "Engine",
     "Implementation",
     "LocalQuentContext",
+    "Network",
+    "Operator",
     "QuentContext",
+    "QuentIRExecutionContext",
     "Query",
     "QueryGroup",
+    "Statistics",
+    "Task",
     "Worker",
 ]

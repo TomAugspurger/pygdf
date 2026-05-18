@@ -118,14 +118,42 @@ def evaluate_pipeline_spmd_mode(
     quent_context._emit_query_events(config_options.executor.spmd_context.quent_logger)
 
     # I don't like recreating the Worker here...
+    worker_id = config_options.executor.spmd_context.worker_id
+    device_memory = cudf_polars.quent._types.Memory(
+        instance_name=f"rank-{comm.rank} device memory",
+        resource_type_name="memory",
+        parent_group_id=quent_context.engine.id,
+    )
+    filesystem = cudf_polars.quent._types.Memory(
+        instance_name=f"rank-{comm.rank} filesystem",
+        resource_type_name="filesystem",
+        parent_group_id=worker_id,
+    )
+    disk_to_device_channel = cudf_polars.quent._types.Channel(
+        instance_name=f"rank-{comm.rank} disk -> device",
+        resource_type_name="DiskToDevice",
+        parent_group_id=worker_id,
+        source=filesystem,
+        target=device_memory,
+    )
+    quent_logger = config_options.executor.spmd_context.quent_logger
+    quent_logger.emit(device_memory.initializing())
+    quent_logger.emit(device_memory.operating(0))
+    quent_logger.emit(filesystem.initializing())
+    quent_logger.emit(filesystem.operating(0))
+    quent_logger.emit(disk_to_device_channel.initializing())
+    quent_logger.emit(disk_to_device_channel.operating())
     local_quent_context = cudf_polars.quent.LocalQuentContext(
         context=quent_context,
         worker=cudf_polars.quent.Worker(
-            id=config_options.executor.spmd_context.worker_id,
+            id=worker_id,
             engine=quent_context.engine,
             instance_name=f"rank-{comm.rank}",
         ),
         logger=config_options.executor.spmd_context.quent_logger,
+        thread_pool_id=uuid.uuid4(),  # TODO: this is incorrect!
+        device_memory=device_memory,
+        disk_to_device_channel=disk_to_device_channel,
     )
 
     df, metadata = evaluate_on_rank(
@@ -137,6 +165,12 @@ def evaluate_pipeline_spmd_mode(
         local_quent_context=local_quent_context,
         query_id=query_id,
     )
+    quent_logger.emit(disk_to_device_channel.finalizing())
+    quent_logger.emit(disk_to_device_channel.exit())
+    quent_logger.emit(filesystem.finalizing())
+    quent_logger.emit(filesystem.exit())
+    quent_logger.emit(device_memory.finalizing())
+    quent_logger.emit(device_memory.exit())
     quent_context._emit_query_exit_events(
         config_options.executor.spmd_context.quent_logger
     )
@@ -753,11 +787,21 @@ class SPMDEngine(StreamingEngine):
         # quent traces before that.
         # Clear the references only after shutdown completes.
 
+<<<<<<< HEAD
         self._quent_logger.emit(self._quent_worker._exit())
         quent_context: cudf_polars.quent.QuentContext = self.config["executor_options"][
             "quent_context"
         ]
         quent_context._emit_engine_exit_events(self._quent_logger)
+=======
+        self.config["executor_options"]["quent_context"].emit_resource_exit_events(
+            self._quent_logger
+        )
+        self._quent_logger.emit(self._quent_worker.exit())
+        self.config["executor_options"]["quent_context"].emit_engine_exit_events(
+            self._quent_logger
+        )
+>>>>>>> 15428e1527 (quent resources)
 
         super().shutdown()
 

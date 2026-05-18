@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -15,6 +16,7 @@ from cudf_streaming.streaming.table_chunk import (
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
 from rapidsmpf.streaming.core.actor import define_actor
 
+import cudf_polars.quent
 from cudf_polars.containers import DataFrame
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
 from cudf_polars.streaming.actor_graph.dispatch import generate_ir_sub_network
@@ -255,6 +257,20 @@ def _(
 
     # Create output ChannelManager
     channels[ir] = ChannelManager(rec.state["context"])
+    ir_context = rec.state["ir_context"]
+    if (
+        rec.state["quent_operator_map"] is not None
+        and rec.state["quent_execution_context"] is not None
+    ):
+        quent_execution_context = rec.state["quent_execution_context"]
+        quent_operator_id = rec.state["quent_operator_map"][ir]
+        ir_context = dataclasses.replace(
+            rec.state["ir_context"],
+            quent_ir_execution_context=cudf_polars.quent.QuentIRExecutionContext.from_execution_context(
+                execution_context=quent_execution_context,
+                quent_operator=quent_operator_id,
+            ),
+        )
 
     # Look up the reserved shuffle ID for this operation
     collective_id = rec.state["collective_id_map"][ir][0]
@@ -265,7 +281,7 @@ def _(
             rec.state["context"],
             rec.state["comm"],
             ir,
-            rec.state["ir_context"],
+            ir_context,
             channels[ir].reserve_input_slot(),
             channels[ir.children[0]].reserve_output_slot(),
             output_count=partition_info[ir].count,

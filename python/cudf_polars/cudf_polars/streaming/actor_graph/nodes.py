@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from typing import TYPE_CHECKING, Any, cast
 
 from cudf_streaming.streaming.channel_metadata import ChannelMetadata
@@ -18,6 +19,7 @@ from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.message import Message
 from rapidsmpf.streaming.core.spillable_messages import SpillableMessages
 
+import cudf_polars.quent
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import IR, Empty
 from cudf_polars.streaming.actor_graph.dispatch import (
@@ -521,13 +523,28 @@ def _(
     # Create output ChannelManager
     channels[ir] = ChannelManager(rec.state["context"])
 
+    ir_context = rec.state["ir_context"]
+    if (
+        rec.state["quent_operator_map"] is not None
+        and rec.state["quent_execution_context"] is not None
+    ):
+        quent_execution_context = rec.state["quent_execution_context"]
+        quent_operator_id = rec.state["quent_operator_map"][ir]
+        ir_context = dataclasses.replace(
+            rec.state["ir_context"],
+            quent_ir_execution_context=cudf_polars.quent.QuentIRExecutionContext.from_execution_context(
+                execution_context=quent_execution_context,
+                quent_operator=quent_operator_id,
+            ),
+        )
+
     if len(ir.children) == 1:
         # Single-channel default node
         nodes[ir] = [
             default_node_single(
                 rec.state["context"],
                 ir,
-                rec.state["ir_context"],
+                ir_context,
                 channels[ir].reserve_input_slot(),
                 channels[ir.children[0]].reserve_output_slot(),
             )
@@ -538,7 +555,7 @@ def _(
             default_node_multi(
                 rec.state["context"],
                 ir,
-                rec.state["ir_context"],
+                ir_context,
                 channels[ir].reserve_input_slot(),
                 tuple(channels[c].reserve_output_slot() for c in ir.children),
             )
@@ -596,6 +613,19 @@ def _(
     """Generate network for Empty node - produces one empty chunk."""
     context = rec.state["context"]
     ir_context = rec.state["ir_context"]
+    if (
+        rec.state["quent_operator_map"] is not None
+        and rec.state["quent_execution_context"] is not None
+    ):
+        quent_execution_context = rec.state["quent_execution_context"]
+        quent_operator_id = rec.state["quent_operator_map"][ir]
+        ir_context = dataclasses.replace(
+            rec.state["ir_context"],
+            quent_ir_execution_context=cudf_polars.quent.QuentIRExecutionContext.from_execution_context(
+                execution_context=quent_execution_context,
+                quent_operator=quent_operator_id,
+            ),
+        )
     channels: dict[IR, ChannelManager] = {ir: ChannelManager(rec.state["context"])}
     nodes: dict[IR, list[Any]] = {
         ir: [empty_node(context, ir, ir_context, channels[ir].reserve_input_slot())]

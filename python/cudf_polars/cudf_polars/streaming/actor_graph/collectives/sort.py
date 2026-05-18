@@ -1,9 +1,10 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Sort logic for the RapidsMPF streaming runtime."""
 
 from __future__ import annotations
 
+import dataclasses
 from typing import TYPE_CHECKING
 
 import polars as pl
@@ -20,6 +21,7 @@ from rapidsmpf.shuffler import PartitionAssignment
 from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.message import Message
 
+import cudf_polars.quent
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.dsl.expr import Col, NamedExpr
 from cudf_polars.dsl.ir import Empty, Sort
@@ -715,6 +717,20 @@ def _sort_rapidsmpf_network(ir: Sort, rec: SubNetGenerator) -> tuple[dict, dict]
     executor = rec.state["config_options"].executor
     partition_info = rec.state["partition_info"]
     dynamic = executor.dynamic_planning is not None
+    ir_context = rec.state["ir_context"]
+    if (
+        rec.state["quent_operator_map"] is not None
+        and rec.state["quent_execution_context"] is not None
+    ):
+        quent_execution_context = rec.state["quent_execution_context"]
+        quent_operator_id = rec.state["quent_operator_map"][ir]
+        ir_context = dataclasses.replace(
+            rec.state["ir_context"],
+            quent_ir_execution_context=cudf_polars.quent.QuentIRExecutionContext.from_execution_context(
+                execution_context=quent_execution_context,
+                quent_operator=quent_operator_id,
+            ),
+        )
 
     if partition_info[ir].count == 1 and (
         not dynamic or isinstance(ir.children[0], Repartition)
@@ -725,7 +741,7 @@ def _sort_rapidsmpf_network(ir: Sort, rec: SubNetGenerator) -> tuple[dict, dict]
             default_node_single(
                 rec.state["context"],
                 ir,
-                rec.state["ir_context"],
+                ir_context,
                 channels[ir].reserve_input_slot(),
                 channels[ir.children[0]].reserve_output_slot(),
             )
@@ -748,7 +764,7 @@ def _sort_rapidsmpf_network(ir: Sort, rec: SubNetGenerator) -> tuple[dict, dict]
             rec.state["context"],
             rec.state["comm"],
             ir,
-            rec.state["ir_context"],
+            ir_context,
             ch_in=channels[child].reserve_output_slot(),
             ch_out=channels[ir].reserve_input_slot(),
             by=by,

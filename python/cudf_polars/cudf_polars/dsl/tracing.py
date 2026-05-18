@@ -9,7 +9,9 @@ import contextlib
 import enum
 import functools
 import os
+import threading
 import time
+import uuid
 from typing import TYPE_CHECKING, Any, Concatenate, Literal, ParamSpec
 
 import nvtx
@@ -49,6 +51,7 @@ if TYPE_CHECKING:
 
     import cudf_polars.containers
     from cudf_polars.dsl import ir
+    from cudf_polars.dsl.ir import IRExecutionContext
 
 
 class Scope(enum.StrEnum):
@@ -63,6 +66,14 @@ class Scope(enum.StrEnum):
 def _getpid() -> int:  # pragma: no cover
     # Gets called for each IR.do_evaluate node, so we'll cache it.
     return os.getpid()
+
+
+def _dataframe_size_bytes(frame: cudf_polars.containers.DataFrame) -> int:
+    return sum(col.device_buffer_size() for col in frame.table.columns())
+
+
+def _dataframes_size_bytes(frames: Sequence[cudf_polars.containers.DataFrame]) -> int:
+    return sum(_dataframe_size_bytes(frame) for frame in frames)
 
 
 def make_snapshot(
@@ -108,9 +119,7 @@ def make_snapshot(
                 f"frames_{phase}": [
                     {
                         "shape": frame.table.shape(),
-                        "size": sum(
-                            col.device_buffer_size() for col in frame.table.columns()
-                        ),
+                        "size": _dataframe_size_bytes(frame),
                     }
                     for frame in frames
                 ],
@@ -168,6 +177,8 @@ def log_do_evaluate(
             *args: P.args,
             **kwargs: P.kwargs,
         ) -> cudf_polars.containers.DataFrame:
+            import cudf_polars.quent
+
             # do this just once
             pynvml.nvmlInit()
             maybe_handle = get_device_handle()
@@ -186,6 +197,36 @@ def log_do_evaluate(
             )
             before_end = time.monotonic_ns()
 
+            # by convention, context is the only keyword-only argument
+            ir_execution_context: IRExecutionContext = kwargs["context"]  # type: ignore[assignment]
+
+            if (
+                quent_ir_execution_context
+                := ir_execution_context.quent_ir_execution_context
+            ) is not None:
+                from cudf_polars.dsl.ir import DataFrameScan, Scan
+
+                token = uuid.uuid4()
+
+                quent_task = cudf_polars.quent.Task(
+                    instance_name=f"{cls.__name__}-{quent_ir_execution_context.quent_operator.id.hex[:8]}-{token.hex[:8]}",
+                    operator_id=quent_ir_execution_context.quent_operator.id,
+                )
+
+                quent_processor = (
+                    quent_ir_execution_context.context.get_or_declare_processor(
+                        quent_ir_execution_context.logger,
+                        thread_ident=threading.get_ident(),
+                        pool_id=quent_ir_execution_context.thread_pool_id,
+                    )
+                )
+                is_io_node = issubclass(cls, (Scan, DataFrameScan))
+                quent_ir_execution_context.logger.emit(quent_task.queueing())
+                if not is_io_node:
+                    quent_ir_execution_context.logger.emit(
+                        quent_task.allocating(resource_id=quent_processor.id)
+                    )
+
             # The decorator preserves the exact signature of the original do_evaluate method.
             # Each IR.do_evaluate method is a classmethod that takes the IR class as first
             # argument, followed by the method-specific arguments, and returns a DataFrame.
@@ -193,6 +234,37 @@ def log_do_evaluate(
             start = time.monotonic_ns()
             result = func(cls, *args, **kwargs)
             stop = time.monotonic_ns()
+
+            if quent_ir_execution_context is not None:
+                output_capacity_bytes = _dataframe_size_bytes(result)
+                if is_io_node:
+                    quent_ir_execution_context.logger.emit(
+                        quent_task.loading(
+                            use_thread=quent_processor,
+                            use_channel=quent_ir_execution_context.disk_to_device_channel,
+                            channel_capacity_bytes=output_capacity_bytes,
+                            use_memory=quent_ir_execution_context.device_memory,
+                            memory_capacity_bytes=output_capacity_bytes,
+                        )
+                    )
+                else:
+                    quent_ir_execution_context.logger.emit(
+                        quent_task.computing(
+                            use_thread=quent_processor,
+                            use_memory=quent_ir_execution_context.device_memory,
+                            memory_capacity_bytes=output_capacity_bytes,
+                        )
+                    )
+                quent_ir_execution_context.logger.emit(
+                    quent_ir_execution_context.quent_operator.statistics(
+                        statistics=cudf_polars.quent.Statistics(
+                            input_bytes=_dataframes_size_bytes(frames),
+                            output_bytes=output_capacity_bytes,
+                            output_rows=result.num_rows,
+                        )
+                    )
+                )
+                quent_ir_execution_context.logger.emit(quent_task.exit())
 
             after_start = time.monotonic_ns()
             after = make_snapshot(

@@ -1,10 +1,10 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """GroupBy and Distinct logic for the RapidsMPF streaming runtime."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import pylibcudf as plc
@@ -18,6 +18,7 @@ from rapidsmpf.config import Options, get_environment_variables
 from rapidsmpf.streaming.core.actor import define_actor
 from rapidsmpf.streaming.core.context import Context
 
+import cudf_polars.quent
 from cudf_polars.containers import DataType
 from cudf_polars.dsl.expr import Col, NamedExpr
 from cudf_polars.dsl.ir import IR, Distinct, GroupBy, Select
@@ -745,6 +746,20 @@ def _(
     actors, channels = process_children(ir, rec)
     channels[ir] = ChannelManager(rec.state["context"])
     collective_ids = list(rec.state["collective_id_map"].get(ir, []))
+    ir_context = rec.state["ir_context"]
+    if (
+        rec.state["quent_operator_map"] is not None
+        and rec.state["quent_execution_context"] is not None
+    ):
+        quent_execution_context = rec.state["quent_execution_context"]
+        quent_operator_id = rec.state["quent_operator_map"][ir]
+        ir_context = replace(
+            rec.state["ir_context"],
+            quent_ir_execution_context=cudf_polars.quent.QuentIRExecutionContext.from_execution_context(
+                execution_context=quent_execution_context,
+                quent_operator=quent_operator_id,
+            ),
+        )
     assert len(collective_ids) == 2, (
         f"{type(ir).__name__} requires 2 collective IDs, got {len(collective_ids)}"
     )
@@ -753,7 +768,7 @@ def _(
             rec.state["context"],
             rec.state["comm"],
             ir,
-            rec.state["ir_context"],
+            ir_context,
             channels[ir].reserve_input_slot(),
             channels[ir.children[0]].reserve_output_slot(),
             config_options.executor.target_partition_size,

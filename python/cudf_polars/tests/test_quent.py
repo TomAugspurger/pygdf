@@ -23,6 +23,7 @@ from cudf_polars.quent._types import (
     Plan,
     Port,
     Query,
+    Statistics,
     Worker,
 )
 from cudf_polars.utils.config import ConfigOptions
@@ -165,6 +166,61 @@ def test_operator_declare_serialization(
         decl = d["data"]["Operator"]["Declaration"]
         assert decl["plan_id"] == str(op.plan_id)
         assert decl["type_name"] == op.type_name
+
+
+def test_operator_declare_custom_attributes_are_typed(
+    ir_and_config: tuple[IR, ConfigOptions[StreamingExecutor]],
+) -> None:
+    ir, config_options = ir_and_config
+    _, operators, _, _ = build_plan(
+        ir, config_options, Query(), uuid.uuid4(), _make_worker()
+    )
+
+    allowed_tags = {
+        "U8",
+        "U16",
+        "U32",
+        "U64",
+        "I8",
+        "I16",
+        "I32",
+        "I64",
+        "F32",
+        "F64",
+        "String",
+        "Struct",
+        "List",
+    }
+    for op in operators:
+        decl = op.declare(timestamp=1).to_dict()["data"]["Operator"]["Declaration"]
+        for attribute in decl["custom_attributes"]:
+            assert set(attribute) == {"key", "value"}
+            assert isinstance(attribute["value"], dict)
+            assert len(attribute["value"]) == 1
+            tag = next(iter(attribute["value"]))
+            assert tag in allowed_tags
+
+
+def test_operator_statistics_serialization(
+    ir_and_config: tuple[IR, ConfigOptions[StreamingExecutor]],
+) -> None:
+    ir, config_options = ir_and_config
+    _, operators, _, _ = build_plan(
+        ir, config_options, Query(), uuid.uuid4(), _make_worker()
+    )
+    op = operators[0]
+    stats = Statistics(input_bytes=123, output_bytes=456, output_rows=7)
+
+    event = op.statistics(stats, timestamp=101)
+    d = event.to_dict()
+
+    assert d["id"] == str(op.id)
+    payload = d["data"]["Operator"]["Statistics"]["custom_attributes"]
+    assert payload == [
+        {"key": "input_bytes", "value": {"U64": 123}},
+        {"key": "output_bytes", "value": {"U64": 456}},
+        {"key": "output_rows", "value": {"U64": 7}},
+    ]
 
 
 def test_port_declare_serialization(

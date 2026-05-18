@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import math
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,7 @@ from rapidsmpf.streaming.core.memory_reserve_or_wait import (
 )
 from rapidsmpf.streaming.core.message import Message
 
+import cudf_polars.quent
 from cudf_polars.dsl.ir import (
     IR,
     DataFrameScan,
@@ -275,6 +277,18 @@ def _(
 
     context = rec.state["context"]
     ir_context = rec.state["ir_context"]
+    if (
+        rec.state["quent_operator_map"] is not None
+        and rec.state["quent_execution_context"] is not None
+    ):
+        quent_operator = rec.state["quent_operator_map"][ir]
+        ir_context = dataclasses.replace(
+            rec.state["ir_context"],
+            quent_ir_execution_context=cudf_polars.quent.QuentIRExecutionContext.from_execution_context(
+                execution_context=rec.state["quent_execution_context"],
+                quent_operator=quent_operator,
+            ),
+        )
     channels: dict[IR, ChannelManager] = {ir: ChannelManager(rec.state["context"])}
     nodes: dict[IR, list[Any]] = {
         ir: [
@@ -392,6 +406,9 @@ async def scan_node(
         # If there is only one scan or one producer, we can
         # skip the lineariser and read the chunks directly
         if len(scans) == 1 or num_producers == 1:
+            # TODO: Figure out parent / child relationship here...
+            # This is kinda like another form of lowering.
+            # Maybe we can do this earlier?
             for seq_num, scan in enumerate(scans):
                 await read_chunk(
                     context,
@@ -573,6 +590,21 @@ def _(
         parquet_options=parquet_options,
         config_options=config_options,
     )
+
+    if (
+        rec.state["quent_operator_map"] is not None
+        and rec.state["quent_execution_context"] is not None
+    ):
+        quent_execution_context = rec.state["quent_execution_context"]
+        quent_operator_id = rec.state["quent_operator_map"][ir]
+        ir_context = dataclasses.replace(
+            rec.state["ir_context"],
+            quent_ir_execution_context=cudf_polars.quent.QuentIRExecutionContext.from_execution_context(
+                execution_context=quent_execution_context,
+                quent_operator=quent_operator_id,
+            ),
+        )
+
     if use_native:
         # Create new channel to so ch_out can be used to add metadata
         ch_in = rec.state["context"].create_channel()
@@ -598,7 +630,7 @@ def _(
                 # Just estimate the local count as well.
                 local_count=math.ceil(partition_info.count / rec.state["comm"].nranks),
             ),
-            rec.state["ir_context"],
+            ir_context,
         )
         nodes[ir] = [native_node, metadata_node]
     else:
@@ -606,7 +638,7 @@ def _(
             scan_node(
                 rec.state["context"],
                 ir,
-                rec.state["ir_context"],
+                ir_context,
                 ch_out,
                 num_producers=num_producers,
                 estimated_chunk_bytes=(
@@ -733,12 +765,25 @@ def _(
     """Generate network for StreamingSink node."""
     nodes, channels = process_children(ir, rec)
     channels[ir] = ChannelManager(rec.state["context"])
+    ir_context = rec.state["ir_context"]
+    if (
+        rec.state["quent_operator_map"] is not None
+        and rec.state["quent_execution_context"] is not None
+    ):
+        quent_operator = rec.state["quent_operator_map"][ir]
+        ir_context = dataclasses.replace(
+            rec.state["ir_context"],
+            quent_ir_execution_context=cudf_polars.quent.QuentIRExecutionContext.from_execution_context(
+                execution_context=rec.state["quent_execution_context"],
+                quent_operator=quent_operator,
+            ),
+        )
     nodes[ir] = [
         sink_node(
             rec.state["context"],
             rec.state["comm"],
             ir,
-            rec.state["ir_context"],
+            ir_context,
             channels[ir.children[0]].reserve_output_slot(),
             channels[ir].reserve_input_slot(),
             rec.state["partition_info"][ir],

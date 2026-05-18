@@ -215,6 +215,8 @@ def generate_network(
     ir_context: IRExecutionContext,
     collective_id_map: dict[IR, list[int]],
     metadata_collector: list[ChannelMetadata] | None,
+    quent_operator_map: dict[IR, cudf_polars.quent.Operator] | None = None,
+    quent_execution_context: cudf_polars.quent.LocalQuentContext | None = None,
 ) -> tuple[list[Any], DeferredMessages]:
     """
     Translate the IR graph to a RapidsMPF streaming network.
@@ -241,6 +243,10 @@ def generate_network(
         The list to collect the final metadata.
         This list will be mutated when the network is executed.
         If None, metadata will not be collected.
+    quent_operator_map
+        The mapping of IR nodes to Quent operator IDs.
+    quent_execution_context
+        The execution context for the Quent operator, used for tracing.
 
     Returns
     -------
@@ -273,6 +279,8 @@ def generate_network(
         "max_io_threads": max_io_threads_local,
         "stats": stats,
         "collective_id_map": collective_id_map,
+        "quent_operator_map": quent_operator_map,
+        "quent_execution_context": quent_execution_context,
     }
     mapper: SubNetGenerator = CachingVisitor(
         generate_ir_sub_network_wrapper, state=state

@@ -118,6 +118,8 @@ class _WorkerContext:
     mr: RmmResourceAdaptor | None
     quent_logger: cudf_polars.quent._logging.QuentLogger
     quent_worker: cudf_polars.quent._types.Worker
+    device_memory: cudf_polars.quent._types.Memory
+    disk_to_device_channel: cudf_polars.quent._types.Channel | None = None
 
 
 def _setup_root(
@@ -183,6 +185,30 @@ def _setup_root(
         instance_name=f"rank-{comm.rank}",
     )
 
+    device_memory = cudf_polars.quent._types.Memory(
+        instance_name=f"rank-{comm.rank} device memory",
+        resource_type_name="memory",
+        parent_group_id=engine_id,
+    )
+    filesystem = cudf_polars.quent._types.Memory(
+        instance_name=f"rank-{comm.rank} filesystem",
+        resource_type_name="filesystem",
+        parent_group_id=worker_id,
+    )
+    disk_to_device_channel = cudf_polars.quent._types.Channel(
+        instance_name=f"rank-{comm.rank} disk -> device",
+        resource_type_name="DiskToDevice",
+        parent_group_id=worker_id,
+        source=filesystem,
+        target=device_memory,
+    )
+    quent_logger = cudf_polars.quent._logging.QuentLogger()
+    quent_logger.emit(device_memory.initializing())
+    quent_logger.emit(device_memory.operating(0))
+    quent_logger.emit(filesystem.initializing())
+    quent_logger.emit(filesystem.operating(0))
+    quent_logger.emit(disk_to_device_channel.initializing())
+    quent_logger.emit(disk_to_device_channel.operating())
     setattr(
         dask_worker,
         f"_cudf_polars_mp_context_{uid}",
@@ -192,7 +218,9 @@ def _setup_root(
             py_executor=None,
             mr=mr,
             quent_worker=quent_worker,
-            quent_logger=cudf_polars.quent._logging.QuentLogger(),
+            quent_logger=quent_logger,
+            device_memory=device_memory,
+            disk_to_device_channel=disk_to_device_channel,
         ),
     )
     return get_root_ucxx_address(comm)
@@ -293,13 +321,39 @@ def _setup_worker(
         thread_name_prefix="dask-executor",
     )
 
+    device_memory = cudf_polars.quent._types.Memory(
+        instance_name=f"rank-{comm.rank} device memory",
+        resource_type_name="memory",
+        parent_group_id=engine_id,
+    )
+    filesystem = cudf_polars.quent._types.Memory(
+        instance_name=f"rank-{comm.rank} filesystem",
+        resource_type_name="filesystem",
+        parent_group_id=worker_id,
+    )
+    disk_to_device_channel = cudf_polars.quent._types.Channel(
+        instance_name=f"rank-{comm.rank} disk -> device",
+        resource_type_name="DiskToDevice",
+        parent_group_id=worker_id,
+        source=filesystem,
+        target=device_memory,
+    )
+    quent_logger = cudf_polars.quent._logging.QuentLogger()
+    quent_logger.emit(device_memory.initializing())
+    quent_logger.emit(device_memory.operating(0))
+    quent_logger.emit(filesystem.initializing())
+    quent_logger.emit(filesystem.operating(0))
+    quent_logger.emit(disk_to_device_channel.initializing())
+    quent_logger.emit(disk_to_device_channel.operating())
     mp_ctx = _WorkerContext(
         comm=comm,
         ctx=ctx,
         py_executor=py_executor,
         mr=mr,
         quent_worker=quent_worker,
-        quent_logger=cudf_polars.quent._logging.QuentLogger(),
+        quent_logger=quent_logger,
+        device_memory=device_memory,
+        disk_to_device_channel=disk_to_device_channel,
     )
 
     setattr(dask_worker, attr, mp_ctx)
@@ -307,7 +361,10 @@ def _setup_worker(
 
 
 def _teardown_worker(
-    *, uid: str, dask_worker: distributed.Worker | None = None
+    *,
+    uid: str,
+    quent_context: cudf_polars.quent.QuentContext,
+    dask_worker: distributed.Worker | None = None,
 ) -> list[dict[str, Any]]:
     """
     Emit Worker.exit, then release per-worker GPU resources.
@@ -319,6 +376,8 @@ def _teardown_worker(
     ----------
     uid
         Unique identifier for the cluster instance to tear down.
+    quent_context
+        Quent context used to finalize declared resources.
     dask_worker
         Injected by ``distributed`` when called via :meth:`distributed.Client.run`.
     """
@@ -328,8 +387,16 @@ def _teardown_worker(
     traces = []
     if mp_ctx is not None:
         if mp_ctx.quent_worker is not None:
+            if mp_ctx.disk_to_device_channel is not None:
+                mp_ctx.quent_logger.emit(mp_ctx.disk_to_device_channel.finalizing())
+                mp_ctx.quent_logger.emit(mp_ctx.disk_to_device_channel.exit())
+                mp_ctx.quent_logger.emit(
+                    mp_ctx.disk_to_device_channel.source.finalizing()
+                )
+                mp_ctx.quent_logger.emit(mp_ctx.disk_to_device_channel.source.exit())
+            mp_ctx.quent_logger.emit(mp_ctx.device_memory.finalizing())
+            mp_ctx.quent_logger.emit(mp_ctx.device_memory.exit())
             mp_ctx.quent_logger.emit(mp_ctx.quent_worker._exit())
-
             traces = mp_ctx.quent_logger.drain()
 
         if mp_ctx.py_executor is not None:
@@ -477,6 +544,9 @@ def _worker_evaluate(
         context=quent_context,
         worker=mp_ctx.quent_worker,
         logger=mp_ctx.quent_logger,
+        thread_pool_id=uuid.uuid4(),  # TODO: this is incorrect!
+        device_memory=mp_ctx.device_memory,
+        disk_to_device_channel=mp_ctx.disk_to_device_channel,
     )
     # evaluate_on_rank always collects metadata internally so we can read
     # metadata[-1].duplicated to decide whether to suppress this rank's output.
@@ -968,7 +1038,11 @@ class DaskEngine(StreamingEngine):
             # Teardown emits Worker.exit, then we drain all buffered events
             # (including the exit event) from workers.
             traces_map = ctx.client.run(
-                functools.partial(_teardown_worker, uid=ctx.rapidsmpf_id)
+                functools.partial(
+                    _teardown_worker,
+                    uid=ctx.rapidsmpf_id,
+                    quent_context=self.config["executor_options"]["quent_context"],
+                )
             )
 
             for traces in traces_map.values():

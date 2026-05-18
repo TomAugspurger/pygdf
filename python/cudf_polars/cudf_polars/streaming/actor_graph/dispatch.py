@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Dispatching for the RapidsMPF streaming runtime."""
 
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.streaming.core.context import Context
 
+    import cudf_polars.quent
     from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.streaming.actor_graph.utils import ChannelManager
     from cudf_polars.streaming.base import (
@@ -58,6 +59,10 @@ class GenState(TypedDict):
         Statistics collector.
     collective_id_map
         The mapping of IR nodes to lists of collective IDs.
+    quent_operator_map
+        The mapping of IR nodes to Quent operator IDs.
+    quent_execution_context
+        The execution context for the Quent operator.
     """
 
     context: Context
@@ -69,6 +74,8 @@ class GenState(TypedDict):
     max_io_threads: int
     stats: StatsCollector
     collective_id_map: dict[IR, list[int]]
+    quent_operator_map: dict[IR, cudf_polars.quent.Operator] | None
+    quent_execution_context: cudf_polars.quent.LocalQuentContext | None
 
 
 SubNetGenerator: TypeAlias = GenericTransformer[

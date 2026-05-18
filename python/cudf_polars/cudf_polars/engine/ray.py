@@ -194,6 +194,7 @@ class RankActor:
         memory_resource_config: MemoryResourceConfig | None,
         worker_id: uuid.UUID,
         engine: cudf_polars.quent.Engine,
+        quent_context: cudf_polars.quent.QuentContext,
     ) -> None:
         bind_to_gpu(hardware_binding)
         memory_resource_config = (
@@ -212,6 +213,10 @@ class RankActor:
         )
         self._comm: Communicator | None = None
         self._ctx: Context | None = None
+        self._worker_id: uuid.UUID = worker_id
+        self._engine = engine
+        self._quent_context: cudf_polars.quent.QuentContext = quent_context
+        self._quent_worker: cudf_polars.quent._types.Worker | None = None
         self._quent_logger = cudf_polars.quent._logging.QuentLogger()
         self._quent_worker = cudf_polars.quent._types.Worker(
             id=worker_id,
@@ -219,6 +224,35 @@ class RankActor:
             instance_name=f"RankActor-{worker_id.hex[:8]}",
         )
         self._quent_logger.emit(self._quent_worker._init())
+        self._device_memory = cudf_polars.quent._types.Memory(
+            instance_name=f"{worker_id} host memory",
+            resource_type_name="memory",
+            parent_group_id=self._engine.id,
+        )
+        self._filesystem = cudf_polars.quent._types.Memory(
+            instance_name=f"{worker_id} filesystem",
+            resource_type_name="filesystem",
+            parent_group_id=worker_id,
+        )
+        self._disk_to_device_channel = cudf_polars.quent._types.Channel(
+            instance_name=f"{worker_id} disk -> device",
+            resource_type_name="DiskToDevice",
+            parent_group_id=worker_id,
+            source=self._filesystem,
+            target=self._device_memory,
+        )
+        self._quent_thread_pool = cudf_polars.quent._types.ThreadPool(
+            id=uuid.uuid4(),
+            worker_id=worker_id,
+        )
+
+        self._quent_logger.emit(self._device_memory.initializing())
+        self._quent_logger.emit(self._device_memory.operating(0))
+        self._quent_logger.emit(self._filesystem.initializing())
+        self._quent_logger.emit(self._filesystem.operating(0))
+        self._quent_logger.emit(self._disk_to_device_channel.initializing())
+        self._quent_logger.emit(self._disk_to_device_channel.operating())
+        self._quent_logger.emit(self._quent_thread_pool.declare())
 
     def setup_root(self) -> bytes:
         """
@@ -311,6 +345,13 @@ class RankActor:
         # Maybe generalize this to all application-level things,
         # followed by framework (ray) level things.
         if self._quent_worker is not None:
+            self._quent_context.emit_resource_exit_events(self._quent_logger)
+            self._quent_logger.emit(self._disk_to_device_channel.finalizing())
+            self._quent_logger.emit(self._disk_to_device_channel.exit())
+            self._quent_logger.emit(self._filesystem.finalizing())
+            self._quent_logger.emit(self._filesystem.exit())
+            self._quent_logger.emit(self._device_memory.finalizing())
+            self._quent_logger.emit(self._device_memory.exit())
             self._quent_logger.emit(self._quent_worker._exit())
             return self._drain_quent_events()
         return []
@@ -414,6 +455,8 @@ class RankActor:
         """
         if self._ctx is None or self._comm is None:
             raise RuntimeError("setup_worker must be called before evaluate_polars_ir")
+        assert self._comm is not None
+        assert self._quent_worker is not None
         # Ray transfers the returned Polars DataFrame back to the client via the
         # object store (pickle / Arrow IPC). The DataFrame is already on CPU at
         # this point (to_polars() copies the result off-GPU), so no GPU memory
@@ -422,7 +465,13 @@ class RankActor:
             context=quent_context,
             worker=self._quent_worker,
             logger=self._quent_logger,
+            thread_pool_id=self._quent_thread_pool.id,
+            device_memory=self._device_memory,
+            disk_to_device_channel=self._disk_to_device_channel,
         )
+        # Keep any previously declared processors for this actor thread.
+        # This really needs to be cleaned up.
+        quent_context._processor_map_.update(self._quent_context._processor_map_)
         # evaluate_on_rank always collects metadata internally so we can read
         # metadata[-1].duplicated to decide whether to suppress this rank's
         # output. The client concatenates each rank's result, so without this
@@ -442,6 +491,8 @@ class RankActor:
         )
         if self._comm.rank != 0 and metadata and metadata[-1].duplicated:
             df = df.clear()
+
+        self._quent_context._processor_map_.update(quent_context._processor_map_)
         return df, metadata if collect_metadata else None
 
     def _drain_quent_events(self) -> list[dict[str, Any]]:
@@ -656,6 +707,7 @@ class RayEngine(StreamingEngine):
                     memory_resource_config=mr_config,
                     worker_id=worker_id,
                     engine=quent_context.engine,
+                    quent_context=quent_context,
                 )
                 for worker_id in worker_ids
             ]

@@ -10,7 +10,7 @@ import enum
 import sys
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from cudf_polars import __version__
 
@@ -28,6 +28,10 @@ class EventName(enum.Enum):
     OPERATOR = "Operator"
     PORT = "Port"
     TASK = "Task"
+    MEMORY = "Memory"
+    CHANNEL = "Channel"
+    THREAD_POOL = "ThreadPool"
+    PROCESSOR = "Processor"
 
 
 if sys.version_info >= (3, 14):  # pragma: no cover; requires Python 3.14+
@@ -67,6 +71,50 @@ class Implementation:
             "name": self.name,
             "version": self.version,
             "custom_attributes": self.custom_attributes,
+        }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class StatisticsAttribute:
+    """Typed key/value pair for Quent statistics custom attributes."""
+
+    key: str
+    value_type: Literal["U64", "F64", "String"]
+    value: int | float | str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"key": self.key, "value": {self.value_type: self.value}}
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class Statistics:
+    """Operator statistics payload."""
+
+    input_bytes: int
+    output_bytes: int
+    output_rows: int
+    custom_attributes: list[StatisticsAttribute] = dataclasses.field(
+        default_factory=list
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to Quent's custom attributes format."""
+        base_attributes: list[StatisticsAttribute] = [
+            StatisticsAttribute(
+                key="input_bytes", value_type="U64", value=self.input_bytes
+            ),
+            StatisticsAttribute(
+                key="output_bytes", value_type="U64", value=self.output_bytes
+            ),
+            StatisticsAttribute(
+                key="output_rows", value_type="U64", value=self.output_rows
+            ),
+        ]
+        return {
+            "custom_attributes": [
+                *(attribute.to_dict() for attribute in base_attributes),
+                *(attribute.to_dict() for attribute in self.custom_attributes),
+            ]
         }
 
 
@@ -119,6 +167,14 @@ class Operator:
             id=self.id,
             timestamp=timestamp if timestamp is not None else time.time_ns(),
             data={EventName.OPERATOR.value: {"Declaration": self.to_dict()}},
+        )
+
+    def statistics(self, statistics: Statistics, timestamp: int | None = None) -> Event:
+        """Emit post-execution operator statistics."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp if timestamp is not None else time.time_ns(),
+            data={EventName.OPERATOR.value: {"Statistics": statistics.to_dict()}},
         )
 
 
@@ -412,4 +468,436 @@ class QueryGroup:
                     }
                 }
             },
+        )
+
+
+# Resource Types
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class Memory:
+    """A Quent Memory resource."""
+
+    # TODO: I think we'll want multiple of these (host / pinned / device memory)
+    id: uuid.UUID = dataclasses.field(default_factory=new_quent_id)
+    instance_name: str
+    resource_type_name: str  # TODO: see if this is static.
+    parent_group_id: uuid.UUID  # TODO: refactor this to be an engine
+
+    def initializing(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Memory Initializing event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.MEMORY.value: {
+                    "seq": 0,
+                    "state": {
+                        "MemoryInitializing": {
+                            "instance_name": self.instance_name,
+                            "parent_group_id": str(self.parent_group_id),
+                            "resource_type_name": self.resource_type_name,
+                        }
+                    },
+                }
+            },
+        )
+
+    def operating(self, capacity_bytes: int, timestamp: int | None = None) -> Event:
+        """Build a Quent Memory Operating event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.MEMORY.value: {
+                    "seq": 1,
+                    "state": {"MemoryOperating": {"capacity_bytes": capacity_bytes}},
+                }
+            },
+        )
+
+    def finalizing(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Memory Finalizing event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.MEMORY.value: {"seq": 2, "state": {"MemoryFinalizing": None}}
+            },
+        )
+
+    def exit(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Memory Exit event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={EventName.MEMORY.value: {"seq": 3, "state": "Exit"}},
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class Channel:
+    """
+    A Quent Channel resource.
+
+    A Channel is a unidirectional data-transfer resource between two entities.
+    Examples include disk-to-device I/O channels and inter-rank network links.
+
+    Parameters
+    ----------
+    source
+        The entity this channel receives from (e.g. a Filesystem Memory).
+    target
+        The entity this channel sends to (e.g. a Device Memory).
+    parent_group_id
+        The resource group this channel belongs to (e.g. a Worker or Network ID).
+    """
+
+    id: uuid.UUID = dataclasses.field(default_factory=new_quent_id)
+    instance_name: str
+    resource_type_name: str
+    parent_group_id: uuid.UUID
+    source: Memory
+    target: Memory
+
+    def initializing(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Channel Initializing event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.CHANNEL.value: {
+                    "seq": 0,
+                    "state": {
+                        "ChannelInitializing": {
+                            "instance_name": self.instance_name,
+                            "parent_group_id": str(self.parent_group_id),
+                            "resource_type_name": self.resource_type_name,
+                            "source_id": str(self.source.id),
+                            "target_id": str(self.target.id),
+                        }
+                    },
+                }
+            },
+        )
+
+    def operating(
+        self, capacity_bytes: int | None = None, timestamp: int | None = None
+    ) -> Event:
+        """Build a Quent Channel Operating event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.CHANNEL.value: {
+                    "seq": 1,
+                    "state": {"ChannelOperating": {"capacity_bytes": capacity_bytes}},
+                }
+            },
+        )
+
+    def finalizing(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Channel Finalizing event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.CHANNEL.value: {
+                    "seq": 2,
+                    "state": {"ChannelFinalizing": None},
+                }
+            },
+        )
+
+    def exit(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Channel Exit event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={EventName.CHANNEL.value: {"seq": 3, "state": "Exit"}},
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class Network:
+    """
+    A Quent Network resource group.
+
+    Groups inter-rank Link channels under a single entity.
+    """
+
+    id: uuid.UUID = dataclasses.field(default_factory=new_quent_id)
+    engine_id: uuid.UUID
+
+    def declare(self, timestamp: int | None = None) -> Event:
+        """Build a Network declaration event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                "Network": {
+                    "Declaration": {
+                        "instance_name": "Network",
+                        "parent_group_id": str(self.engine_id),
+                    }
+                }
+            },
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class ThreadPool:
+    # {"id":"019dfdf2-26e2-7a42-af43-ea3e27459b8c","timestamp":1778081998562528225,"data":{"ThreadPool":{"Declaration":{"instance_name":"Thread Pool","parent_group_id":"019dfdf2-26e2-7a42-af43-e9d3ad80cb69"}}}}
+    id: uuid.UUID = dataclasses.field(default_factory=uuid.uuid4)
+    worker_id: uuid.UUID
+
+    def declare(self, timestamp: int | None = None) -> Event:
+        instance_name = f"Thread Pool {self.id.hex[:8]}"
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.THREAD_POOL.value: {
+                    "Declaration": {
+                        "instance_name": instance_name,
+                        "parent_group_id": str(self.worker_id),
+                    }
+                },
+            },
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class Processor:
+    # {"id":"019dfdf2-26e2-7a42-af43-ea51ff967fa1","timestamp":1778081998562538443,"data":{"Processor":{"seq":0,"state":{"ProcessorInitializing":{"instance_name":"Thread 1","parent_group_id":"019dfdf2-26e2-7a42-af43-ea3e27459b8c","resource_type_name":"processor"}}}}}
+    # {"id":"019dfdf2-26e2-7a42-af43-ea51ff967fa1","timestamp":1778081998562538609,"data":{"Processor":{"seq":1,"state":{"ProcessorOperating":null}}}}
+    # {"id":"019dfdf2-26e2-7a42-af43-ea51ff967fa1","timestamp":1778081999758405882,"data":{"Processor":{"seq":2,"state":{"ProcessorFinalizing":null}}}}
+    # {"id":"019dfdf2-26e2-7a42-af43-ea51ff967fa1","timestamp":1778081999758405986,"data":{"Processor":{"seq":3,"state":"Exit"}}}
+    id: uuid.UUID = dataclasses.field(default_factory=uuid.uuid4)
+    pool_id: uuid.UUID
+
+    def initializing(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Processor Initializing event."""
+        instance_name = f"Thread {self.id.hex[:8]}"
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.PROCESSOR.value: {
+                    "seq": 0,
+                    "state": {
+                        "ProcessorInitializing": {
+                            "instance_name": instance_name,
+                            "parent_group_id": str(self.pool_id),
+                            "resource_type_name": "processor",
+                        }
+                    },
+                }
+            },
+        )
+
+    def operating(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Processor Operating event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.PROCESSOR.value: {
+                    "seq": 1,
+                    "state": {"ProcessorOperating": None},
+                }
+            },
+        )
+
+    def finalizing(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Processor Finalizing event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.PROCESSOR.value: {
+                    "seq": 2,
+                    "state": {"ProcessorFinalizing": None},
+                }
+            },
+        )
+
+    def exit(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Processor Exit event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={EventName.PROCESSOR.value: {"seq": 3, "state": "Exit"}},
+        )
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class Task:
+    """A Quent Task."""
+
+    # e.g.
+    # {"id":"019dfdf2-26e2-7a42-af43-ef508b85b019","timestamp":1778081998562999387,"data":{"Task":{"seq":0,"state":{"Queueing":{"instance_name":"task-0","operator_id":"019dfdf2-26e2-7a42-af43-edc157afe24a"}}}}}
+    # {"id":"019dfdf2-26e2-7a42-af43-ef508b85b019","timestamp":1778081998563099700,"data":{"Task":{"seq":1,"state":{"Allocating":{"use_thread":{"resource_id":"019dfdf2-26e2-7a42-af43-ea4ed5de211d","capacity":null}}}}}}Q
+    # {"id":"019dfdf2-26e2-7a42-af43-ef508b85b019","timestamp":1778081998563159401,"data":{"Task":{"seq":2,"state":{"Loading":{"use_thread":{"resource_id":"019dfdf2-26e2-7a42-af43-ea4ed5de211d","capacity":null},"use_fs_to_mem":{"resource_id":"019dfdf2-26e2-7a42-af43-ea146f707e99","capacity":{"capacity_bytes":648019968}},"use_memory":{"resource_id":"019dfdf2-26e2-7a42-af43-ea071579c1a5","capacity":{"capacity_bytes":648019968}}}}}}}
+    # {"id":"019dfdf2-26e2-7a42-af43-ef508b85b019","timestamp":1778081998563241752,"data":{"Task":{"seq":3,"state":{"Computing":{"use_thread":{"resource_id":"019dfdf2-26e2-7a42-af43-ea4ed5de211d","capacity":null},"use_memory":{"resource_id":"019dfdf2-26e2-7a42-af43-ea071579c1a5","capacity":{"capacity_bytes":1944059904}}}}}}}
+    # {"id":"019dfdf2-26e2-7a42-af43-ef508b85b019","timestamp":1778081998563245059,"data":{"Task":{"seq":4,"state":"Exit"}}}
+
+    # or:
+    # {"id":"019dfdf2-26e3-74b3-b38b-fca60d27a1d1","timestamp":1778081998563029999,"data":{"Task":{"seq":0,"state":{"Queueing":{"instance_name":"task-64","operator_id":"019dfdf2-26e2-7a42-af43-edc157afe24a"}}}}}
+    # {"id":"019dfdf2-26e3-74b3-b38b-fca60d27a1d1","timestamp":1778081998563122381,"data":{"Task":{"seq":1,"state":{"Allocating":{"use_thread":{"resource_id":"019dfdf2-26e2-7a42-af43-ea51ff967fa1","capacity":null}}}}}}
+    # {"id":"019dfdf2-26e3-74b3-b38b-fca60d27a1d1","timestamp":1778081998563177943,"data":{"Task":{"seq":2,"state":{"Computing":{"use_thread":{"resource_id":"019dfdf2-26e2-7a42-af43-ea51ff967fa1","capacity":null},"use_memory":{"resource_id":"019dfdf2-26e2-7a42-af43-ea071579c1a5","capacity":{"capacity_bytes":0}}}}}}}
+    # {"id":"019dfdf2-26e3-74b3-b38b-fca60d27a1d1","timestamp":1778081998563181641,"data":{"Task":{"seq":3,"state":"Exit"}}}
+
+    # So the states are task-specific (spilling, etc.). hmmm.
+    id: uuid.UUID = dataclasses.field(default_factory=new_quent_id)
+    instance_name: str | None = None
+    operator_id: uuid.UUID
+
+    def queueing(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Task Queueing event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.TASK.value: {
+                    "seq": 0,
+                    "state": {
+                        "Queueing": {
+                            "instance_name": self.instance_name or self.id.hex[:8],
+                            "operator_id": str(self.operator_id),
+                        }
+                    },
+                }
+            },
+        )
+
+    def allocating(
+        self,
+        resource_id: uuid.UUID,
+        capacity: int | None = None,
+        timestamp: int | None = None,
+    ) -> Event:
+        """Build a Quent Task Allocating event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.TASK.value: {
+                    "seq": 1,
+                    "state": {
+                        "Allocating": {
+                            "use_thread": {
+                                "resource_id": str(resource_id),
+                                "capacity": capacity,
+                            }
+                        }
+                    },
+                }
+            },
+        )
+
+    def loading(
+        self,
+        use_thread: Processor | None = None,
+        use_channel: Channel | None = None,
+        channel_capacity_bytes: int = 0,
+        use_memory: Memory | None = None,
+        memory_capacity_bytes: int = 0,
+        timestamp: int | None = None,
+    ) -> Event:
+        """Build a Quent Task Loading event."""
+        loading_data: dict[str, dict[str, Any]] = {}
+        if use_thread is not None:
+            loading_data["use_thread"] = {
+                "resource_id": str(use_thread.id),
+                "capacity": None,
+            }
+        if use_channel is not None:
+            loading_data["use_fs_to_mem"] = {
+                "resource_id": str(use_channel.id),
+                "capacity": {"capacity_bytes": channel_capacity_bytes},
+            }
+        if use_memory is not None:
+            loading_data["use_memory"] = {
+                "resource_id": str(use_memory.id),
+                "capacity": {"capacity_bytes": memory_capacity_bytes},
+            }
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.TASK.value: {
+                    "seq": 2,
+                    "state": {"Loading": loading_data},
+                }
+            },
+        )
+
+    def computing(
+        self,
+        use_thread: Processor | None = None,
+        use_memory: Memory | None = None,
+        memory_capacity_bytes: int = 0,
+        timestamp: int | None = None,
+    ) -> Event:
+        """Build a Quent Task Computing event."""
+        # TODO: capacity?
+        computing_data: dict[str, dict[str, Any]] = {}
+        if use_thread is not None:
+            computing_data["use_thread"] = {
+                "resource_id": str(use_thread.id),
+                "capacity": None,
+            }
+        if use_memory is not None:
+            computing_data["use_memory"] = {
+                "resource_id": str(use_memory.id),
+                "capacity": {"capacity_bytes": memory_capacity_bytes},
+            }
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.TASK.value: {
+                    "seq": 3,
+                    "state": {"Computing": computing_data},
+                }
+            },
+        )
+
+    def sending(
+        self,
+        use_thread: Processor | None = None,
+        use_link: Channel | None = None,
+        link_capacity_bytes: int = 0,
+        timestamp: int | None = None,
+    ) -> Event:
+        """Build a Quent Task Sending event."""
+        sending_data: dict[str, dict[str, Any]] = {}
+        if use_thread is not None:
+            sending_data["use_thread"] = {
+                "resource_id": str(use_thread.id),
+                "capacity": None,
+            }
+        if use_link is not None:
+            sending_data["use_link"] = {
+                "resource_id": str(use_link.id),
+                "capacity": {"capacity_bytes": link_capacity_bytes},
+            }
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={
+                EventName.TASK.value: {
+                    "seq": 4,
+                    "state": {"Sending": sending_data},
+                }
+            },
+        )
+
+    def exit(self, timestamp: int | None = None) -> Event:
+        """Build a Quent Task Exit event."""
+        return Event(
+            id=self.id,
+            timestamp=timestamp or time.time_ns(),
+            data={EventName.TASK.value: {"seq": 5, "state": "Exit"}},
         )
