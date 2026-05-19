@@ -68,6 +68,18 @@ def test_split_scan_aligns_to_row_group_boundaries(
     assert_gpu_result_equal(q, engine=streaming_engine)
 
 
+def test_split_scan_with_hybrid_scan(tmp_path, df, streaming_engine_factory):
+    streaming_engine = streaming_engine_factory(
+        StreamingOptions(
+            target_partition_size=1_000,
+            parquet_options={"use_hybrid_scan": True},
+        ),
+    )
+    make_partitioned_source(df, tmp_path, "parquet", n_files=1, row_group_size=10)
+    q = pl.scan_parquet(tmp_path)
+    assert_gpu_result_equal(q, engine=streaming_engine)
+
+
 @pytest.mark.parametrize("mask", [None, pl.col("x") < 1_000])
 def test_split_scan_predicate(tmp_path, df, mask, streaming_engine_factory):
     streaming_engine = streaming_engine_factory(

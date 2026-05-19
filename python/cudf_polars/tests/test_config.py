@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import sys
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -36,6 +36,9 @@ from cudf_polars.utils.config import (
     _default_cuda_stream_policy,
 )
 from cudf_polars.utils.cuda_stream import get_cuda_stream
+
+if TYPE_CHECKING:
+    from cudf_polars.experimental.rapidsmpf.hybrid_scan import CachedParquetMetadata
 
 
 def test_polars_verbose_warns(engine, monkeypatch):
@@ -215,15 +218,38 @@ def test_parquet_options(executor: str) -> None:
     )
     assert config.parquet_options.chunked is True
     assert config.parquet_options.n_output_chunks == 1
+    assert config.parquet_options.use_hybrid_scan is False
+    assert config.parquet_options.hybrid_scan_coalesce_max_gap == 0
+    assert config.parquet_options.hybrid_scan_max_read_workers == 4
+    assert config.parquet_options.hybrid_scan_sync_before_read is False
+    assert config.parquet_options.hybrid_scan_use_slab_allocation is False
 
     config = ConfigOptions.from_polars_engine(
         pl.GPUEngine(
             executor=executor,
-            parquet_options={"chunked": False, "n_output_chunks": 16},
+            parquet_options={
+                "chunked": False,
+                "n_output_chunks": 16,
+                "use_hybrid_scan": True,
+            },
         )
     )
     assert config.parquet_options.chunked is False
     assert config.parquet_options.n_output_chunks == 16
+    assert config.parquet_options.use_hybrid_scan is True
+
+
+def test_use_rapidsmpf_native_and_use_hybrid_scan_raises() -> None:
+    with pytest.raises(
+        ValueError,
+        match="use_hybrid_scan and use_rapidsmpf_native cannot be enabled at the same time",
+    ):
+        ConfigOptions.from_polars_engine(
+            pl.GPUEngine(
+                executor="streaming",
+                parquet_options={"use_hybrid_scan": True, "use_rapidsmpf_native": True},
+            )
+        )
 
 
 def test_parquet_options_from_none() -> None:
@@ -328,6 +354,11 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__MAX_FOOTER_SAMPLES", "0")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__MAX_ROW_GROUP_SAMPLES", "0")
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__USE_RAPIDSMPF_NATIVE", "0")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__USE_HYBRID_SCAN", "1")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__HYBRID_SCAN_COALESCE_MAX_GAP", "64")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__HYBRID_SCAN_MAX_READ_WORKERS", "8")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__HYBRID_SCAN_SYNC_BEFORE_READ", "1")
+        m.setenv("CUDF_POLARS__PARQUET_OPTIONS__HYBRID_SCAN_USE_SLAB_ALLOCATION", "1")
 
         # Test default
         engine = pl.GPUEngine()
@@ -339,6 +370,11 @@ def test_parquet_options_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         assert config.parquet_options.max_footer_samples == 0
         assert config.parquet_options.max_row_group_samples == 0
         assert config.parquet_options.use_rapidsmpf_native is False
+        assert config.parquet_options.use_hybrid_scan is True
+        assert config.parquet_options.hybrid_scan_coalesce_max_gap == 64
+        assert config.parquet_options.hybrid_scan_max_read_workers == 8
+        assert config.parquet_options.hybrid_scan_sync_before_read is True
+        assert config.parquet_options.hybrid_scan_use_slab_allocation is True
 
     with monkeypatch.context() as m:
         m.setenv("CUDF_POLARS__PARQUET_OPTIONS__CHUNKED", "foo")
@@ -406,6 +442,11 @@ def test_fallback_mode_default(monkeypatch: pytest.MonkeyPatch) -> None:
         "max_footer_samples",
         "max_row_group_samples",
         "use_rapidsmpf_native",
+        "use_hybrid_scan",
+        "hybrid_scan_coalesce_max_gap",
+        "hybrid_scan_max_read_workers",
+        "hybrid_scan_sync_before_read",
+        "hybrid_scan_use_slab_allocation",
     ],
 )
 def test_validate_parquet_options(option: str) -> None:
@@ -518,6 +559,11 @@ def test_memory_resource_config_from_env(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_ir_execution_context() -> None:
     context = IRExecutionContext()
     assert context.get_cuda_stream is get_cuda_stream
+    assert context.parquet_metadata == {}
+    context.parquet_metadata[("file.parquet",)] = cast(
+        "CachedParquetMetadata", object()
+    )
+    assert ("file.parquet",) in context.parquet_metadata
     context.get_cuda_stream()  # no exception
 
 

@@ -13,15 +13,27 @@ from cudf_polars.experimental.base import StatsCollector
 from cudf_polars.experimental.io import _build_source_info
 
 if TYPE_CHECKING:
-    from cudf_polars.dsl.ir import IR
+    from cudf_polars.dsl.ir import IR, IRExecutionContext
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
+from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 
+
+@nvtx_annotate_cudf_polars(message="collect_statistics")
 def collect_statistics(
     root: IR,
     config_options: ConfigOptions[StreamingExecutor],
+    *,
+    ir_context: IRExecutionContext | None = None,
 ) -> StatsCollector:
     """Collect DataSourceInfo for each leaf Scan/DataFrameScan node."""
+    if config_options.parquet_options.use_hybrid_scan and ir_context is not None:
+        from cudf_polars.experimental.rapidsmpf.hybrid_scan import (
+            populate_parquet_metadata_cache,
+        )
+
+        populate_parquet_metadata_cache(root, ir_context)
+
     # Group parquet Scan nodes by paths, accumulating the union of needed columns
     # across all Scan nodes that read the same files.
     parquet_groups: dict[tuple[str, ...], tuple[set[str], list[Scan]]] = {}
@@ -41,10 +53,20 @@ def collect_statistics(
 
     # Parquet sources
     for needed_cols, scan_nodes in parquet_groups.values():
+        cached_metadata = None
+        if config_options.parquet_options.use_hybrid_scan and ir_context is not None:
+            from cudf_polars.experimental.rapidsmpf.hybrid_scan import (
+                get_cached_parquet_metadata,
+            )
+
+            cached_metadata = get_cached_parquet_metadata(
+                scan_nodes[0].paths, ir_context
+            )
         source = _build_source_info(
             scan_nodes[0],
             config_options,
             needed_cols=frozenset(needed_cols),
+            cached_metadata=cached_metadata,
         )
         for node in scan_nodes:
             stats.scan_stats[node] = source

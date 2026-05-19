@@ -11,15 +11,19 @@ import pytest
 
 import polars as pl
 
+import pylibcudf as plc
+
 from cudf_polars import Translator
 from cudf_polars.containers import DataType
-from cudf_polars.dsl.ir import Empty, Projection
+from cudf_polars.dsl.ir import Empty, IRExecutionContext, Projection
 from cudf_polars.experimental.base import SerializedDataSourceInfo, StatsCollector
 from cudf_polars.experimental.io import (
     DataFrameSourceInfo,
     ParquetSourceInfo,
     _clear_source_info_cache,
 )
+from cudf_polars.experimental.parallel import lower_ir_graph
+from cudf_polars.experimental.rapidsmpf import hybrid_scan
 from cudf_polars.experimental.rapidsmpf.frontend.options import StreamingOptions
 from cudf_polars.experimental.statistics import collect_statistics
 from cudf_polars.testing.asserts import assert_gpu_result_equal
@@ -111,6 +115,54 @@ def test_base_stats_parquet(
         assert source.row_count is None
         assert source.column_storage_size("x") is None
         assert source.column_storage_size("y") is None
+
+
+def test_hybrid_scan_stats_reuses_prefetched_metadata(tmp_path, monkeypatch):
+    _clear_source_info_cache()
+    df = pl.DataFrame(
+        {
+            "a": range(10),
+            "b": ["x", "yy", "zzz", "x", "yy"] * 2,
+        }
+    )
+    make_partitioned_source(df, tmp_path, "parquet", n_files=2)
+    engine = pl.GPUEngine(
+        raise_on_fail=True,
+        executor="streaming",
+        executor_options={
+            "target_partition_size": 1_000_000_000,
+            "broadcast_join_limit": 1_000_000,
+        },
+        parquet_options={
+            "use_hybrid_scan": True,
+            "max_footer_samples": 3,
+            "max_row_group_samples": 0,
+        },
+    )
+    ir = Translator(pl.scan_parquet(tmp_path)._ldf.visit(), engine).translate_ir()
+    config = ConfigOptions.from_polars_engine(engine)
+    context = IRExecutionContext()
+
+    hybrid_scan.populate_parquet_metadata_cache(ir, context)
+
+    def fail_read_metadata(*args, **kwargs):
+        raise AssertionError("unexpected read_parquet_metadata")
+
+    def fail_fetch(*args, **kwargs):
+        raise AssertionError("unexpected footer fetch")
+
+    monkeypatch.setattr(
+        plc.io.parquet_metadata, "read_parquet_metadata", fail_read_metadata
+    )
+    monkeypatch.setattr(hybrid_scan, "_fetch_cached_parquet_file_metadata", fail_fetch)
+
+    stats = collect_statistics(ir, config, ir_context=context)
+    lowered, partition_info = lower_ir_graph(ir, config, stats)
+    hybrid_scan.populate_parquet_metadata_cache(lowered, context, partition_info)
+
+    source = stats.scan_stats[ir]
+    assert source.row_count == df.height
+    assert source.column_storage_size("a") is not None
 
 
 def test_dataframescan_stats_pickle(stats_engine):

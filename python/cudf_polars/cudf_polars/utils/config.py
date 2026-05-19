@@ -204,8 +204,26 @@ class ParquetOptions:
         will also be skipped if ``max_footer_samples`` is 0.
     use_rapidsmpf_native
         Whether to use the native rapidsmpf node for parquet reading.
-        This option is only used by the streaming executor.
+        This option is only used by the streaming executor. This option cannot
+        be enabled if ``use_hybrid_scan`` is also enabled.
         Default is False.
+    use_hybrid_scan
+        Whether to use the experimental pylibcudf hybrid-scan parquet reader.
+        This option is only used by the streaming executor. This option cannot
+        be enabled if ``use_rapidsmpf_native`` is also enabled.
+        Default is False.
+    hybrid_scan_coalesce_max_gap
+        Maximum gap (bytes) allowed between consecutive byte ranges when
+        coalescing remote reads in the hybrid-scan path. Default is 0.
+    hybrid_scan_max_read_workers
+        Maximum number of worker threads used to read coalesced byte ranges
+        concurrently in the hybrid-scan path. Default is 4.
+    hybrid_scan_sync_before_read
+        Whether to force a CUDA stream synchronization before hybrid-scan
+        range reads. Disabled by default.
+    hybrid_scan_use_slab_allocation
+        Whether to allocate one large device slab and carve views for coalesced
+        range reads. Disabled by default.
     """
 
     _env_prefix = "CUDF_POLARS__PARQUET_OPTIONS"
@@ -247,6 +265,37 @@ class ParquetOptions:
             default=False,
         )
     )
+    use_hybrid_scan: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__USE_HYBRID_SCAN",
+            _bool_converter,
+            default=False,
+        )
+    )
+    hybrid_scan_coalesce_max_gap: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__HYBRID_SCAN_COALESCE_MAX_GAP", int, default=0
+        )
+    )
+    hybrid_scan_max_read_workers: int = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__HYBRID_SCAN_MAX_READ_WORKERS", int, default=4
+        )
+    )
+    hybrid_scan_sync_before_read: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__HYBRID_SCAN_SYNC_BEFORE_READ",
+            _bool_converter,
+            default=False,
+        )
+    )
+    hybrid_scan_use_slab_allocation: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__HYBRID_SCAN_USE_SLAB_ALLOCATION",
+            _bool_converter,
+            default=False,
+        )
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if not isinstance(self.chunked, bool):
@@ -263,6 +312,24 @@ class ParquetOptions:
             raise TypeError("max_row_group_samples must be an int")
         if not isinstance(self.use_rapidsmpf_native, bool):
             raise TypeError("use_rapidsmpf_native must be a bool")
+        if not isinstance(self.use_hybrid_scan, bool):
+            raise TypeError("use_hybrid_scan must be a bool")
+        if self.use_hybrid_scan and self.use_rapidsmpf_native:
+            raise ValueError(
+                "use_hybrid_scan and use_rapidsmpf_native cannot be enabled at the same time"
+            )
+        if not isinstance(self.hybrid_scan_coalesce_max_gap, int):
+            raise TypeError("hybrid_scan_coalesce_max_gap must be an int")
+        if self.hybrid_scan_coalesce_max_gap < 0:
+            raise ValueError("hybrid_scan_coalesce_max_gap must be non-negative")
+        if not isinstance(self.hybrid_scan_max_read_workers, int):
+            raise TypeError("hybrid_scan_max_read_workers must be an int")
+        if self.hybrid_scan_max_read_workers < 1:
+            raise ValueError("hybrid_scan_max_read_workers must be at least 1")
+        if not isinstance(self.hybrid_scan_sync_before_read, bool):
+            raise TypeError("hybrid_scan_sync_before_read must be a bool")
+        if not isinstance(self.hybrid_scan_use_slab_allocation, bool):
+            raise TypeError("hybrid_scan_use_slab_allocation must be a bool")
 
 
 def default_target_partition_size(min_device_size: int | None) -> int:

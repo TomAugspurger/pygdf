@@ -30,6 +30,9 @@ from cudf_polars.experimental.parallel import lower_ir_graph
 from cudf_polars.experimental.rapidsmpf.collectives import ReserveOpIDs
 from cudf_polars.experimental.rapidsmpf.collectives.common import reserve_op_id
 from cudf_polars.experimental.rapidsmpf.core import generate_network
+from cudf_polars.experimental.rapidsmpf.hybrid_scan import (
+    populate_parquet_metadata_cache,
+)
 from cudf_polars.experimental.rapidsmpf.tracing import log_query_plan
 from cudf_polars.experimental.rapidsmpf.utils import empty_table_chunk
 from cudf_polars.experimental.statistics import collect_statistics
@@ -404,6 +407,7 @@ def execute_ir_on_rank(
     collective_id_map: dict[IR, list[int]],
     *,
     query_id: uuid.UUID,
+    ir_context: IRExecutionContext | None = None,
 ) -> tuple[pl.DataFrame, list[ChannelMetadata]]:
     """
     Execute a Polars IR query on a single rank's GPU.
@@ -432,6 +436,9 @@ def execute_ir_on_rank(
         Mapping from IR nodes to their pre-allocated collective operation IDs.
     query_id
         Unique identifier for the query, propagated into actor traces.
+    ir_context
+        Optional pre-created IR execution context. If provided, any query-lifetime
+        metadata cached on the context is preserved for actor execution.
 
     Returns
     -------
@@ -440,9 +447,20 @@ def execute_ir_on_rank(
     metadata
         Collected channel metadata.
     """
-    ir_context = IRExecutionContext(
-        py_executor, get_cuda_stream=ctx.get_stream_from_pool, query_id=query_id
-    )
+    if ir_context is None:
+        ir_context = IRExecutionContext(
+            py_executor, get_cuda_stream=ctx.get_stream_from_pool, query_id=query_id
+        )
+    else:
+        # Preserve pre-populated query-lifetime caches (for example parquet
+        # metadata) while attaching rank-local runtime settings needed during
+        # actor execution.
+        ir_context = dataclasses.replace(
+            ir_context,
+            py_executor=py_executor,
+            get_cuda_stream=ctx.get_stream_from_pool,
+            query_id=query_id,
+        )
     metadata_collector: list[ChannelMetadata] = []
 
     nodes, output = generate_network(
@@ -579,6 +597,7 @@ def allgather_stats(
     br: BufferResource,
     ir: IR,
     config_options: ConfigOptions[StreamingExecutor],
+    ir_context: IRExecutionContext | None = None,
 ) -> StatsCollector:
     """
     Collect scan statistics on rank 0 and distribute to all ranks.
@@ -596,16 +615,18 @@ def allgather_stats(
         Root of the pre-lowered IR graph (same object on every rank).
     config_options
         Executor configuration.
+    ir_context
+        Optional pre-created IR execution context carrying query-lifetime caches.
 
     Returns
     -------
     A :class:`StatsCollector` valid for the local rank's IR node objects.
     """
     if comm.nranks == 1:
-        return collect_statistics(ir, config_options)
+        return collect_statistics(ir, config_options, ir_context=ir_context)
 
     if comm.rank == 0:
-        stats = collect_statistics(ir, config_options)
+        stats = collect_statistics(ir, config_options, ir_context=ir_context)
         data = json.dumps(stats.serialize(ir)).encode()
     else:
         data = b""
@@ -660,8 +681,11 @@ def evaluate_on_rank(
     metadata
         Collected channel metadata.
     """
-    stats = allgather_stats(comm, ctx.br(), ir, config_options)
+    ir_context = IRExecutionContext(get_cuda_stream=ctx.get_stream_from_pool)
+    stats = allgather_stats(comm, ctx.br(), ir, config_options, ir_context)
     ir, partition_info = lower_ir_graph(ir, config_options, stats)
+    if config_options.parquet_options.use_hybrid_scan:
+        populate_parquet_metadata_cache(ir, ir_context, partition_info)
 
     if comm.rank == 0:
         # At least for now, the query plan is identical on all ranks,
@@ -679,4 +703,5 @@ def evaluate_on_rank(
             stats,
             collective_id_map,
             query_id=query_id,
+            ir_context=ir_context,
         )
