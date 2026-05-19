@@ -7,6 +7,7 @@ from __future__ import annotations
 import dataclasses
 import io
 import os
+import queue
 import struct
 import threading
 import time
@@ -14,6 +15,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -50,6 +52,7 @@ __all__ = [
 
 _PARQUET_MAGIC = b"PAR1"
 _DEFAULT_FOOTER_PREFETCH_WORKERS = 64
+_DEFAULT_READ_READY_QUEUE_SIZE = 2
 
 
 def _log_io_event(message: str, *, scope: str, **kwargs: Any) -> None:
@@ -566,8 +569,12 @@ def _read_byte_ranges_to_device(
         sync_before_read=sync_before_read,
         use_slab_allocation=use_slab_allocation,
     )
-    _read_prepared_ranges_to_device_many((prepared_reads,), max_workers=max_workers)
-    return _finalize_prepared_range_reads(prepared_reads, stream=stream)
+    for ready in _iter_prepared_reads_as_ready(
+        (prepared_reads,),
+        max_workers=max_workers,
+    ):
+        return _finalize_prepared_range_reads(ready, stream=stream)
+    raise RuntimeError("Expected prepared reads to be available")
 
 
 def _prepare_read_ranges_to_device(
@@ -622,76 +629,123 @@ def _prepare_read_ranges_to_device(
 
 
 @nvtx.annotate("read_coalesced_blocks_many", domain="cudf_polars", color="red")
-def _read_prepared_ranges_to_device_many(
+def _iter_prepared_reads_as_ready(
     prepared_reads: tuple[_PreparedReadRanges, ...],
     *,
     max_workers: int,
-) -> None:
-    """Execute coalesced block reads across all paths in one thread pool."""
-    flat_tasks: list[tuple[_PreparedReadRanges, int, _CoalescedRange]] = []
-    for prepared in prepared_reads:
-        for block_index, block in enumerate(prepared.coalesced_ranges):
-            flat_tasks.append((prepared, block_index, block))
-    if not flat_tasks:
+) -> Any:
+    """Yield per-path read plans as soon as all of their blocks are read."""
+    if not prepared_reads:
         return
 
-    handles: list[kvikio.RemoteFile | kvikio.CuFile] = []
-    handles_lock = threading.Lock()
-    local_state = threading.local()
-
-    def _get_handle(
-        path: str, file_size: int | None
-    ) -> kvikio.RemoteFile | kvikio.CuFile:
-        handles_by_path = getattr(local_state, "handles_by_path", None)
-        if handles_by_path is None:
-            handles_by_path = {}
-            local_state.handles_by_path = handles_by_path
-        handle = handles_by_path.get(path)
-        if handle is None:
-            handle = _open_file(path, nbytes=file_size)
-            handles_by_path[path] = handle
-            with handles_lock:
-                handles.append(handle)
-        return handle
-
-    @nvtx.annotate("read_coalesced_block", domain="cudf_polars", color="red")
-    def _read_coalesced_block(
-        task: tuple[_PreparedReadRanges, int, _CoalescedRange],
-    ) -> None:
-        prepared, block_index, block = task
-        if block.size == 0:
-            return
-        started = time.perf_counter_ns()
-        handle = _get_handle(prepared.path, prepared.file_size)
-        nread = handle.pread(
-            prepared.targets[block_index],
-            size=block.size,
-            file_offset=block.offset,
-        ).get()
-        if nread != block.size:
-            raise OSError(f"Expected to read {block.size} bytes, got {nread}")
-        finished = time.perf_counter_ns()
-        _log_io_event(
-            "Hybrid Scan Range Request",
-            scope="RangeRequest",
-            path=prepared.path,
-            offset=block.offset,
-            size=block.size,
-            timestamp=started,
-            duration=finished - started,
+    ready_queue: queue.Queue[Any] = queue.Queue(
+        maxsize=max(
+            1,
+            min(_DEFAULT_READ_READY_QUEUE_SIZE, len(prepared_reads)),
         )
+    )
+    sentinel = object()
+    total_paths = len(prepared_reads)
 
+    def _producer() -> None:
+        handles: list[kvikio.RemoteFile | kvikio.CuFile] = []
+        handles_lock = threading.Lock()
+        local_state = threading.local()
+        state_lock = threading.Lock()
+        remaining_by_id = {
+            id(prepared): sum(block.size > 0 for block in prepared.coalesced_ranges)
+            for prepared in prepared_reads
+        }
+        flat_tasks: list[tuple[_PreparedReadRanges, int, _CoalescedRange]] = []
+        for prepared in prepared_reads:
+            for block_index, block in enumerate(prepared.coalesced_ranges):
+                if block.size > 0:
+                    flat_tasks.append((prepared, block_index, block))
+            if remaining_by_id[id(prepared)] == 0:
+                ready_queue.put(prepared)
+
+        def _get_handle(
+            path: str, file_size: int | None
+        ) -> kvikio.RemoteFile | kvikio.CuFile:
+            handles_by_path = getattr(local_state, "handles_by_path", None)
+            if handles_by_path is None:
+                handles_by_path = {}
+                local_state.handles_by_path = handles_by_path
+            handle = handles_by_path.get(path)
+            if handle is None:
+                handle = _open_file(path, nbytes=file_size)
+                handles_by_path[path] = handle
+                with handles_lock:
+                    handles.append(handle)
+            return handle
+
+        def _mark_block_complete(prepared: _PreparedReadRanges) -> None:
+            with state_lock:
+                key = id(prepared)
+                remaining = remaining_by_id[key] - 1
+                remaining_by_id[key] = remaining
+            if remaining == 0:
+                ready_queue.put(prepared)
+
+        @nvtx.annotate("read_coalesced_block", domain="cudf_polars", color="red")
+        def _read_coalesced_block(
+            task: tuple[_PreparedReadRanges, int, _CoalescedRange],
+        ) -> None:
+            prepared, block_index, block = task
+            started = time.perf_counter_ns()
+            handle = _get_handle(prepared.path, prepared.file_size)
+            nread = handle.pread(
+                prepared.targets[block_index],
+                size=block.size,
+                file_offset=block.offset,
+            ).get()
+            if nread != block.size:
+                raise OSError(f"Expected to read {block.size} bytes, got {nread}")
+            finished = time.perf_counter_ns()
+            _log_io_event(
+                "Hybrid Scan Range Request",
+                scope="RangeRequest",
+                path=prepared.path,
+                offset=block.offset,
+                size=block.size,
+                timestamp=started,
+                duration=finished - started,
+            )
+            _mark_block_complete(prepared)
+
+        try:
+            if flat_tasks:
+                worker_count = max(1, min(max_workers, len(flat_tasks)))
+                if worker_count == 1:
+                    for task in flat_tasks:
+                        _read_coalesced_block(task)
+                else:
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        list(executor.map(_read_coalesced_block, flat_tasks))
+        except BaseException as exc:
+            ready_queue.put(exc)
+        finally:
+            for handle in handles:
+                handle.close()
+            ready_queue.put(sentinel)
+
+    producer = threading.Thread(target=_producer, name="hybrid_scan_read_producer")
+    producer.start()
+    completed = 0
     try:
-        worker_count = max(1, min(max_workers, len(flat_tasks)))
-        if worker_count == 1:
-            for task in flat_tasks:
-                _read_coalesced_block(task)
-        else:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                list(executor.map(_read_coalesced_block, flat_tasks))
+        while completed < total_paths:
+            item = ready_queue.get()
+            if item is sentinel:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            completed += 1
+            yield item
     finally:
-        for handle in handles:
-            handle.close()
+        while producer.is_alive():
+            with suppress(queue.Empty):
+                ready_queue.get(timeout=0.01)
+        producer.join()
 
 
 def _finalize_prepared_range_reads(
@@ -741,7 +795,7 @@ def _finalize_prepared_range_reads(
     )
 
 
-@nvtx.annotate("reaad_parquet_with_hybrid_scan", domain="cudf_polars", color="red")
+@nvtx.annotate("read_parquet_with_hybrid_scan", domain="cudf_polars", color="red")
 def read_parquet_with_hybrid_scan(
     paths: list[str],
     column_names: list[str] | None,
@@ -844,34 +898,46 @@ def read_parquet_with_hybrid_scan(
             )
         )
 
+    rows_per_source = [0] * len(scan_plans)
+    tables_by_index: list[plc.Table | None] = [None] * len(scan_plans)
+    plan_by_prepared_id = {
+        id(plan.prepared_reads): (index, plan)
+        for index, plan in enumerate(scan_plans)
+        if plan.prepared_reads is not None
+    }
     pending_reads = tuple(
         plan.prepared_reads for plan in scan_plans if plan.prepared_reads is not None
     )
     with nvtx.annotate("read_byte_ranges_to_device", domain="cudf_polars", color="red"):
-        _read_prepared_ranges_to_device_many(
+        for prepared in _iter_prepared_reads_as_ready(
             pending_reads,
             max_workers=parquet_options.hybrid_scan_max_read_workers,
-        )
-
-    for plan in scan_plans:
-        if plan.prepared_reads is None:
-            rows_per_source.append(0)
-            continue
-        read_result = _finalize_prepared_range_reads(plan.prepared_reads, stream=stream)
-        with nvtx.annotate(
-            "reader.materialize_all_columns", domain="cudf_polars", color="red"
         ):
-            table_with_metadata = plan.reader.materialize_all_columns(
-                plan.row_groups,
-                read_result.column_data,
-                plan.options,
-                stream,
-            )
-        names = table_with_metadata.column_names(include_children=False)
-        if output_names is None:
-            output_names = names
-        tables.append(table_with_metadata.tbl)
-        rows_per_source.append(table_with_metadata.tbl.num_rows())
+            plan_index, plan = plan_by_prepared_id[id(prepared)]
+            read_result = _finalize_prepared_range_reads(prepared, stream=stream)
+            with nvtx.annotate(
+                "reader.materialize_all_columns", domain="cudf_polars", color="red"
+            ):
+                table_with_metadata = plan.reader.materialize_all_columns(
+                    plan.row_groups,
+                    read_result.column_data,
+                    plan.options,
+                    stream,
+                )
+            names = table_with_metadata.column_names(include_children=False)
+            if output_names is None:
+                output_names = names
+            tables_by_index[plan_index] = table_with_metadata.tbl
+            rows_per_source[plan_index] = table_with_metadata.tbl.num_rows()
+
+    for index, plan in enumerate(scan_plans):
+        if plan.prepared_reads is None:
+            rows_per_source[index] = 0
+            continue
+        table = tables_by_index[index]
+        if table is None:  # pragma: no cover
+            raise AssertionError(f"Missing materialized table for path {plan.path}")
+        tables.append(table)
 
     if not tables:
         return HybridScanReadResult(
