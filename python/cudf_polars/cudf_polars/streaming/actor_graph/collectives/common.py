@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Literal
 from rapidsmpf.shuffler import Shuffler
 
 from cudf_polars.dsl.ir import Distinct, GroupBy, Sort
+from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.io import StreamingSink
 from cudf_polars.streaming.join import Join
@@ -31,6 +32,7 @@ _collective_id_vacancy: set[int] = set(range(Shuffler.max_concurrent_shuffles))
 _collective_id_vacancy_lock: threading.Lock = threading.Lock()
 
 
+@nvtx_annotate_cudf_polars(message="get_new_collective_id")
 def _get_new_collective_id() -> int:
     with _collective_id_vacancy_lock:
         if not _collective_id_vacancy:

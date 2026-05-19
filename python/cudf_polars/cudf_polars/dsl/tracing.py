@@ -133,7 +133,9 @@ def make_snapshot(
             )
 
         if device_handle is not None:
-            processes = pynvml.nvmlDeviceGetComputeRunningProcesses(device_handle)
+            processes = pynvml.nvmlDeviceGetComputeRunningProcesses(
+                device_handle
+            )  # TODO: this might be slow?
             for proc in processes:
                 if proc.pid == pid:
                     d[f"nvml_current_bytes_{phase}"] = proc.usedGpuMemory
