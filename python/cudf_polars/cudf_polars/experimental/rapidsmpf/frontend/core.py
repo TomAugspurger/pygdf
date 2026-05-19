@@ -447,9 +447,20 @@ def execute_ir_on_rank(
     metadata
         Collected channel metadata.
     """
-    ir_context = IRExecutionContext(
-        py_executor, get_cuda_stream=ctx.get_stream_from_pool, query_id=query_id
-    )
+    if ir_context is None:
+        ir_context = IRExecutionContext(
+            py_executor, get_cuda_stream=ctx.get_stream_from_pool, query_id=query_id
+        )
+    else:
+        # Preserve pre-populated query-lifetime caches (for example parquet
+        # metadata) while attaching rank-local runtime settings needed during
+        # actor execution.
+        ir_context = dataclasses.replace(
+            ir_context,
+            py_executor=py_executor,
+            get_cuda_stream=ctx.get_stream_from_pool,
+            query_id=query_id,
+        )
     metadata_collector: list[ChannelMetadata] = []
 
     nodes, output = generate_network(
