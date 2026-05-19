@@ -125,6 +125,37 @@ class _ReadRangesResult:
     backing_refs: tuple[Any, ...]
 
 
+@dataclasses.dataclass
+class _PreparedReadRanges:
+    """Prepared per-path read plan used for flattened IO scheduling."""
+
+    path: str
+    file_size: int | None
+    byte_ranges: list[Any]
+    coalesced_ranges: list[_CoalescedRange]
+    slices: list[_RangeSlice]
+    targets: list[Any]
+    owners: list[Any]
+    requested_bytes: int
+    read_bytes: int
+    max_workers: int
+    max_coalesce_gap: int
+    sync_before_read: bool
+    use_slab_allocation: bool
+    started_ns: int
+
+
+@dataclasses.dataclass
+class _PathScanPlan:
+    """Per-path scan plan for two-phase read/materialize execution."""
+
+    path: str
+    reader: Any
+    options: plc.io.parquet.ParquetReaderOptions
+    row_groups: list[Any]
+    prepared_reads: _PreparedReadRanges | None
+
+
 def _footer_as_parquet_buffer(footer_bytes: bytes) -> io.BytesIO:
     """Wrap footer bytes in a minimal in-memory parquet file."""
     if not footer_bytes:
@@ -525,6 +556,32 @@ def _read_byte_ranges_to_device(
     use_slab_allocation: bool = False,
 ) -> _ReadRangesResult:
     """Read byte ranges from *path* into device buffers."""
+    prepared_reads = _prepare_read_ranges_to_device(
+        path,
+        byte_ranges,
+        stream,
+        file_size=file_size,
+        max_coalesce_gap=max_coalesce_gap,
+        max_workers=max_workers,
+        sync_before_read=sync_before_read,
+        use_slab_allocation=use_slab_allocation,
+    )
+    _read_prepared_ranges_to_device_many((prepared_reads,), max_workers=max_workers)
+    return _finalize_prepared_range_reads(prepared_reads, stream=stream)
+
+
+def _prepare_read_ranges_to_device(
+    path: str,
+    byte_ranges: list[Any],
+    stream: Any,
+    *,
+    file_size: int | None = None,
+    max_coalesce_gap: int = 0,
+    max_workers: int = 128,
+    sync_before_read: bool = False,
+    use_slab_allocation: bool = False,
+) -> _PreparedReadRanges:
+    """Prepare one path's coalesced read plan without issuing reads yet."""
     coalesce_start = time.perf_counter_ns()
     requested_bytes = sum(int(byte_range.size) for byte_range in byte_ranges)
     coalesced_ranges, slices = _coalesce_ranges(byte_ranges, max_gap=max_coalesce_gap)
@@ -541,36 +598,73 @@ def _read_byte_ranges_to_device(
         timestamp=coalesce_start,
         duration=coalesce_end - coalesce_start,
     )
-
     if sync_before_read:
         stream.synchronize()
-
     targets, owners = _allocate_coalesced_targets(
         coalesced_ranges, stream, use_slab_allocation=use_slab_allocation
     )
+    return _PreparedReadRanges(
+        path=path,
+        file_size=file_size,
+        byte_ranges=byte_ranges,
+        coalesced_ranges=coalesced_ranges,
+        slices=slices,
+        targets=targets,
+        owners=owners,
+        requested_bytes=requested_bytes,
+        read_bytes=read_bytes,
+        max_workers=max_workers,
+        max_coalesce_gap=max_coalesce_gap,
+        sync_before_read=sync_before_read,
+        use_slab_allocation=use_slab_allocation,
+        started_ns=time.perf_counter_ns(),
+    )
+
+
+@nvtx.annotate("read_coalesced_blocks_many", domain="cudf_polars", color="red")
+def _read_prepared_ranges_to_device_many(
+    prepared_reads: tuple[_PreparedReadRanges, ...],
+    *,
+    max_workers: int,
+) -> None:
+    """Execute coalesced block reads across all paths in one thread pool."""
+    flat_tasks: list[tuple[_PreparedReadRanges, int, _CoalescedRange]] = []
+    for prepared in prepared_reads:
+        for block_index, block in enumerate(prepared.coalesced_ranges):
+            flat_tasks.append((prepared, block_index, block))
+    if not flat_tasks:
+        return
+
     handles: list[kvikio.RemoteFile | kvikio.CuFile] = []
-    # TODO: these locks surely aren't necessary.
     handles_lock = threading.Lock()
     local_state = threading.local()
 
-    def _get_handle() -> kvikio.RemoteFile | kvikio.CuFile:
-        handle = getattr(local_state, "handle", None)
+    def _get_handle(
+        path: str, file_size: int | None
+    ) -> kvikio.RemoteFile | kvikio.CuFile:
+        handles_by_path = getattr(local_state, "handles_by_path", None)
+        if handles_by_path is None:
+            handles_by_path = {}
+            local_state.handles_by_path = handles_by_path
+        handle = handles_by_path.get(path)
         if handle is None:
             handle = _open_file(path, nbytes=file_size)
-            local_state.handle = handle
+            handles_by_path[path] = handle
             with handles_lock:
                 handles.append(handle)
         return handle
 
     @nvtx.annotate("read_coalesced_block", domain="cudf_polars", color="red")
-    def _read_coalesced_block(task: tuple[int, _CoalescedRange]) -> None:
-        block_index, block = task
+    def _read_coalesced_block(
+        task: tuple[_PreparedReadRanges, int, _CoalescedRange],
+    ) -> None:
+        prepared, block_index, block = task
         if block.size == 0:
             return
         started = time.perf_counter_ns()
-        handle = _get_handle()
+        handle = _get_handle(prepared.path, prepared.file_size)
         nread = handle.pread(
-            targets[block_index],
+            prepared.targets[block_index],
             size=block.size,
             file_offset=block.offset,
         ).get()
@@ -580,65 +674,70 @@ def _read_byte_ranges_to_device(
         _log_io_event(
             "Hybrid Scan Range Request",
             scope="RangeRequest",
-            path=path,
+            path=prepared.path,
             offset=block.offset,
             size=block.size,
             timestamp=started,
             duration=finished - started,
         )
 
-    started_ns = time.perf_counter_ns()
     try:
-        if coalesced_ranges:
-            worker_count = max(1, min(max_workers, len(coalesced_ranges)))
-            if worker_count == 1:
-                for task in enumerate(coalesced_ranges):
-                    _read_coalesced_block(task)
-            else:
-                with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    list(
-                        executor.map(_read_coalesced_block, enumerate(coalesced_ranges))
-                    )
-
-        result: list[plc.gpumemoryview] = []
-        empty = rmm.DeviceBuffer(size=0, stream=stream)
-        owners.append(empty)
-        for slice_info in slices:
-            if slice_info.size == 0:
-                result.append(plc.gpumemoryview(empty))
-                continue
-            view = targets[slice_info.block_index][
-                slice_info.block_offset : slice_info.block_offset + slice_info.size
-            ]
-            result.append(plc.gpumemoryview(view))
-            owners.append(view)
-        elapsed_ns = time.perf_counter_ns() - started_ns
+        worker_count = max(1, min(max_workers, len(flat_tasks)))
+        if worker_count == 1:
+            for task in flat_tasks:
+                _read_coalesced_block(task)
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                list(executor.map(_read_coalesced_block, flat_tasks))
     finally:
         for handle in handles:
             handle.close()
 
+
+def _finalize_prepared_range_reads(
+    prepared_reads: _PreparedReadRanges,
+    *,
+    stream: Any,
+) -> _ReadRangesResult:
+    """Build gpumemoryviews and emit final per-path byte-range metrics."""
+    result: list[plc.gpumemoryview] = []
+    empty = rmm.DeviceBuffer(size=0, stream=stream)
+    prepared_reads.owners.append(empty)
+    for slice_info in prepared_reads.slices:
+        if slice_info.size == 0:
+            result.append(plc.gpumemoryview(empty))
+            continue
+        view = prepared_reads.targets[slice_info.block_index][
+            slice_info.block_offset : slice_info.block_offset + slice_info.size
+        ]
+        result.append(plc.gpumemoryview(view))
+        prepared_reads.owners.append(view)
+    elapsed_ns = time.perf_counter_ns() - prepared_reads.started_ns
+
     dsl_tracing.log(
         "Hybrid Scan Byte Ranges",
         scope="hybrid_scan_read",
-        path=path,
-        original_range_count=len(byte_ranges),
-        coalesced_range_count=len(coalesced_ranges),
-        requested_bytes=requested_bytes,
-        read_bytes=read_bytes,
-        over_read_bytes=max(read_bytes - requested_bytes, 0),
+        path=prepared_reads.path,
+        original_range_count=len(prepared_reads.byte_ranges),
+        coalesced_range_count=len(prepared_reads.coalesced_ranges),
+        requested_bytes=prepared_reads.requested_bytes,
+        read_bytes=prepared_reads.read_bytes,
+        over_read_bytes=max(
+            prepared_reads.read_bytes - prepared_reads.requested_bytes, 0
+        ),
         duration_ns=elapsed_ns,
-        max_workers=max_workers,
-        max_coalesce_gap=max_coalesce_gap,
-        sync_before_read=sync_before_read,
-        use_slab_allocation=use_slab_allocation,
+        max_workers=prepared_reads.max_workers,
+        max_coalesce_gap=prepared_reads.max_coalesce_gap,
+        sync_before_read=prepared_reads.sync_before_read,
+        use_slab_allocation=prepared_reads.use_slab_allocation,
     )
     return _ReadRangesResult(
         column_data=result,
-        original_range_count=len(byte_ranges),
-        coalesced_range_count=len(coalesced_ranges),
-        requested_bytes=requested_bytes,
-        read_bytes=read_bytes,
-        backing_refs=tuple(owners),
+        original_range_count=len(prepared_reads.byte_ranges),
+        coalesced_range_count=len(prepared_reads.coalesced_ranges),
+        requested_bytes=prepared_reads.requested_bytes,
+        read_bytes=prepared_reads.read_bytes,
+        backing_refs=tuple(prepared_reads.owners),
     )
 
 
@@ -653,6 +752,7 @@ def read_parquet_with_hybrid_scan(
     row_group_indices_by_path: dict[str, list[int]] | None = None,
 ) -> HybridScanReadResult:
     """Read parquet data with pylibcudf's single-step hybrid scan reader."""
+    scan_plans: list[_PathScanPlan] = []
     tables: list[plc.Table] = []
     rows_per_source: list[int] = []
     output_names: list[str] | None = None
@@ -706,7 +806,15 @@ def read_parquet_with_hybrid_scan(
             duration=row_group_end - row_group_start,
         )
         if not row_groups:
-            rows_per_source.append(0)
+            scan_plans.append(
+                _PathScanPlan(
+                    path=path,
+                    reader=reader,
+                    options=options,
+                    row_groups=row_groups,
+                    prepared_reads=None,
+                )
+            )
             continue
 
         with nvtx.annotate(
@@ -717,26 +825,46 @@ def read_parquet_with_hybrid_scan(
             raise NotImplementedError(
                 "Hybrid scan does not yet support zero-column parquet reads."
             )
-        with nvtx.annotate(
-            "read_byte_ranges_to_device", domain="cudf_polars", color="red"
-        ):
-            read_result = _read_byte_ranges_to_device(
+        scan_plans.append(
+            _PathScanPlan(
                 path,
-                byte_ranges,
-                stream,
-                file_size=file_metadata.file_size,
-                max_coalesce_gap=parquet_options.hybrid_scan_coalesce_max_gap,
-                max_workers=parquet_options.hybrid_scan_max_read_workers,
-                sync_before_read=parquet_options.hybrid_scan_sync_before_read,
-                use_slab_allocation=parquet_options.hybrid_scan_use_slab_allocation,
+                reader,
+                options,
+                row_groups,
+                _prepare_read_ranges_to_device(
+                    path,
+                    byte_ranges,
+                    stream,
+                    file_size=file_metadata.file_size,
+                    max_coalesce_gap=parquet_options.hybrid_scan_coalesce_max_gap,
+                    max_workers=parquet_options.hybrid_scan_max_read_workers,
+                    sync_before_read=parquet_options.hybrid_scan_sync_before_read,
+                    use_slab_allocation=parquet_options.hybrid_scan_use_slab_allocation,
+                ),
             )
+        )
+
+    pending_reads = tuple(
+        plan.prepared_reads for plan in scan_plans if plan.prepared_reads is not None
+    )
+    with nvtx.annotate("read_byte_ranges_to_device", domain="cudf_polars", color="red"):
+        _read_prepared_ranges_to_device_many(
+            pending_reads,
+            max_workers=parquet_options.hybrid_scan_max_read_workers,
+        )
+
+    for plan in scan_plans:
+        if plan.prepared_reads is None:
+            rows_per_source.append(0)
+            continue
+        read_result = _finalize_prepared_range_reads(plan.prepared_reads, stream=stream)
         with nvtx.annotate(
             "reader.materialize_all_columns", domain="cudf_polars", color="red"
         ):
-            table_with_metadata = reader.materialize_all_columns(
-                row_groups,
-                read_result.column_data,  # type: ignore[arg-type]
-                options,
+            table_with_metadata = plan.reader.materialize_all_columns(
+                plan.row_groups,
+                read_result.column_data,
+                plan.options,
                 stream,
             )
         names = table_with_metadata.column_names(include_children=False)
