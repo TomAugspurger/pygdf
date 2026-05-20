@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import heapq
 import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Literal
@@ -26,8 +27,12 @@ if TYPE_CHECKING:
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 
-# Set of available collective IDs
-_collective_id_vacancy: set[int] = set(range(Shuffler.max_concurrent_shuffles))
+# Min-heap + membership set of available collective IDs.
+# The heap gives fast deterministic allocation of the smallest ID.
+# We use both a heap + set to ensure that the heap never includes
+# multiple copies of the same ID (from, e.g. releasing the same ID twice).
+_collective_id_vacancy_heap: list[int] = list(range(Shuffler.max_concurrent_shuffles))
+_collective_id_vacancy: set[int] = set(_collective_id_vacancy_heap)
 _collective_id_vacancy_lock: threading.Lock = threading.Lock()
 
 
@@ -40,15 +45,17 @@ def _get_new_collective_id() -> int:
             )
 
         # All ranks must choose the same collective IDs during lowering.
-        collective_id = min(_collective_id_vacancy)
-        _collective_id_vacancy.discard(collective_id)
+        collective_id = heapq.heappop(_collective_id_vacancy_heap)
+        _collective_id_vacancy.remove(collective_id)
         return collective_id
 
 
 def _release_collective_id(collective_id: int) -> None:
     """Release a collective ID back to the vacancy set."""
     with _collective_id_vacancy_lock:
-        _collective_id_vacancy.add(collective_id)
+        if collective_id not in _collective_id_vacancy:
+            _collective_id_vacancy.add(collective_id)
+            heapq.heappush(_collective_id_vacancy_heap, collective_id)
 
 
 class ReserveOpIDs:
