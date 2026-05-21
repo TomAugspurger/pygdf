@@ -362,24 +362,57 @@ def _parquet_physical_types(
     return column_types  # pragma: no cover
 
 
-def _cast_literal_to_decimal(
-    side: expr.Expr, lit: expr.Literal, phys_type_map: dict[str, plc.DataType]
-) -> expr.Expr:
+def _comparison_side_column_name(side: expr.Expr) -> str:
     if isinstance(side, expr.Cast):
         col = side.children[0]
         assert isinstance(col, expr.Col)
-        name = col.name
-    else:
-        assert isinstance(side, expr.Col)
-        name = side.name
-    if (type_ := phys_type_map[name]).id() in _DECIMAL_IDS:
-        scale = abs(type_.scale())
+        return col.name
+    assert isinstance(side, expr.Col)
+    return side.name
+
+
+def _cast_literal_to_decimal(
+    side: expr.Expr, lit: expr.Literal, phys_type: plc.DataType
+) -> expr.Expr:
+    if phys_type.id() in _DECIMAL_IDS:
+        scale = abs(phys_type.scale())
         return expr.Cast(
             side.dtype,
             True,  # noqa: FBT003
             expr.Cast(DataType(pl.Decimal(38, scale)), True, lit),  # noqa: FBT003
         )
     return lit
+
+
+def _cast_literal_to_temporal_type(side: expr.Expr, lit: expr.Literal) -> expr.Expr:
+    if side.dtype == lit.dtype:
+        return lit
+
+    side_type = side.dtype.plc_type
+    lit_type = lit.dtype.plc_type
+    if (
+        (
+            plc.traits.is_timestamp(side_type)
+            and lit_type.id() == plc.TypeId.TIMESTAMP_DAYS
+        )
+        or (
+            side_type.id() == plc.TypeId.TIMESTAMP_DAYS
+            and plc.traits.is_timestamp(lit_type)
+        )
+        or (plc.traits.is_timestamp(side_type) and plc.traits.is_timestamp(lit_type))
+    ) and dtypes.can_cast(lit_type, side_type):
+        return expr.Cast(side.dtype, True, lit)  # noqa: FBT003
+    return lit
+
+
+def _cast_literal_to_comparison_type(
+    side: expr.Expr, lit: expr.Literal, phys_type_map: dict[str, plc.DataType]
+) -> expr.Expr:
+    name = _comparison_side_column_name(side)
+    casted = _cast_literal_to_decimal(side, lit, phys_type_map[name])
+    if isinstance(casted, expr.Literal):
+        return _cast_literal_to_temporal_type(side, casted)
+    return casted
 
 
 def _cast_literals_to_physical_types(
@@ -393,11 +426,11 @@ def _cast_literals_to_physical_types(
             if isinstance(left, (expr.Col, expr.Cast)) and isinstance(
                 right, expr.Literal
             ):
-                right = _cast_literal_to_decimal(left, right, phys_type_map)
+                right = _cast_literal_to_comparison_type(left, right, phys_type_map)
             elif isinstance(right, (expr.Col, expr.Cast)) and isinstance(
                 left, expr.Literal
             ):
-                left = _cast_literal_to_decimal(right, left, phys_type_map)
+                left = _cast_literal_to_comparison_type(right, left, phys_type_map)
 
         return node.reconstruct([left, right])
     return node
@@ -410,7 +443,11 @@ def _prepare_parquet_predicate(
     columns: list[str] | None,
 ) -> expr.Expr:
     cols = columns or list(schema.keys())
-    if any(isinstance(schema[c].polars_type, pl.Decimal) for c in cols if c in schema):
+    if any(
+        isinstance(schema[c].polars_type, (pl.Decimal, pl.Date, pl.Datetime))
+        for c in cols
+        if c in schema
+    ):
         return _cast_literals_to_physical_types(
             predicate, _parquet_physical_types(paths, cols)
         )

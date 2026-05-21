@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import datetime
+
+import numpy as np
 import pytest
 
 import polars as pl
@@ -81,3 +84,26 @@ def test_parquet_filter_boolean_column(engine: pl.GPUEngine, tmp_path):
     df.write_parquet(tmp_path / "df.parquet")
     q = pl.scan_parquet(tmp_path / "df.parquet").filter(pl.col("y"))
     assert_gpu_result_equal(q, engine=engine)
+
+
+def test_parquet_filter_datetime_is_between_numpy_datetime64(tmp_path):
+    df = pl.DataFrame(
+        {
+            "a": [
+                datetime.datetime(2021, 1, 1),
+                datetime.datetime(2021, 1, 2),
+                datetime.datetime(2021, 1, 3),
+            ]
+        }
+    )
+    df.write_parquet(tmp_path / "df.parquet")
+
+    lower = np.datetime64("2021-01-01")
+    upper = np.datetime64("2021-01-01")
+    q = pl.scan_parquet(tmp_path / "df.parquet").filter(
+        pl.col("a").is_between(lower, upper)
+    )
+
+    assert_gpu_result_equal(
+        q, engine=pl.GPUEngine(executor="in-memory", raise_on_fail=True)
+    )
