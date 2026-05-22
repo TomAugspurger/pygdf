@@ -349,18 +349,24 @@ class HardwareInfo:
     """Information about the hardware used to run the query."""
 
     gpus: list[GPUInfo]
+    cuda_driver_version: int | None
     # TODO: ucx
 
     @classmethod
     def collect(cls) -> HardwareInfo:
         """Collect the hardware information."""
+        cuda_driver_version: int | None = None
         if pynvml is not None:
             pynvml.nvmlInit()
             gpus = [GPUInfo.from_index(i) for i in range(pynvml.nvmlDeviceGetCount())]
+            try:
+                cuda_driver_version = pynvml.nvmlSystemGetCudaDriverVersion_v2()
+            except pynvml.NVMLError:
+                cuda_driver_version = None
         else:
             # No GPUs -- probably running in CPU mode
             gpus = []
-        return cls(gpus=gpus)
+        return cls(gpus=gpus, cuda_driver_version=cuda_driver_version)
 
 
 def get_data(path: str | Path, table_name: str, suffix: str = "") -> pl.LazyFrame:
