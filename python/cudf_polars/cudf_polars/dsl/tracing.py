@@ -37,6 +37,9 @@ LOG_MEMORY = LOG_TRACES and _bool_converter(
 LOG_DATAFRAMES = LOG_TRACES and _bool_converter(
     os.environ.get("CUDF_POLARS_LOG_TRACES_DATAFRAMES", "1")
 )
+LOG_IO = LOG_TRACES and _bool_converter(
+    os.environ.get("CUDF_POLARS_LOG_TRACES_IO", "1")
+)
 
 CUDF_POLARS_NVTX_DOMAIN = "cudf_polars"
 
@@ -57,6 +60,7 @@ class Scope(str, enum.Enum):
     PLAN = "plan"
     ACTOR = "actor"
     EVALUATE_IR_NODE = "evaluate_ir_node"
+    IO = "io"
 
 
 @functools.cache
@@ -158,7 +162,7 @@ def log_do_evaluate(
     func
         The ``IR.do_evaluate`` method to wrap.
     """
-    if not LOG_TRACES:
+    if not LOG_IO:
         return func
     else:  # pragma: no cover; requires CUDF_POLARS_LOG_TRACES=1
 
@@ -235,3 +239,35 @@ def log(message: str, **kwargs: Any) -> None:
     if LOG_TRACES:  # pragma: no cover; requires CUDF_POLARS_LOG_TRACES=1
         log = structlog.get_logger()
         log.info(message, **kwargs)
+
+
+@contextlib.contextmanager
+def log_io_event(
+    *,
+    phase: Literal["metadata", "data"],
+    paths: list[str] | tuple[str, ...],
+    is_statistics: bool = False,
+    offset: int = -1,
+    size: int = -1,
+) -> Generator[None, None, None]:
+    """
+    Emit a structured IO trace event.
+
+    ``offset`` and ``size`` represent physical byte ranges when known.
+    A value of ``-1`` means the information is not available at this layer.
+    """
+    start = time.monotonic_ns()
+    yield
+    stop = time.monotonic_ns()
+    log(
+        "IO event",
+        scope=Scope.IO.value,
+        phase=phase,
+        start=start,
+        stop=stop,
+        is_statistics=is_statistics,
+        prefix=os.path.commonpath(paths),
+        path_count=len(paths),
+        offset=offset,
+        size=size,
+    )
