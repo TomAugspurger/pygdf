@@ -246,10 +246,14 @@ def prefetch_parquet_file_metadata_for_ir(
 
     if len(missing_files) > 0:
         with cm:
-            for key, metadata in executor.map(
-                _fetch_parquet_footers_for_paths, missing_files
-            ):
-                context.parquet_file_metadata.setdefault(key, metadata)
+            futures = [
+                executor.submit(_fetch_parquet_footers_for_paths, missing_file)
+                for missing_file in missing_files
+            ]
+
+            for future in concurrent.futures.as_completed(futures):
+                paths, metadata = future.result()
+                context.parquet_file_metadata.setdefault(paths, metadata)
 
     for group in groups:
         context.parquet_file_metadata.setdefault(
