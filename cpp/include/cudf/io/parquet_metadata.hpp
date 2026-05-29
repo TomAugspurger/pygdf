@@ -15,7 +15,10 @@
 #include <cudf/io/types.hpp>
 #include <cudf/utilities/export.hpp>
 
+#include <cstddef>
+#include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace CUDF_EXPORT cudf {
@@ -271,6 +274,105 @@ class parquet_metadata {
 };
 
 /**
+ * @brief Owning handle for parquet file footer metadata with cheap indexed views.
+ */
+class parquet_footer_view {
+ public:
+  /**
+   * @brief Default constructor.
+   */
+  explicit parquet_footer_view() = default;
+
+  /**
+   * @brief Construct from owned parquet file metadata.
+   *
+   * @param file_metadatas Owned footer metadata, one element per parquet source.
+   */
+  explicit parquet_footer_view(std::vector<parquet::FileMetaData>&& file_metadatas)
+    : _file_metadatas{std::move(file_metadatas)}
+  {
+  }
+
+  /**
+   * @brief Number of parquet files in this view.
+   *
+   * @return Number of footer metadata objects held by this view.
+   */
+  [[nodiscard]] std::size_t num_files() const { return _file_metadatas.size(); }
+
+  /**
+   * @brief Return file metadata for a specific source index.
+   *
+   * @param file_index Index of the parquet source.
+   * @return File footer metadata for the selected source.
+   */
+  [[nodiscard]] parquet::FileMetaData const& file_metadata(std::size_t file_index) const
+  {
+    return _file_metadatas.at(file_index);
+  }
+
+  /**
+   * @brief Return a row group view for a file and row-group index.
+   *
+   * @param file_index Index of the parquet source.
+   * @param row_group_index Index of the row group inside the selected file.
+   * @return Row group metadata for the selected file and row group.
+   */
+  [[nodiscard]] parquet::RowGroup const& row_group(std::size_t file_index,
+                                                   std::size_t row_group_index) const
+  {
+    return file_metadata(file_index).row_groups.at(row_group_index);
+  }
+
+  /**
+   * @brief Return a column chunk view for file, row-group, and column indexes.
+   *
+   * @param file_index Index of the parquet source.
+   * @param row_group_index Index of the row group inside the selected file.
+   * @param column_index Index of the column chunk inside the selected row group.
+   * @return Column chunk metadata for the selected file, row group, and column.
+   */
+  [[nodiscard]] parquet::ColumnChunk const& column_chunk(std::size_t file_index,
+                                                         std::size_t row_group_index,
+                                                         std::size_t column_index) const
+  {
+    return row_group(file_index, row_group_index).columns.at(column_index);
+  }
+
+  /**
+   * @brief Return a sorting column view for file, row-group, and sorting-column indexes.
+   *
+   * @param file_index Index of the parquet source.
+   * @param row_group_index Index of the row group inside the selected file.
+   * @param sorting_column_index Index of the sorting-column metadata entry.
+   * @return Sorting-column metadata for the selected row group.
+   */
+  [[nodiscard]] parquet::SortingColumn const& sorting_column(std::size_t file_index,
+                                                             std::size_t row_group_index,
+                                                             std::size_t sorting_column_index) const
+  {
+    auto const& sorting_columns = row_group(file_index, row_group_index).sorting_columns;
+    if (not sorting_columns.has_value()) {
+      throw std::out_of_range("Row group has no sorting columns");
+    }
+    return sorting_columns.value().at(sorting_column_index);
+  }
+
+  /**
+   * @brief Release ownership of all file metadata.
+   *
+   * @return Moved-out vector of owned file footer metadata.
+   */
+  [[nodiscard]] std::vector<parquet::FileMetaData> release() &&
+  {
+    return std::move(_file_metadatas);
+  }
+
+ private:
+  std::vector<parquet::FileMetaData> _file_metadatas;
+};
+
+/**
  * @brief Reads metadata of parquet dataset
  *
  * @ingroup io_readers
@@ -292,6 +394,18 @@ parquet_metadata read_parquet_metadata(source_info const& src_info);
  * @return List of FileMetaData objects, one per parquet source
  */
 std::vector<parquet::FileMetaData> read_parquet_footers(
+  cudf::host_span<std::unique_ptr<cudf::io::datasource> const> sources);
+
+/**
+ * @brief Constructs a view handle over parquet file footers.
+ *
+ * @ingroup io_readers
+ *
+ * @param sources Input `datasource` objects to read the dataset from
+ *
+ * @return Handle owning one FileMetaData object per parquet source
+ */
+parquet_footer_view read_parquet_footers_view(
   cudf::host_span<std::unique_ptr<cudf::io::datasource> const> sources);
 
 /** @} */  // end of group

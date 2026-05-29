@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
 
+from libc.stddef cimport size_t
 from pylibcudf.io.types cimport SourceInfo
 from pylibcudf.libcudf.io.parquet_schema cimport (
     ColumnChunk as cpp_ColumnChunk,
@@ -70,6 +71,26 @@ cdef class FileMetaData:
     @staticmethod
     cdef FileMetaData from_cpp(cpp_FileMetaData metadata)
 
+cdef class _ParquetFooterViewOwner:
+    cdef parquet_metadata.parquet_footer_view c_obj
+
+    @staticmethod
+    cdef _ParquetFooterViewOwner from_cpp(
+        parquet_metadata.parquet_footer_view metadata_view
+    )
+
+cdef class FileMetaDataView:
+    cdef _ParquetFooterViewOwner _owner
+    cdef size_t _file_index
+    cdef object _row_groups_cache
+
+    @staticmethod
+    cdef FileMetaDataView from_owner(
+        _ParquetFooterViewOwner owner, size_t file_index
+    )
+
+    cpdef FileMetaData to_owned(self)
+
 cdef class SortingColumn:
     cdef cpp_SortingColumn c_obj
 
@@ -88,11 +109,69 @@ cdef class ColumnChunkMetaData:
     @staticmethod
     cdef ColumnChunkMetaData from_cpp(cpp_ColumnChunkMetaData meta_data)
 
+cdef class SortingColumnView:
+    cdef _ParquetFooterViewOwner _owner
+    cdef size_t _file_index
+    cdef size_t _row_group_index
+    cdef size_t _sorting_column_index
+
+    @staticmethod
+    cdef SortingColumnView from_owner(
+        _ParquetFooterViewOwner owner,
+        size_t file_index,
+        size_t row_group_index,
+        size_t sorting_column_index,
+    )
+
+cdef class ColumnChunkMetaDataView:
+    cdef _ParquetFooterViewOwner _owner
+    cdef size_t _file_index
+    cdef size_t _row_group_index
+    cdef size_t _column_index
+
+    @staticmethod
+    cdef ColumnChunkMetaDataView from_owner(
+        _ParquetFooterViewOwner owner,
+        size_t file_index,
+        size_t row_group_index,
+        size_t column_index,
+    )
+
+cdef class ColumnChunkView:
+    cdef _ParquetFooterViewOwner _owner
+    cdef size_t _file_index
+    cdef size_t _row_group_index
+    cdef size_t _column_index
+    cdef object _meta_data_cache
+
+    @staticmethod
+    cdef ColumnChunkView from_owner(
+        _ParquetFooterViewOwner owner,
+        size_t file_index,
+        size_t row_group_index,
+        size_t column_index,
+    )
+
 cdef class RowGroup:
     cdef cpp_RowGroup c_obj
 
     @staticmethod
     cdef RowGroup from_cpp(cpp_RowGroup row_group)
 
+cdef class RowGroupView:
+    cdef _ParquetFooterViewOwner _owner
+    cdef size_t _file_index
+    cdef size_t _row_group_index
+    cdef object _columns_cache
+    cdef object _sorting_columns_cache
+
+    @staticmethod
+    cdef RowGroupView from_owner(
+        _ParquetFooterViewOwner owner,
+        size_t file_index,
+        size_t row_group_index,
+    )
+
 cpdef ParquetMetadata read_parquet_metadata(SourceInfo src_info)
 cpdef list read_parquet_footers(SourceInfo src_info)
+cpdef tuple read_parquet_footers_view(SourceInfo src_info)

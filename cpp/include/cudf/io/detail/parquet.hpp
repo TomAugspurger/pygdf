@@ -265,6 +265,15 @@ parquet_metadata read_parquet_metadata(host_span<std::unique_ptr<datasource> con
 std::vector<parquet::FileMetaData> read_parquet_footers(
   host_span<std::unique_ptr<datasource> const> sources);
 
+/**
+ * @brief Constructs a view handle over parquet file footers
+ *
+ * @param sources Input `datasource` objects to read the dataset from
+ *
+ * @return Handle owning one FileMetaData object per parquet source
+ */
+parquet_footer_view read_parquet_footers_view(host_span<std::unique_ptr<datasource> const> sources);
+
 }  // namespace parquet::detail
 }  // namespace io
 }  // namespace CUDF_EXPORT cudf

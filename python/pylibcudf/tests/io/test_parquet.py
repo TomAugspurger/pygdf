@@ -447,6 +447,81 @@ def test_file_metadata_row_groups_and_column_chunks() -> None:
             assert meta_data.path_in_schema[-1] == pa_col_chunk.path_in_schema
 
 
+def test_file_metadata_view_row_groups_and_column_chunks(tmp_path) -> None:
+    table = pa.table(
+        {
+            "a": list(range(100)),
+            "b": [x * 10 for x in range(100)],
+        }
+    )
+    parquet_path = tmp_path / "view_metadata.parquet"
+    write_table(table, parquet_path, row_group_size=25)
+    parquet_file = pq.ParquetFile(parquet_path)
+    source_info = plc.io.SourceInfo([parquet_path])
+    file_metadata_view = plc.io.parquet_metadata.read_parquet_footers_view(
+        source_info
+    )[0]
+
+    row_groups = file_metadata_view.row_groups
+    assert len(row_groups) == parquet_file.metadata.num_row_groups
+    assert file_metadata_view.row_groups is row_groups
+
+    for rg_idx, row_group in enumerate(row_groups):
+        pa_row_group = parquet_file.metadata.row_group(rg_idx)
+        assert row_group.num_rows == pa_row_group.num_rows
+        assert row_group.total_byte_size == pa_row_group.total_byte_size
+        assert row_group.total_compressed_size is None or (
+            row_group.total_compressed_size >= 0
+        )
+        assert row_group.file_offset is None or row_group.file_offset >= 0
+        assert row_group.ordinal is None or row_group.ordinal == rg_idx
+        assert row_group.columns is row_groups[rg_idx].columns
+
+        for col_idx, column_chunk in enumerate(row_group.columns):
+            pa_col_chunk = pa_row_group.column(col_idx)
+            meta_data = column_chunk.meta_data
+            assert column_chunk.file_path == ""
+            assert column_chunk.file_offset == 0
+            assert isinstance(column_chunk.offset_index_offset, int)
+            assert isinstance(column_chunk.offset_index_length, int)
+            assert isinstance(column_chunk.column_index_offset, int)
+            assert isinstance(column_chunk.column_index_length, int)
+            assert isinstance(column_chunk.schema_idx, int)
+            assert meta_data.num_values == pa_col_chunk.num_values
+            assert (
+                meta_data.total_uncompressed_size
+                == pa_col_chunk.total_uncompressed_size
+            )
+            assert (
+                meta_data.total_compressed_size
+                == pa_col_chunk.total_compressed_size
+            )
+            assert meta_data.path_in_schema[-1] == pa_col_chunk.path_in_schema
+
+
+def test_file_metadata_view_retains_lifetime_and_materializes_to_owned(
+    tmp_path,
+) -> None:
+    table = pa.table({"a": list(range(10))})
+    parquet_path = tmp_path / "view_lifetime.parquet"
+    write_table(table, parquet_path, row_group_size=5)
+    source_info = plc.io.SourceInfo([parquet_path])
+    metadata_view = plc.io.parquet_metadata.read_parquet_footers_view(
+        source_info
+    )[0]
+    row_group = metadata_view.row_groups[0]
+    del metadata_view
+
+    assert row_group.num_rows > 0
+    assert row_group.columns[0].meta_data.num_values > 0
+
+    owned = plc.io.parquet_metadata.read_parquet_footers_view(source_info)[
+        0
+    ].to_owned()
+    assert isinstance(owned, plc.io.parquet_metadata.FileMetaData)
+    assert owned.num_rows == table.num_rows
+
+
 def test_file_metadata_wrappers_not_directly_constructible() -> None:
     with pytest.raises(
         ValueError, match="SortingColumn cannot be constructed directly"
@@ -464,6 +539,27 @@ def test_file_metadata_wrappers_not_directly_constructible() -> None:
         ValueError, match="RowGroup cannot be constructed directly"
     ):
         plc.io.parquet_metadata.RowGroup()
+    with pytest.raises(
+        ValueError, match="SortingColumnView cannot be constructed directly"
+    ):
+        plc.io.parquet_metadata.SortingColumnView()
+    with pytest.raises(
+        ValueError, match="ColumnChunkView cannot be constructed directly"
+    ):
+        plc.io.parquet_metadata.ColumnChunkView()
+    with pytest.raises(
+        ValueError,
+        match="ColumnChunkMetaDataView cannot be constructed directly",
+    ):
+        plc.io.parquet_metadata.ColumnChunkMetaDataView()
+    with pytest.raises(
+        ValueError, match="RowGroupView cannot be constructed directly"
+    ):
+        plc.io.parquet_metadata.RowGroupView()
+    with pytest.raises(
+        ValueError, match="FileMetaDataView cannot be constructed directly"
+    ):
+        plc.io.parquet_metadata.FileMetaDataView()
 
 
 def test_file_metadata_row_group_sorting_columns(tmp_path) -> None:

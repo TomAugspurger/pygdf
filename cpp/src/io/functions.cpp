@@ -667,6 +667,13 @@ std::vector<parquet::FileMetaData> read_parquet_footers(
   return detail_parquet::read_parquet_footers(sources);
 }
 
+parquet_footer_view read_parquet_footers_view(
+  host_span<std::unique_ptr<cudf::io::datasource> const> sources)
+{
+  CUDF_FUNC_RANGE();
+  return detail_parquet::read_parquet_footers_view(sources);
+}
+
 /**
  * @copydoc cudf::io::merge_row_group_metadata
  */

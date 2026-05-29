@@ -1,9 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
 # SPDX-License-Identifier: Apache-2.0
 
+from libc.stddef cimport size_t
 from libc.stdint cimport uint8_t
 from libcpp.memory cimport make_unique, unique_ptr
 from libcpp.string cimport string
+from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
 from pylibcudf.io.types cimport SourceInfo
@@ -29,14 +31,20 @@ ctypedef const unique_ptr[datasource] const_unique_ptr_datasource
 
 __all__ = [
     "ColumnChunk",
+    "ColumnChunkView",
     "ColumnChunkMetaData",
+    "ColumnChunkMetaDataView",
     "FileMetaData",
+    "FileMetaDataView",
     "ParquetColumnSchema",
     "ParquetMetadata",
     "ParquetSchema",
     "RowGroup",
+    "RowGroupView",
     "SortingColumn",
+    "SortingColumnView",
     "read_parquet_footers",
+    "read_parquet_footers_view",
     "read_parquet_metadata",
 ]
 
@@ -530,6 +538,348 @@ cdef class FileMetaData:
         return FileMetaData.from_cpp(metadata)
 
 
+cdef class _ParquetFooterViewOwner:
+    def __init__(self):
+        raise ValueError(
+            "_ParquetFooterViewOwner cannot be constructed directly"
+        )
+
+    @staticmethod
+    cdef _ParquetFooterViewOwner from_cpp(
+        cpp_parquet_metadata.parquet_footer_view metadata_view
+    ):
+        cdef _ParquetFooterViewOwner result = _ParquetFooterViewOwner.__new__(
+            _ParquetFooterViewOwner
+        )
+        result.c_obj = move(metadata_view)
+        return result
+
+
+cdef class SortingColumnView:
+    """View metadata for a row-group sorting column."""
+
+    def __init__(self):
+        raise ValueError("SortingColumnView cannot be constructed directly")
+
+    @staticmethod
+    cdef SortingColumnView from_owner(
+        _ParquetFooterViewOwner owner,
+        size_t file_index,
+        size_t row_group_index,
+        size_t sorting_column_index,
+    ):
+        cdef SortingColumnView result = SortingColumnView.__new__(
+            SortingColumnView
+        )
+        result._owner = owner
+        result._file_index = file_index
+        result._row_group_index = row_group_index
+        result._sorting_column_index = sorting_column_index
+        return result
+
+    @property
+    def column_idx(self):
+        return self._owner.c_obj.sorting_column(
+            self._file_index, self._row_group_index, self._sorting_column_index
+        ).column_idx
+
+    @property
+    def descending(self):
+        return self._owner.c_obj.sorting_column(
+            self._file_index, self._row_group_index, self._sorting_column_index
+        ).descending
+
+    @property
+    def nulls_first(self):
+        return self._owner.c_obj.sorting_column(
+            self._file_index, self._row_group_index, self._sorting_column_index
+        ).nulls_first
+
+
+cdef class ColumnChunkMetaDataView:
+    """View payload for a column chunk metadata object."""
+
+    def __init__(self):
+        raise ValueError("ColumnChunkMetaDataView cannot be constructed directly")
+
+    @staticmethod
+    cdef ColumnChunkMetaDataView from_owner(
+        _ParquetFooterViewOwner owner,
+        size_t file_index,
+        size_t row_group_index,
+        size_t column_index,
+    ):
+        cdef ColumnChunkMetaDataView result = ColumnChunkMetaDataView.__new__(
+            ColumnChunkMetaDataView
+        )
+        result._owner = owner
+        result._file_index = file_index
+        result._row_group_index = row_group_index
+        result._column_index = column_index
+        return result
+
+    @property
+    def path_in_schema(self):
+        cdef size_t path_idx
+        cdef const cpp_ColumnChunk* chunk = &self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        )
+        return [
+            chunk[0].meta_data.path_in_schema[path_idx].decode("utf-8")
+            for path_idx in range(chunk[0].meta_data.path_in_schema.size())
+        ]
+
+    @property
+    def num_values(self):
+        cdef const cpp_ColumnChunk* chunk = &self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        )
+        return chunk[0].meta_data.num_values
+
+    @property
+    def total_uncompressed_size(self):
+        cdef const cpp_ColumnChunk* chunk = &self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        )
+        return chunk[0].meta_data.total_uncompressed_size
+
+    @property
+    def total_compressed_size(self):
+        cdef const cpp_ColumnChunk* chunk = &self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        )
+        return chunk[0].meta_data.total_compressed_size
+
+
+cdef class ColumnChunkView:
+    """View metadata for a row group's column chunk."""
+
+    def __init__(self):
+        raise ValueError("ColumnChunkView cannot be constructed directly")
+
+    @staticmethod
+    cdef ColumnChunkView from_owner(
+        _ParquetFooterViewOwner owner,
+        size_t file_index,
+        size_t row_group_index,
+        size_t column_index,
+    ):
+        cdef ColumnChunkView result = ColumnChunkView.__new__(ColumnChunkView)
+        result._owner = owner
+        result._file_index = file_index
+        result._row_group_index = row_group_index
+        result._column_index = column_index
+        result._meta_data_cache = None
+        return result
+
+    @property
+    def file_path(self):
+        return self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        ).file_path.decode("utf-8")
+
+    @property
+    def file_offset(self):
+        return self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        ).file_offset
+
+    @property
+    def offset_index_offset(self):
+        return self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        ).offset_index_offset
+
+    @property
+    def offset_index_length(self):
+        return self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        ).offset_index_length
+
+    @property
+    def column_index_offset(self):
+        return self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        ).column_index_offset
+
+    @property
+    def column_index_length(self):
+        return self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        ).column_index_length
+
+    @property
+    def schema_idx(self):
+        return self._owner.c_obj.column_chunk(
+            self._file_index, self._row_group_index, self._column_index
+        ).schema_idx
+
+    @property
+    def meta_data(self):
+        if self._meta_data_cache is None:
+            self._meta_data_cache = ColumnChunkMetaDataView.from_owner(
+                self._owner,
+                self._file_index,
+                self._row_group_index,
+                self._column_index,
+            )
+        return self._meta_data_cache
+
+
+cdef class RowGroupView:
+    """Parquet row group metadata view."""
+
+    def __init__(self):
+        raise ValueError("RowGroupView cannot be constructed directly")
+
+    @staticmethod
+    cdef RowGroupView from_owner(
+        _ParquetFooterViewOwner owner,
+        size_t file_index,
+        size_t row_group_index,
+    ):
+        cdef RowGroupView result = RowGroupView.__new__(RowGroupView)
+        result._owner = owner
+        result._file_index = file_index
+        result._row_group_index = row_group_index
+        result._columns_cache = None
+        result._sorting_columns_cache = None
+        return result
+
+    @property
+    def columns(self):
+        cdef size_t col_idx
+        cdef const cpp_RowGroup* row_group
+        if self._columns_cache is None:
+            row_group = &self._owner.c_obj.row_group(
+                self._file_index, self._row_group_index
+            )
+            self._columns_cache = tuple(
+                ColumnChunkView.from_owner(
+                    self._owner,
+                    self._file_index,
+                    self._row_group_index,
+                    col_idx,
+                )
+                for col_idx in range(row_group[0].columns.size())
+            )
+        return self._columns_cache
+
+    @property
+    def total_byte_size(self):
+        return self._owner.c_obj.row_group(
+            self._file_index, self._row_group_index
+        ).total_byte_size
+
+    @property
+    def num_rows(self):
+        return self._owner.c_obj.row_group(
+            self._file_index, self._row_group_index
+        ).num_rows
+
+    @property
+    def sorting_columns(self):
+        cdef size_t sorting_col_idx
+        cdef const cpp_RowGroup* row_group = &self._owner.c_obj.row_group(
+            self._file_index, self._row_group_index
+        )
+        if not row_group[0].sorting_columns.has_value():
+            return None
+        if self._sorting_columns_cache is None:
+            self._sorting_columns_cache = tuple(
+                SortingColumnView.from_owner(
+                    self._owner,
+                    self._file_index,
+                    self._row_group_index,
+                    sorting_col_idx,
+                )
+                for sorting_col_idx in range(
+                    row_group[0].sorting_columns.value().size()
+                )
+            )
+        return self._sorting_columns_cache
+
+    @property
+    def file_offset(self):
+        cdef const cpp_RowGroup* row_group = &self._owner.c_obj.row_group(
+            self._file_index, self._row_group_index
+        )
+        if not row_group[0].file_offset.has_value():
+            return None
+        return row_group[0].file_offset.value()
+
+    @property
+    def total_compressed_size(self):
+        cdef const cpp_RowGroup* row_group = &self._owner.c_obj.row_group(
+            self._file_index, self._row_group_index
+        )
+        if not row_group[0].total_compressed_size.has_value():
+            return None
+        return row_group[0].total_compressed_size.value()
+
+    @property
+    def ordinal(self):
+        cdef const cpp_RowGroup* row_group = &self._owner.c_obj.row_group(
+            self._file_index, self._row_group_index
+        )
+        if not row_group[0].ordinal.has_value():
+            return None
+        return row_group[0].ordinal.value()
+
+
+cdef class FileMetaDataView:
+    """Parquet file footer metadata view."""
+
+    def __init__(self):
+        raise ValueError("FileMetaDataView cannot be constructed directly")
+
+    @staticmethod
+    cdef FileMetaDataView from_owner(
+        _ParquetFooterViewOwner owner, size_t file_index
+    ):
+        cdef FileMetaDataView result = FileMetaDataView.__new__(
+            FileMetaDataView
+        )
+        result._owner = owner
+        result._file_index = file_index
+        result._row_groups_cache = None
+        return result
+
+    @property
+    def version(self):
+        return self._owner.c_obj.file_metadata(self._file_index).version
+
+    @property
+    def num_rows(self):
+        return self._owner.c_obj.file_metadata(self._file_index).num_rows
+
+    @property
+    def created_by(self):
+        return self._owner.c_obj.file_metadata(
+            self._file_index
+        ).created_by.decode("utf-8")
+
+    @property
+    def row_groups(self):
+        cdef size_t row_group_idx
+        cdef const cpp_FileMetaData* file_meta
+        if self._row_groups_cache is None:
+            file_meta = &self._owner.c_obj.file_metadata(self._file_index)
+            self._row_groups_cache = tuple(
+                RowGroupView.from_owner(
+                    self._owner, self._file_index, row_group_idx
+                )
+                for row_group_idx in range(file_meta[0].row_groups.size())
+            )
+        return self._row_groups_cache
+
+    cpdef FileMetaData to_owned(self):
+        """Materialize this view into an owned ``FileMetaData`` object."""
+        return FileMetaData.from_cpp(
+            self._owner.c_obj.file_metadata(self._file_index)
+        )
+
+
 cpdef ParquetMetadata read_parquet_metadata(SourceInfo src_info):
     """
     Reads metadata of parquet dataset.
@@ -586,3 +936,38 @@ cpdef list read_parquet_footers(SourceInfo src_info):
         )
 
     return [FileMetaData.from_cpp(metadata) for metadata in c_result]
+
+
+cpdef tuple read_parquet_footers_view(SourceInfo src_info):
+    """
+    Read parquet file footers as cheap ``FileMetaDataView`` objects.
+
+    Parameters
+    ----------
+    src_info : SourceInfo
+        Dataset source.
+
+    Returns
+    -------
+    tuple[FileMetaDataView, ...]
+        One view object per input source.
+    """
+    cdef vector[unique_ptr[datasource]] sources
+    cdef cpp_parquet_metadata.parquet_footer_view c_result
+    cdef _ParquetFooterViewOwner owner
+    cdef size_t file_index
+    cdef list result_views
+    with nogil:
+        sources = make_datasources(src_info.c_obj)
+        c_result = cpp_parquet_metadata.read_parquet_footers_view(
+            host_span[const_unique_ptr_datasource](
+                <const_unique_ptr_datasource*>sources.data(),
+                sources.size(),
+            )
+        )
+
+    owner = _ParquetFooterViewOwner.from_cpp(move(c_result))
+    result_views = []
+    for file_index in range(owner.c_obj.num_files()):
+        result_views.append(FileMetaDataView.from_owner(owner, file_index))
+    return tuple(result_views)

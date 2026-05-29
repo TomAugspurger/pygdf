@@ -1125,6 +1125,11 @@ parquet_metadata read_parquet_metadata(host_span<std::unique_ptr<datasource> con
 std::vector<parquet::FileMetaData> read_parquet_footers(
   host_span<std::unique_ptr<datasource> const> sources)
 {
+  return std::move(cudf::io::parquet::detail::read_parquet_footers_view(sources)).release();
+}
+
+parquet_footer_view read_parquet_footers_view(host_span<std::unique_ptr<datasource> const> sources)
+{
   // Do not use arrow schema when only reading the parquet metadata.
   constexpr auto use_arrow_schema = false;
 
@@ -1135,9 +1140,9 @@ std::vector<parquet::FileMetaData> read_parquet_footers(
   constexpr auto read_page_indexes = true;
 
   // Parse the source dataset metadata
-  return aggregate_reader_metadata(
-           sources, use_arrow_schema, has_column_projection, read_page_indexes)
-    .get_parquet_metadatas();
+  return parquet_footer_view{
+    aggregate_reader_metadata(sources, use_arrow_schema, has_column_projection, read_page_indexes)
+      .get_parquet_metadatas()};
 }
 
 }  // namespace cudf::io::parquet::detail
