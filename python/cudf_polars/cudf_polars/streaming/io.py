@@ -269,6 +269,7 @@ class SplitScan(IR):
         include_file_paths: str | None,
         predicate: NamedExpr | None,
         parquet_options: ParquetOptions,
+        parquet_metadatas: list[plc.io.parquet_metadata.FileMetaData] | None = None,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
@@ -288,7 +289,7 @@ class SplitScan(IR):
         # - We can use all this information to calculate the
         #   "skip_rows" and "n_rows" options to use locally.
 
-        if parquet_options.prefetch_file_metadata:
+        if parquet_metadatas is None and parquet_options.prefetch_file_metadata:
             parquet_metadatas = Scan._lookup_parquet_metadatas(paths, context)
 
             row_group_num_rows = [
@@ -345,6 +346,7 @@ class SplitScan(IR):
                 include_file_paths,
                 predicate,
                 parquet_options,
+                parquet_metadatas,
                 context=context,
             )
 
@@ -427,6 +429,7 @@ class FusedScan(IR):
         include_file_paths: str | None,
         predicate: NamedExpr | None,
         parquet_options: ParquetOptions,
+        parquet_metadatas: list[plc.io.parquet_metadata.FileMetaData] | None = None,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
@@ -444,6 +447,7 @@ class FusedScan(IR):
                 include_file_paths,
                 predicate,
                 parquet_options,
+                parquet_metadatas,
                 context=context,
             )
 

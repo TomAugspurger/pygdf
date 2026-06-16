@@ -27,7 +27,6 @@ from rapidsmpf.streaming.core.actor import run_actor_network
 from cudf_polars.containers import DataFrame
 from cudf_polars.dsl.ir import (
     IRExecutionContext,
-    prefetch_parquet_file_metadata_for_ir,
     seed_parquet_file_metadata_from_stats,
 )
 from cudf_polars.streaming.actor_graph.collectives import ReserveOpIDs
@@ -698,10 +697,6 @@ def evaluate_on_rank(
 
     if config_options.parquet_options.prefetch_file_metadata:
         seed_parquet_file_metadata_from_stats(stats, ir_context)
-        prefetch_parquet_file_metadata_for_ir(
-            ir,
-            ir_context,
-        )
 
     with ReserveOpIDs(ir, config_options) as collective_id_map:
         return execute_ir_on_rank(

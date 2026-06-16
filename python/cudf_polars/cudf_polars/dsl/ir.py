@@ -555,6 +555,7 @@ class Scan(IR):
         "cloud_options",
         "include_file_paths",
         "n_rows",
+        "parquet_metadatas",
         "parquet_options",
         "paths",
         "predicate",
@@ -577,8 +578,9 @@ class Scan(IR):
         "include_file_paths",
         "predicate",
         "parquet_options",
+        "parquet_metadatas",
     )
-    _n_non_child_args = 11
+    _n_non_child_args = 12
     typ: str
     """What type of file are we reading? Parquet, CSV, etc..."""
     reader_options: dict[str, Any]
@@ -601,6 +603,7 @@ class Scan(IR):
     """Mask to apply to the read dataframe."""
     parquet_options: ParquetOptions
     """Parquet-specific options."""
+    parquet_metadatas: list[plc.io.parquet_metadata.FileMetaData] | None
 
     PARQUET_DEFAULT_CHUNK_SIZE: int = 0  # unlimited
     PARQUET_DEFAULT_PASS_LIMIT: int = 16 * 1024**3  # 16GiB
@@ -619,6 +622,7 @@ class Scan(IR):
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
         parquet_options: ParquetOptions,
+        parquet_metadatas: list[plc.io.parquet_metadata.FileMetaData] | None,
     ):
         self.schema = schema
         self.typ = typ
@@ -643,9 +647,11 @@ class Scan(IR):
             include_file_paths,
             predicate,
             parquet_options,
+            parquet_metadatas,
         )
         self.children = ()
         self.parquet_options = parquet_options
+        self.parquet_metadatas = parquet_metadatas
         if self.typ not in ("csv", "parquet", "ndjson"):  # pragma: no cover
             # This line is unhittable ATM since IPC/Anonymous scan raise
             # on the polars side
@@ -786,10 +792,11 @@ class Scan(IR):
         n_rows: int,
         parquet_options: ParquetOptions,
         context: IRExecutionContext | None,
+        parquet_metadatas: list[plc.io.parquet_metadata.FileMetaData] | None = None,
     ) -> int:
         # Zero-width parquet files lose their row count when read through
         # pylibcudf. See https://github.com/rapidsai/cudf/issues/21428
-        if parquet_options.prefetch_file_metadata and context is not None:
+        if parquet_metadatas is None and parquet_options.prefetch_file_metadata and context is not None:
             parquet_metadatas = Scan._lookup_parquet_metadatas(paths, context)
             num_rows = sum(metadata.num_rows for metadata in parquet_metadatas)
         else:
@@ -819,6 +826,7 @@ class Scan(IR):
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
         parquet_options: ParquetOptions,
+        parquet_metadatas: list[plc.io.parquet_metadata.FileMetaData] | None,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
@@ -934,7 +942,7 @@ class Scan(IR):
                     df,
                 )
         elif typ == "parquet":
-            if parquet_options.prefetch_file_metadata:
+            if parquet_metadatas is None and parquet_options.prefetch_file_metadata:
                 parquet_metadatas = cls._lookup_parquet_metadatas(paths, context)
             else:
                 parquet_metadatas = None
@@ -984,7 +992,12 @@ class Scan(IR):
                         )
                 num_rows = (
                     cls._get_parquet_row_count_from_metadata(
-                        paths, skip_rows, n_rows, parquet_options, context
+                        paths,
+                        skip_rows,
+                        n_rows,
+                        parquet_options,
+                        context,
+                        parquet_metadatas=parquet_metadatas,
                     )
                     if not names
                     else None
@@ -1010,7 +1023,12 @@ class Scan(IR):
                 col_names = tbl_w_meta.column_names(include_children=False)
                 num_rows = (
                     cls._get_parquet_row_count_from_metadata(
-                        paths, skip_rows, n_rows, parquet_options, context
+                        paths,
+                        skip_rows,
+                        n_rows,
+                        parquet_options,
+                        context,
+                        parquet_metadatas=parquet_metadatas,
                     )
                     if not col_names
                     else None

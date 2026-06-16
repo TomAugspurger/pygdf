@@ -113,6 +113,41 @@ def test_scan_parquet_prefetch_file_metadata(
     assert_gpu_result_equal(pl.scan_parquet(tmp_path), engine=streaming_engine)
 
 
+def test_scan_parquet_prefetch_metadata_shared_scan_paths(
+    tmp_path: Path,
+    df: pl.DataFrame,
+    streaming_engine_factory: Callable[..., StreamingEngine],
+):
+    streaming_engine = streaming_engine_factory(
+        StreamingOptions(parquet_options={"prefetch_file_metadata": True}),
+    )
+    make_partitioned_source(df, tmp_path, "parquet", n_files=2)
+    scan = pl.scan_parquet(tmp_path)
+    query = pl.concat([scan.select("x"), scan.select("x")])
+    assert_gpu_result_equal(query, engine=streaming_engine)
+
+
+def test_scan_parquet_prefetch_metadata_disjoint_scan_paths(
+    tmp_path: Path,
+    streaming_engine_factory: Callable[..., StreamingEngine],
+):
+    streaming_engine = streaming_engine_factory(
+        StreamingOptions(parquet_options={"prefetch_file_metadata": True}),
+    )
+    left = pl.DataFrame({"x": [1, 2, 3]})
+    right = pl.DataFrame({"x": [4, 5, 6]})
+    left.write_parquet(tmp_path / "left.parquet")
+    right.write_parquet(tmp_path / "right.parquet")
+
+    query = pl.concat(
+        [
+            pl.scan_parquet(tmp_path / "left.parquet"),
+            pl.scan_parquet(tmp_path / "right.parquet"),
+        ]
+    )
+    assert_gpu_result_equal(query, engine=streaming_engine)
+
+
 def test_prefetch_file_metadata_non_parquet_scan(df, streaming_engine_factory) -> None:
     streaming_engine = streaming_engine_factory(
         StreamingOptions(parquet_options={"prefetch_file_metadata": True}),
@@ -238,6 +273,7 @@ def _make_parquet_scan(
         None,
         None,
         parquet_options,
+        None,
     )
 
 
@@ -354,6 +390,7 @@ def test_scan_missing_prefetch_metadata_raises() -> None:
             scan.include_file_paths,
             scan.predicate,
             scan.parquet_options,
+            None,
             context=ctx,
         )
 
@@ -397,5 +434,6 @@ def test_split_scan_do_evaluate_missing_prefetch_metadata() -> None:
             None,
             None,
             parquet_options,
+            None,
             context=context,
         )
