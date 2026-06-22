@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Benchmark utilities for the RapidsMPF SPMD and Ray frontends."""
@@ -6,7 +6,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import ctypes
+import ctypes.util
 import dataclasses
+import functools
 import importlib
 import io
 import itertools
@@ -82,7 +86,7 @@ except ImportError:
     CUDF_POLARS_AVAILABLE = False
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from cudf_polars.engine.options import StreamingOptions
     from cudf_polars.streaming.explain import SerializablePlan
@@ -118,6 +122,85 @@ else:
 
 _STREAMING_FRONTENDS = frozenset({"dask", "ray", "spmd"})
 _CPU_ENGINES = frozenset({"polars-cpu", "duckdb"})
+
+
+@functools.cache
+def _load_cuda_profiler_api() -> tuple[ctypes.CDLL, Any, Any]:
+    """Load and cache cudart profiler start/stop symbols."""
+    libcudart_name = ctypes.util.find_library("cudart")
+    candidates = tuple(
+        dict.fromkeys(
+            name
+            for name in (
+                libcudart_name,
+                "libcudart.so",
+                "libcudart.so.12",
+                "libcudart.so.11.0",
+            )
+            if name is not None
+        )
+    )
+    load_errors: list[str] = []
+    for candidate in candidates:
+        try:
+            lib = ctypes.CDLL(candidate)
+        except OSError as exc:
+            load_errors.append(f"{candidate}: {exc}")
+            continue
+
+        try:
+            start = lib.cudaProfilerStart
+            stop = lib.cudaProfilerStop
+        except AttributeError as exc:
+            load_errors.append(f"{candidate}: {exc}")
+            continue
+
+        start.restype = ctypes.c_int
+        stop.restype = ctypes.c_int
+        start.argtypes = []
+        stop.argtypes = []
+        return lib, start, stop
+
+    details = "; ".join(load_errors) if load_errors else "no candidates found"
+    raise RuntimeError(
+        "Unable to load CUDA profiler APIs from libcudart; "
+        "cannot enable --nsys-profile. "
+        f"Load attempts: {details}"
+    )
+
+
+def _nsys_profile_start_if_enabled(*, enabled: bool) -> None:
+    """Start an Nsight focused-profiling capture range if enabled."""
+    if not enabled:
+        return
+    _, start, _ = _load_cuda_profiler_api()
+    result = start()
+    if result != 0:
+        raise RuntimeError(
+            f"cudaProfilerStart() failed with CUDA runtime error code {result}."
+        )
+
+
+def _nsys_profile_stop_if_enabled(*, enabled: bool) -> None:
+    """Stop an Nsight focused-profiling capture range if enabled."""
+    if not enabled:
+        return
+    _, _, stop = _load_cuda_profiler_api()
+    result = stop()
+    if result != 0:
+        raise RuntimeError(
+            f"cudaProfilerStop() failed with CUDA runtime error code {result}."
+        )
+
+
+@contextlib.contextmanager
+def _nsys_profile_capture_range(*, enabled: bool) -> Iterator[None]:
+    """Context manager for Nsight focused-profiling capture ranges."""
+    _nsys_profile_start_if_enabled(enabled=enabled)
+    try:
+        yield
+    finally:
+        _nsys_profile_stop_if_enabled(enabled=enabled)
 
 
 @dataclasses.dataclass
@@ -925,7 +1008,8 @@ def run_polars_query_iteration(
     result_casts: list[pl.Expr] | None = None,
 ) -> SuccessRecord:
     """Run a single query iteration. Caller must wrap in try/except."""
-    result, duration = execute_query(q_id, iteration, q, run_config, args, engine)
+    with _nsys_profile_capture_range(enabled=args.nsys_profile):
+        result, duration = execute_query(q_id, iteration, q, run_config, args, engine)
 
     if expected is not None and prepare_validation_result is not None:
         result = prepare_validation_result(result)
@@ -1897,6 +1981,15 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
         help="Collect data tracing cudf-polars execution.",
     )
     parser.add_argument(
+        "--nsys-profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=textwrap.dedent("""\
+            Use Nsight Systems focused profiling by bracketing each query iteration
+            with cudaProfilerStart/cudaProfilerStop capture ranges. Use this with:
+            nsys profile --capture-range=cudaProfilerApi --capture-range-end=repeat ..."""),
+    )
+    parser.add_argument(
         "--debug",
         default=False,
         action="store_true",
@@ -2097,7 +2190,6 @@ def run_polars(benchmark: Any, args: argparse.Namespace) -> None:
             "cudf-polars tracing only applies to GPU frontends "
             "(in-memory, dask, ray, spmd)."
         )
-
     if run_config.validation_method is not None:
         validate_against = run_config.validation_method.expected_source
         if validate_against == run_config.frontend:
