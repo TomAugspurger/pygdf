@@ -845,20 +845,6 @@ def _sink_to_file(
     return True
 
 
-def _columnchunk_metadata_from_footers(
-    footers: list[plc.io.parquet_metadata.FileMetaData],
-) -> dict[str, list[int]]:
-    columnchunk_metadata: dict[str, list[int]] = {}
-    for fmd in footers:
-        for rg in fmd.row_groups:
-            for col in rg.columns:
-                name = ".".join(col.meta_data.path_in_schema)
-                columnchunk_metadata.setdefault(name, []).append(
-                    col.meta_data.total_uncompressed_size
-                )
-    return columnchunk_metadata
-
-
 class ParquetMetadata:
     """
     Parquet metadata container.
@@ -949,7 +935,7 @@ class ParquetMetadata:
                 sum(uncompressed_sizes[start:end])
                 for (start, end) in itertools.pairwise(rowgroup_offsets_per_file)
             ]
-            for name, uncompressed_sizes in _columnchunk_metadata_from_footers(
+            for name, uncompressed_sizes in plc.io.parquet_metadata.columnchunk_metadata(
                 sample_footers
             ).items()
         }

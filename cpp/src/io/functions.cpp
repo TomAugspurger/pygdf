@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -665,6 +665,13 @@ std::vector<parquet::FileMetaData> read_parquet_footers(
 {
   CUDF_FUNC_RANGE();
   return detail_parquet::read_parquet_footers(sources);
+}
+
+parquet_metadata::column_chunk_metadata columnchunk_metadata(
+  std::vector<parquet::FileMetaData>&& parquet_metadatas)
+{
+  CUDF_FUNC_RANGE();
+  return detail_parquet::columnchunk_metadata(std::move(parquet_metadatas));
 }
 
 /**

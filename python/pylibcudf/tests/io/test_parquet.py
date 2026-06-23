@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import io
 import os
@@ -445,6 +445,40 @@ def test_file_metadata_row_groups_and_column_chunks() -> None:
                 == pa_col_chunk.total_compressed_size
             )
             assert meta_data.path_in_schema[-1] == pa_col_chunk.path_in_schema
+
+
+def test_columnchunk_metadata_from_footers() -> None:
+    table = pa.table(
+        {
+            "id": list(range(100)),
+            "nested": pa.array(
+                [{"x": i, "y": i * 2} for i in range(100)],
+                type=pa.struct([("x", pa.int64()), ("y", pa.int64())]),
+            ),
+        }
+    )
+    sink = io.BytesIO()
+    write_table(table, sink, row_group_size=20)
+    sink.seek(0)
+
+    source_info = plc.io.SourceInfo([sink])
+    footers = plc.io.parquet_metadata.read_parquet_footers(source_info)
+    from_footers = plc.io.parquet_metadata.columnchunk_metadata(footers)
+    from_metadata = plc.io.parquet_metadata.read_parquet_metadata(
+        source_info
+    ).columnchunk_metadata()
+
+    assert from_footers == from_metadata
+    assert "nested.x" in from_footers
+    assert "nested.y" in from_footers
+
+
+def test_columnchunk_metadata_requires_file_metadata() -> None:
+    with pytest.raises(
+        TypeError,
+        match="parquet_metadatas must contain only FileMetaData objects",
+    ):
+        plc.io.parquet_metadata.columnchunk_metadata([object()])
 
 
 def test_file_metadata_wrappers_not_directly_constructible() -> None:

@@ -325,6 +325,58 @@ def test_parquet_metadata_reads_footers(
     assert metadata.row_count == df.height
 
 
+def test_parquet_metadata_column_chunk_sizes_match_footer_walk(
+    tmp_path: pathlib.Path,
+    df_and_schema: tuple[pl.DataFrame, Schema],
+) -> None:
+    df, _schema = df_and_schema
+    make_partitioned_source(
+        df,
+        tmp_path,
+        "parquet",
+        n_files=2,
+        row_group_size=max(1, df.height // 10),
+    )
+    paths = tuple(str(path) for path in sorted(tmp_path.iterdir()))
+    metadata = ParquetMetadata(paths, max_footer_samples=10)
+
+    assert metadata.file_metadata is not None
+    sample_footers = list(metadata.file_metadata)
+
+    manual_columnchunk_metadata: dict[str, list[int]] = {}
+    for fmd in sample_footers:
+        for rg in fmd.row_groups:
+            for col in rg.columns:
+                name = ".".join(col.meta_data.path_in_schema)
+                manual_columnchunk_metadata.setdefault(name, []).append(
+                    col.meta_data.total_uncompressed_size
+                )
+
+    wrapper_columnchunk_metadata = plc.io.parquet_metadata.columnchunk_metadata(
+        sample_footers
+    )
+    assert wrapper_columnchunk_metadata == manual_columnchunk_metadata
+
+    row_group_counts = [len(fmd.row_groups) for fmd in sample_footers]
+    rowgroup_offsets_per_file = [0]
+    for count in row_group_counts:
+        rowgroup_offsets_per_file.append(rowgroup_offsets_per_file[-1] + count)
+
+    expected_means = {}
+    for name, uncompressed_sizes in wrapper_columnchunk_metadata.items():
+        per_file_sizes = [
+            sum(
+                uncompressed_sizes[
+                    rowgroup_offsets_per_file[i] : rowgroup_offsets_per_file[i + 1]
+                ]
+            )
+            for i in range(len(row_group_counts))
+        ]
+        expected_means[name] = int(sum(per_file_sizes) / len(per_file_sizes))
+
+    assert metadata.mean_size_per_file == expected_means
+
+
 def test_dataframe_round_trip() -> None:
     info = DataFrameSourceInfo(2500)
     data = info.serialize()

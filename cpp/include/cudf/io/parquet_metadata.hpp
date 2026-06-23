@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -293,6 +293,19 @@ parquet_metadata read_parquet_metadata(source_info const& src_info);
  */
 std::vector<parquet::FileMetaData> read_parquet_footers(
   cudf::host_span<std::unique_ptr<cudf::io::datasource> const> sources);
+
+/**
+ * @brief Builds column chunk metadata from parquet file footers.
+ *
+ * @ingroup io_readers
+ *
+ * @param parquet_metadatas Input parquet file footer metadata.
+ *
+ * @return Map of column names to vectors of `total_uncompressed_size` metadata from all their
+ *         column chunks.
+ */
+parquet_metadata::column_chunk_metadata columnchunk_metadata(
+  std::vector<parquet::FileMetaData>&& parquet_metadatas);
 
 /** @} */  // end of group
 }  // namespace io
