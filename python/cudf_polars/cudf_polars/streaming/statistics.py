@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """Utilities for tracking scan statistics."""
@@ -8,7 +8,7 @@ from __future__ import annotations
 import concurrent.futures
 from typing import TYPE_CHECKING
 
-from cudf_polars.dsl.ir import DataFrameScan, Scan
+from cudf_polars.dsl.ir import DataFrameScan, ParquetScan
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.base import StatsCollector
 from cudf_polars.streaming.io import _build_source_info
@@ -42,18 +42,19 @@ def collect_statistics(
     """
     # Group parquet Scan nodes by paths, accumulating the union of needed columns
     # across all Scan nodes that read the same files.
-    parquet_groups: dict[tuple[str, ...], tuple[set[str], Schema, list[Scan]]] = {}
+    parquet_groups: dict[
+        tuple[str, ...], tuple[set[str], Schema, list[ParquetScan]]
+    ] = {}
     dataframe_scans: list[DataFrameScan] = []
     for node in traversal([root]):
-        if isinstance(node, Scan):
-            if node.typ == "parquet":
-                paths_key = tuple(node.paths)
-                if paths_key not in parquet_groups:
-                    parquet_groups[paths_key] = (set(), {}, [])
-                needed_cols, schema, scan_nodes = parquet_groups[paths_key]
-                needed_cols.update(node.schema.keys())
-                schema.update(node.schema)
-                scan_nodes.append(node)
+        if isinstance(node, ParquetScan):
+            paths_key = tuple(node.paths)
+            if paths_key not in parquet_groups:
+                parquet_groups[paths_key] = (set(), {}, [])
+            needed_cols, schema, scan_nodes = parquet_groups[paths_key]
+            needed_cols.update(node.schema.keys())
+            schema.update(node.schema)
+            scan_nodes.append(node)
         elif isinstance(node, DataFrameScan):
             dataframe_scans.append(node)
 

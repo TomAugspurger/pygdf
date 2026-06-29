@@ -412,24 +412,39 @@ def _(node: plrs._ir_nodes.Scan, translator: Translator, schema: Schema) -> ir.I
                     f"Reading compressed {typ.upper()} files is not supported."
                 )
 
-    return ir.Scan(
-        schema,
-        typ,
-        reader_options,
-        cloud_options,
-        paths,
-        with_columns,
-        skip_rows,
-        n_rows,
-        row_index,
-        include_file_paths,
-        (
-            None
-            if node.predicate is None
-            else translate_predicate(translator, n=node.predicate, schema=schema)
-        ),
-        parquet_options,
+    predicate = (
+        None
+        if node.predicate is None
+        else translate_predicate(translator, n=node.predicate, schema=schema)
     )
+    if typ == "parquet":
+        return ir.ParquetScan(
+            schema,
+            cloud_options,
+            paths,
+            with_columns,
+            skip_rows,
+            n_rows,
+            row_index,
+            include_file_paths,
+            predicate,
+            parquet_options,
+        )
+    if typ in ("csv", "ndjson"):
+        return ir.Scan(
+            schema,
+            typ,
+            reader_options,
+            cloud_options,
+            paths,
+            with_columns,
+            skip_rows,
+            n_rows,
+            row_index,
+            include_file_paths,
+            predicate,
+        )
+    raise NotImplementedError(f"Unhandled scan type: {typ}")  # pragma: no cover
 
 
 @_translate_ir.register

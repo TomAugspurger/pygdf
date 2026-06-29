@@ -21,6 +21,7 @@ from cudf_polars.dsl.ir import (
     IR,
     DataFrameScan,
     Empty,
+    ParquetScan,
     Scan,
     Sink,
 )
@@ -41,7 +42,6 @@ if TYPE_CHECKING:
     from collections.abc import Hashable, MutableMapping, Sequence
 
     from cudf_polars.containers import DataFrame, DataType
-    from cudf_polars.dsl.expr import NamedExpr
     from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.base import (
         DataSourceInfo,
@@ -76,34 +76,35 @@ def _(
 
 
 def scan_partition_plan(
-    ir: Scan, stats: StatsCollector, config_options: ConfigOptions[StreamingExecutor]
+    ir: ParquetScan,
+    stats: StatsCollector,
+    config_options: ConfigOptions[StreamingExecutor],
 ) -> IOPartitionPlan:
     """Extract the partitioning plan of a Scan operation."""
-    if ir.typ == "parquet":
-        blocksize: int = config_options.executor.target_partition_size
-        if source := stats.scan_stats.get(ir):
-            column_sizes = [
-                sz
-                for col in ir.schema
-                if (sz := source.column_storage_size(col)) is not None
-            ]
-            if (file_size := sum(column_sizes)) > 0:
-                if file_size > blocksize:
-                    # Split large files
-                    factor = math.ceil(file_size / blocksize)
-                    return IOPartitionPlan(
-                        factor,
-                        IOPartitionFlavor.SPLIT_FILES,
-                        estimated_chunk_bytes=file_size // factor,
-                    )
-                else:
-                    # Fuse small files
-                    factor = min(max(blocksize // int(file_size), 1), len(ir.paths))
-                    return IOPartitionPlan(
-                        factor,
-                        IOPartitionFlavor.FUSED_FILES,
-                        estimated_chunk_bytes=file_size * factor,
-                    )
+    blocksize: int = config_options.executor.target_partition_size
+    if source := stats.scan_stats.get(ir):
+        column_sizes = [
+            sz
+            for col in ir.schema
+            if (sz := source.column_storage_size(col)) is not None
+        ]
+        if (file_size := sum(column_sizes)) > 0:
+            if file_size > blocksize:
+                # Split large files
+                factor = math.ceil(file_size / blocksize)
+                return IOPartitionPlan(
+                    factor,
+                    IOPartitionFlavor.SPLIT_FILES,
+                    estimated_chunk_bytes=file_size // factor,
+                )
+            else:
+                # Fuse small files
+                factor = min(max(blocksize // int(file_size), 1), len(ir.paths))
+                return IOPartitionPlan(
+                    factor,
+                    IOPartitionFlavor.FUSED_FILES,
+                    estimated_chunk_bytes=file_size * factor,
+                )
 
     # TODO: Use file sizes for csv and json
     return IOPartitionPlan(1, IOPartitionFlavor.SINGLE_FILE)
@@ -116,13 +117,12 @@ def _rank_slice(total: int, rank: int, nranks: int) -> tuple[int, int]:
 
 
 def expand_scan_for_rank(
-    ir: Scan,
+    ir: Scan | ParquetScan,
     plan: IOPartitionPlan,
     partition_count: int,
     *,
     rank: int,
     nranks: int,
-    parquet_options: ParquetOptions,
 ) -> StreamingScan:
     """
     Expand a Scan node into a rank-local StreamingScan.
@@ -139,8 +139,6 @@ def expand_scan_for_rank(
         Rank of the current worker.
     nranks
         Number of workers.
-    parquet_options
-        Parquet reader options.
 
     Returns
     -------
@@ -148,13 +146,14 @@ def expand_scan_for_rank(
         Rank-local streaming scan.
     """
     if plan.flavor == IOPartitionFlavor.SPLIT_FILES:
+        if not isinstance(ir, ParquetScan):  # pragma: no cover
+            raise TypeError("Split-file planning is only supported for ParquetScan.")
         return StreamingScan.for_split_files(
             ir,
             plan,
             partition_count,
             rank=rank,
             nranks=nranks,
-            parquet_options=parquet_options,
         )
     else:
         return StreamingScan.for_fused_files(
@@ -163,7 +162,6 @@ def expand_scan_for_rank(
             partition_count,
             rank=rank,
             nranks=nranks,
-            parquet_options=parquet_options,
         )
 
 
@@ -179,7 +177,6 @@ class SplitScan(IR):
 
     __slots__ = (
         "base_scan",
-        "parquet_options",
         "paths",
         "schema",
         "split_index",
@@ -191,10 +188,9 @@ class SplitScan(IR):
         "paths",
         "split_index",
         "total_splits",
-        "parquet_options",
     )
-    _n_non_child_args = 13
-    base_scan: Scan
+    _n_non_child_args = 4
+    base_scan: ParquetScan
     """Scan operation this node is based on."""
     paths: list[str]
     """File path for this split task."""
@@ -202,17 +198,14 @@ class SplitScan(IR):
     """Index of the current split."""
     total_splits: int
     """Total number of splits."""
-    parquet_options: ParquetOptions
-    """Parquet-specific options."""
 
     def __init__(
         self,
         schema: Schema,
-        base_scan: Scan,
+        base_scan: ParquetScan,
         paths: list[str],
         split_index: int,
         total_splits: int,
-        parquet_options: ParquetOptions,
     ):
         self.schema = schema
         self.base_scan = base_scan
@@ -222,24 +215,10 @@ class SplitScan(IR):
         self._non_child_args = (
             split_index,
             total_splits,
-            base_scan.schema,
-            base_scan.typ,
-            base_scan.reader_options,
+            base_scan,
             paths,
-            base_scan.with_columns,
-            base_scan.skip_rows,
-            base_scan.n_rows,
-            base_scan.row_index,
-            base_scan.include_file_paths,
-            base_scan.predicate,
-            parquet_options,
         )
-        self.parquet_options = parquet_options
         self.children = ()
-        if base_scan.typ not in ("parquet",):  # pragma: no cover
-            raise NotImplementedError(
-                f"Unhandled Scan type for file splitting: {base_scan.typ}"
-            )
 
     def get_hashable(self) -> Hashable:
         """Hashable representation of the node."""
@@ -250,7 +229,6 @@ class SplitScan(IR):
             tuple(self.paths),
             self.split_index,
             self.total_splits,
-            self.parquet_options,
         )
 
     @classmethod
@@ -258,24 +236,12 @@ class SplitScan(IR):
         cls,
         split_index: int,
         total_splits: int,
-        schema: Schema,
-        typ: str,
-        reader_options: dict[str, Any],
+        base_scan: ParquetScan,
         paths: list[str],
-        with_columns: list[str] | None,
-        skip_rows: int,
-        n_rows: int,
-        row_index: tuple[str, int] | None,
-        include_file_paths: str | None,
-        predicate: NamedExpr | None,
-        parquet_options: ParquetOptions,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
-        if typ not in ("parquet",):  # pragma: no cover
-            raise NotImplementedError(f"Unhandled Scan type for file splitting: {typ}")
-
         if len(paths) > 1:  # pragma: no cover
             raise ValueError(f"Expected a single path, got: {paths}")
 
@@ -322,18 +288,16 @@ class SplitScan(IR):
         with nvtx_annotate_cudf_polars(
             message=f"SplitScan: {paths[0]} [{split_index + 1}/{total_splits}]"
         ):
-            return Scan.do_evaluate(
-                schema,
-                typ,
-                reader_options,
+            return ParquetScan.do_evaluate(
+                base_scan.schema,
                 paths,
-                with_columns,
+                base_scan.with_columns,
                 skip_rows,
                 n_rows,
-                row_index,
-                include_file_paths,
-                predicate,
-                parquet_options,
+                base_scan.row_index,
+                base_scan.include_file_paths,
+                base_scan.predicate,
+                base_scan.parquet_options,
                 context=context,
             )
 
@@ -348,7 +312,6 @@ class FusedScan(IR):
 
     __slots__ = (
         "base_scan",
-        "parquet_options",
         "paths",
         "schema",
     )
@@ -356,39 +319,25 @@ class FusedScan(IR):
         "schema",
         "base_scan",
         "paths",
-        "parquet_options",
     )
-    _n_non_child_args = 11
-    base_scan: Scan
+    _n_non_child_args = 2
+    base_scan: Scan | ParquetScan
     """Scan operation this node is based on."""
     paths: list[str]
     """File paths assigned to this task."""
-    parquet_options: ParquetOptions
-    """Parquet-specific options."""
 
     def __init__(
         self,
         schema: Schema,
-        base_scan: Scan,
+        base_scan: Scan | ParquetScan,
         paths: list[str],
-        parquet_options: ParquetOptions,
     ):
         self.schema = schema
         self.base_scan = base_scan
         self.paths = paths
-        self.parquet_options = parquet_options
         self._non_child_args = (
-            base_scan.schema,
-            base_scan.typ,
-            base_scan.reader_options,
+            base_scan,
             paths,
-            base_scan.with_columns,
-            base_scan.skip_rows,
-            base_scan.n_rows,
-            base_scan.row_index,
-            base_scan.include_file_paths,
-            base_scan.predicate,
-            parquet_options,
         )
         self.children = ()
 
@@ -399,40 +348,42 @@ class FusedScan(IR):
             tuple(self.schema.items()),
             self.base_scan.get_hashable(),
             tuple(self.paths),
-            self.parquet_options,
         )
 
     @classmethod
     def do_evaluate(
         cls,
-        schema: Schema,
-        typ: str,
-        reader_options: dict[str, Any],
+        base_scan: Scan | ParquetScan,
         paths: list[str],
-        with_columns: list[str] | None,
-        skip_rows: int,
-        n_rows: int,
-        row_index: tuple[str, int] | None,
-        include_file_paths: str | None,
-        predicate: NamedExpr | None,
-        parquet_options: ParquetOptions,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
         """Evaluate and return a dataframe."""
         with nvtx_annotate_cudf_polars(message=f"FusedScan: {', '.join(paths)}"):
+            if isinstance(base_scan, ParquetScan):
+                return ParquetScan.do_evaluate(
+                    base_scan.schema,
+                    paths,
+                    base_scan.with_columns,
+                    base_scan.skip_rows,
+                    base_scan.n_rows,
+                    base_scan.row_index,
+                    base_scan.include_file_paths,
+                    base_scan.predicate,
+                    base_scan.parquet_options,
+                    context=context,
+                )
             return Scan.do_evaluate(
-                schema,
-                typ,
-                reader_options,
+                base_scan.schema,
+                base_scan.typ,
+                base_scan.reader_options,
                 paths,
-                with_columns,
-                skip_rows,
-                n_rows,
-                row_index,
-                include_file_paths,
-                predicate,
-                parquet_options,
+                base_scan.with_columns,
+                base_scan.skip_rows,
+                base_scan.n_rows,
+                base_scan.row_index,
+                base_scan.include_file_paths,
+                base_scan.predicate,
                 context=context,
             )
 
@@ -445,7 +396,7 @@ def _(
 
 
 def can_use_native_parquet_node(
-    ir: Scan,
+    ir: ParquetScan,
     *,
     plan: IOPartitionPlan,
     count: int,
@@ -496,7 +447,6 @@ def can_use_native_parquet_node(
     return (
         parquet_options.use_rapidsmpf_native
         and (count > 1 or _dynamic_planning_on(config_options))
-        and ir.typ == "parquet"
         and ir.row_index is None
         and ir.include_file_paths is None
         and ir.n_rows == -1
@@ -505,18 +455,13 @@ def can_use_native_parquet_node(
     )
 
 
-@lower_ir_node.register(Scan)
+@lower_ir_node.register(ParquetScan)
 def _(
-    ir: Scan, rec: LowerIRTransformer
+    ir: ParquetScan, rec: LowerIRTransformer
 ) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
     config_options = rec.state["config_options"]
     parquet_options = config_options.parquet_options
-    if (
-        ir.typ in ("csv", "parquet", "ndjson")
-        and ir.n_rows == -1
-        and ir.skip_rows == 0
-        and ir.row_index is None
-    ):
+    if ir.n_rows == -1 and ir.skip_rows == 0 and ir.row_index is None:
         # NOTE: We calculate the expected partition count
         # to help trigger fallback warnings in lower_ir_graph.
         # The generate_ir_sub_network logic is NOT required
@@ -550,7 +495,29 @@ def _(
         count,
         rank=rec.state["rank"],
         nranks=rec.state["nranks"],
-        parquet_options=parquet_options,
+    )
+    return new_ir, {new_ir: PartitionInfo(count=count, io_plan=plan)}
+
+
+@lower_ir_node.register(Scan)
+def _(
+    ir: Scan, rec: LowerIRTransformer
+) -> tuple[IR, MutableMapping[IR, PartitionInfo]]:
+    if ir.n_rows == -1 and ir.skip_rows == 0 and ir.row_index is None:
+        plan = IOPartitionPlan(factor=1, flavor=IOPartitionFlavor.SINGLE_FILE)
+        count = len(ir.paths)
+    else:
+        plan = IOPartitionPlan(
+            factor=len(ir.paths),
+            flavor=IOPartitionFlavor.SINGLE_READ,
+        )
+        count = 1
+    new_ir = expand_scan_for_rank(
+        ir,
+        plan,
+        count,
+        rank=rec.state["rank"],
+        nranks=rec.state["nranks"],
     )
     return new_ir, {new_ir: PartitionInfo(count=count, io_plan=plan)}
 
@@ -569,10 +536,12 @@ class StreamingScan(IR):
     )
     _n_non_child_args = 2
     scans: Sequence[SplitScan] | Sequence[FusedScan]
-    base_scan: Scan
+    base_scan: Scan | ParquetScan
 
     def __init__(
-        self, scans: Sequence[SplitScan] | Sequence[FusedScan], base_scan: Scan
+        self,
+        scans: Sequence[SplitScan] | Sequence[FusedScan],
+        base_scan: Scan | ParquetScan,
     ):
         self.scans = scans
         self.base_scan = base_scan
@@ -583,13 +552,12 @@ class StreamingScan(IR):
     @classmethod
     def for_split_files(
         cls,
-        base_scan: Scan,
+        base_scan: ParquetScan,
         plan: IOPartitionPlan,
         partition_count: int,
         *,
         rank: int,
         nranks: int,
-        parquet_options: ParquetOptions,
     ) -> Self:
         """Construct a StreamingScan where each file is split into factor partitions."""
         local_offset, local_count = _rank_slice(partition_count, rank, nranks)
@@ -608,7 +576,6 @@ class StreamingScan(IR):
                         [path],
                         sindex,
                         plan.factor,
-                        parquet_options,
                     )
                 )
                 sindex += 1
@@ -619,13 +586,12 @@ class StreamingScan(IR):
     @classmethod
     def for_fused_files(
         cls,
-        base_scan: Scan,
+        base_scan: Scan | ParquetScan,
         plan: IOPartitionPlan,
         partition_count: int,
         *,
         rank: int,
         nranks: int,
-        parquet_options: ParquetOptions,
     ) -> Self:
         """Construct a StreamingScan where factor files are grouped into one partition."""
         local_offset, local_count = _rank_slice(partition_count, rank, nranks)
@@ -636,7 +602,6 @@ class StreamingScan(IR):
                 base_scan.schema,
                 base_scan,
                 base_scan.paths[offset : offset + plan.factor],
-                parquet_options,
             )
             for offset in range(paths_start, paths_end, plan.factor)
             if base_scan.paths[offset : offset + plan.factor]
@@ -652,7 +617,7 @@ class StreamingScan(IR):
     def do_evaluate(
         cls,
         scans: Sequence[SplitScan] | Sequence[FusedScan],
-        base_scan: Scan,
+        base_scan: Scan | ParquetScan,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
@@ -1131,7 +1096,7 @@ def _build_parquet_source(
 
 
 def _build_source_info(
-    ir: Scan | DataFrameScan,
+    ir: ParquetScan | DataFrameScan,
     config_options: ConfigOptions[StreamingExecutor],
     *,
     needed_cols: frozenset[str] | None = None,
@@ -1140,7 +1105,7 @@ def _build_source_info(
     """Return DataSourceInfo for a Scan or DataFrameScan node."""
     if isinstance(ir, DataFrameScan):
         return DataFrameSourceInfo.from_polars(pl.DataFrame._from_pydf(ir.df))
-    elif isinstance(ir, Scan) and ir.typ == "parquet":
+    elif isinstance(ir, ParquetScan):
         max_footer = config_options.parquet_options.max_footer_samples
         max_rg = config_options.parquet_options.max_row_group_samples
         needed_cols = frozenset(ir.schema) if needed_cols is None else needed_cols
@@ -1148,7 +1113,7 @@ def _build_source_info(
         paths = tuple(ir.paths)
         return _build_parquet_source(paths, needed_cols, schema, max_footer, max_rg)
     else:  # pragma: no cover
-        raise ValueError(f"Unsupported Scan type: {ir.typ}")
+        raise TypeError(f"Unsupported source info input: {type(ir).__name__}")
 
 
 def _clear_source_info_cache() -> None:

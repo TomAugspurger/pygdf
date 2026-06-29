@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """Parallel Select Logic."""
 
@@ -11,7 +11,15 @@ import polars as pl
 
 from cudf_polars.dsl import expr
 from cudf_polars.dsl.expr import Col, Len
-from cudf_polars.dsl.ir import Empty, HConcat, HStack, Projection, Scan, Select, Union
+from cudf_polars.dsl.ir import (
+    Empty,
+    HConcat,
+    HStack,
+    ParquetScan,
+    Projection,
+    Select,
+    Union,
+)
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.dsl.utils.naming import unique_names
 from cudf_polars.streaming.base import PartitionInfo
@@ -413,25 +421,28 @@ def _(
         )
 
     # Fast count optimization - reads parquet metadata only, works regardless of partitioning
-    scan_child: Scan | None = None
+    scan_child: ParquetScan | None = None
     if Select._is_len_expr(ir.exprs):
         if (
             isinstance(child, Union)
             and len(child.children) == 1
-            and isinstance(child.children[0], Scan)
+            and isinstance(child.children[0], ParquetScan)
         ):
             # Task engine case
             scan_child = child.children[0]
         elif isinstance(child, StreamingScan):  # pragma: no cover
             # RapidsMPF case
-            scan_child = child.base_scan
-        elif isinstance(child, Scan):  # pragma: no cover; Requires rapidsmpf runtime
+            if isinstance(child.base_scan, ParquetScan):
+                scan_child = child.base_scan
+        elif isinstance(
+            child, ParquetScan
+        ):  # pragma: no cover; Requires rapidsmpf runtime
             # Legacy task-engine case
             scan_child = child
 
-    if scan_child and scan_child.predicate is None and scan_child.typ == "parquet":
+    if scan_child and scan_child.predicate is None:
         # Special Case: Fast count.
-        count = Scan._get_parquet_row_count_from_metadata(
+        count = ParquetScan._get_row_count_from_metadata(
             scan_child.paths, scan_child.skip_rows, scan_child.n_rows
         )
         dtype = ir.exprs[0].value.dtype

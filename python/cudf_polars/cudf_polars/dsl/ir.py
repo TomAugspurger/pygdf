@@ -97,6 +97,7 @@ __all__ = [
     "Join",
     "MapFunction",
     "MergeSorted",
+    "ParquetScan",
     "Projection",
     "PythonScan",
     "Reduce",
@@ -422,7 +423,6 @@ class Scan(IR):
         "cloud_options",
         "include_file_paths",
         "n_rows",
-        "parquet_options",
         "paths",
         "predicate",
         "reader_options",
@@ -443,10 +443,9 @@ class Scan(IR):
         "row_index",
         "include_file_paths",
         "predicate",
-        "parquet_options",
     )
-    _n_non_child_args = 11
-    typ: str
+    _n_non_child_args = 10
+    typ: Literal["csv", "ndjson"]
     """What type of file are we reading? Parquet, CSV, etc..."""
     reader_options: dict[str, Any]
     """Reader-specific options, as dictionary."""
@@ -466,16 +465,11 @@ class Scan(IR):
     """Include the path of the source file(s) as a column with this name."""
     predicate: expr.NamedExpr | None
     """Mask to apply to the read dataframe."""
-    parquet_options: ParquetOptions
-    """Parquet-specific options."""
-
-    PARQUET_DEFAULT_CHUNK_SIZE: int = 0  # unlimited
-    PARQUET_DEFAULT_PASS_LIMIT: int = 16 * 1024**3  # 16GiB
 
     def __init__(
         self,
         schema: Schema,
-        typ: str,
+        typ: Literal["csv", "ndjson"],
         reader_options: dict[str, Any],
         cloud_options: dict[str, Any] | None,
         paths: list[str],
@@ -485,7 +479,6 @@ class Scan(IR):
         row_index: tuple[str, int] | None,
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
-        parquet_options: ParquetOptions,
     ):
         self.schema = schema
         self.typ = typ
@@ -509,14 +502,8 @@ class Scan(IR):
             row_index,
             include_file_paths,
             predicate,
-            parquet_options,
         )
         self.children = ()
-        self.parquet_options = parquet_options
-        if self.typ not in ("csv", "parquet", "ndjson"):  # pragma: no cover
-            # This line is unhittable ATM since IPC/Anonymous scan raise
-            # on the polars side
-            raise NotImplementedError(f"Unhandled scan type: {self.typ}")
         if self.typ == "ndjson" and (self.n_rows != -1 or self.skip_rows != 0):
             raise NotImplementedError("row limit in scan for json reader")
         if self.skip_rows < 0:
@@ -582,15 +569,6 @@ class Scan(IR):
             if include_file_paths is not None:
                 # TODO: Need to populate num_rows_per_source in read_json in libcudf
                 raise NotImplementedError("Including file paths in a json scan.")
-        elif (
-            self.typ == "parquet"
-            and self.row_index is not None
-            and self.with_columns is not None
-            and len(self.with_columns) == 0
-        ):
-            raise NotImplementedError(
-                "Reading only parquet metadata to produce row index."
-            )
 
     def get_hashable(self) -> Hashable:
         """
@@ -613,7 +591,6 @@ class Scan(IR):
             self.row_index,
             self.include_file_paths,
             self.predicate,
-            self.parquet_options,
         )
 
     @staticmethod
@@ -645,26 +622,13 @@ class Scan(IR):
             [Column(filepaths, name=name, dtype=dtype)], stream=df.stream
         )
 
-    @staticmethod
-    @nvtx_annotate_cudf_polars(message="Scan._get_parquet_row_count_from_metadata")
-    def _get_parquet_row_count_from_metadata(
-        paths: list[str], skip_rows: int, n_rows: int
-    ) -> int:
-        # Zero-width parquet files lose their row count when read through
-        # pylibcudf. See https://github.com/rapidsai/cudf/issues/21428
-        meta = plc.io.parquet_metadata.read_parquet_metadata(plc.io.SourceInfo(paths))
-        num_rows = meta.num_rows() - skip_rows
-        if n_rows != -1:
-            num_rows = min(num_rows, n_rows)
-        return max(num_rows, 0)
-
     @classmethod
     @log_do_evaluate
     @nvtx_annotate_cudf_polars(message="Scan")
     def do_evaluate(
         cls,
         schema: Schema,
-        typ: str,
+        typ: Literal["csv", "ndjson"],
         reader_options: dict[str, Any],
         paths: list[str],
         with_columns: list[str] | None,
@@ -673,7 +637,6 @@ class Scan(IR):
         row_index: tuple[str, int] | None,
         include_file_paths: str | None,
         predicate: expr.NamedExpr | None,
-        parquet_options: ParquetOptions,
         *,
         context: IRExecutionContext,
     ) -> DataFrame:
@@ -788,91 +751,7 @@ class Scan(IR):
                     [t.num_rows() for t in tables],
                     df,
                 )
-        elif typ == "parquet":
-            filters = None
-            if predicate is not None and row_index is None:
-                # Can't apply filters during read if we have a row index.
-                filters = to_parquet_filter(
-                    _prepare_parquet_predicate(
-                        predicate.value, paths, schema, with_columns
-                    ),
-                    stream=stream,
-                )
-            parquet_reader_options = (
-                plc.io.parquet.ParquetReaderOptions.builder(plc.io.SourceInfo(paths))
-                .decimal_width(plc.TypeId.DECIMAL128)
-                .build()
-            )
-
-            if with_columns is not None:
-                parquet_reader_options.set_column_names(with_columns)
-            if filters is not None:
-                parquet_reader_options.set_filter(filters)
-            if n_rows != -1:
-                parquet_reader_options.set_num_rows(n_rows)
-            if skip_rows != 0:
-                parquet_reader_options.set_skip_rows(skip_rows)
-            if parquet_options.chunked:
-                reader = plc.io.parquet.ChunkedParquetReader(
-                    parquet_reader_options,
-                    chunk_read_limit=parquet_options.chunk_read_limit,
-                    pass_read_limit=parquet_options.pass_read_limit,
-                    stream=stream,
-                )
-                chunk = reader.read_chunk()
-                # TODO: Nested column names
-                names = chunk.column_names(include_children=False)
-                concatenated_columns = chunk.tbl.columns()
-                while reader.has_next():
-                    columns = reader.read_chunk().tbl.columns()
-                    # Discard columns while concatenating to reduce memory footprint.
-                    # Reverse order to avoid O(n^2) list popping cost.
-                    for i in reversed(range(len(concatenated_columns))):
-                        concatenated_columns[i] = plc.concatenate.concatenate(
-                            [concatenated_columns[i], columns.pop()], stream=stream
-                        )
-                num_rows = (
-                    cls._get_parquet_row_count_from_metadata(paths, skip_rows, n_rows)
-                    if not names
-                    else None
-                )
-                df = DataFrame.from_table(
-                    plc.Table(concatenated_columns),
-                    names=names,
-                    dtypes=[schema[name] for name in names],
-                    stream=stream,
-                    num_rows=num_rows,
-                )
-                if include_file_paths is not None:
-                    df = Scan.add_file_paths(  # pragma: no cover
-                        include_file_paths, paths, chunk.num_rows_per_source, df
-                    )
-            else:
-                tbl_w_meta = plc.io.parquet.read_parquet(
-                    parquet_reader_options, stream=stream
-                )
-                # TODO: consider nested column names?
-                col_names = tbl_w_meta.column_names(include_children=False)
-                num_rows = (
-                    cls._get_parquet_row_count_from_metadata(paths, skip_rows, n_rows)
-                    if not col_names
-                    else None
-                )
-                df = DataFrame.from_table(
-                    tbl_w_meta.tbl,
-                    col_names,
-                    [schema[name] for name in col_names],
-                    stream=stream,
-                    num_rows=num_rows,
-                )
-                if include_file_paths is not None:
-                    df = Scan.add_file_paths(
-                        include_file_paths, paths, tbl_w_meta.num_rows_per_source, df
-                    )
-            if filters is not None:
-                # Mask must have been applied.
-                return df
-        elif typ == "ndjson":
+        else:
             json_schema: list[plc.io.json.NameAndType] = [
                 (name, typ.plc_type, []) for name, typ in schema.items()
             ]
@@ -897,10 +776,6 @@ class Scan(IR):
             if row_index is not None:
                 col_order.remove(row_index[0])
             df = df.select(col_order)
-        else:
-            raise NotImplementedError(
-                f"Unhandled scan type: {typ}"
-            )  # pragma: no cover; post init trips first
         if row_index is not None:
             name, offset = row_index
             offset += skip_rows
@@ -928,6 +803,268 @@ class Scan(IR):
                 predicate.evaluate(df), target_length=df.num_rows, stream=df.stream
             )
             return df.filter(mask)
+
+
+class ParquetScan(IR):
+    """Input from parquet files."""
+
+    __slots__ = (
+        "cloud_options",
+        "include_file_paths",
+        "n_rows",
+        "parquet_options",
+        "paths",
+        "predicate",
+        "row_index",
+        "skip_rows",
+        "with_columns",
+    )
+    _non_child = (
+        "schema",
+        "cloud_options",
+        "paths",
+        "with_columns",
+        "skip_rows",
+        "n_rows",
+        "row_index",
+        "include_file_paths",
+        "predicate",
+        "parquet_options",
+    )
+    _n_non_child_args = 9
+    typ: Literal["parquet"] = "parquet"
+    """Fixed scan type for parquet."""
+    cloud_options: dict[str, Any] | None
+    """Cloud-related authentication options, currently ignored."""
+    paths: list[str]
+    """List of paths to read from."""
+    with_columns: list[str] | None
+    """Projected columns to return."""
+    skip_rows: int
+    """Rows to skip at the start when reading."""
+    n_rows: int
+    """Number of rows to read after skipping."""
+    row_index: tuple[str, int] | None
+    """If not None add an integer index column of the given name."""
+    include_file_paths: str | None
+    """Include the path of the source file(s) as a column with this name."""
+    predicate: expr.NamedExpr | None
+    """Mask to apply to the read dataframe."""
+    parquet_options: ParquetOptions
+    """Parquet-specific options."""
+
+    def __init__(
+        self,
+        schema: Schema,
+        cloud_options: dict[str, Any] | None,
+        paths: list[str],
+        with_columns: list[str] | None,
+        skip_rows: int,
+        n_rows: int,
+        row_index: tuple[str, int] | None,
+        include_file_paths: str | None,
+        predicate: expr.NamedExpr | None,
+        parquet_options: ParquetOptions,
+    ):
+        self.schema = schema
+        self.cloud_options = cloud_options
+        self.paths = paths
+        self.with_columns = with_columns
+        self.skip_rows = skip_rows
+        self.n_rows = n_rows
+        self.row_index = row_index
+        self.include_file_paths = include_file_paths
+        self.predicate = predicate
+        self.parquet_options = parquet_options
+        self._non_child_args = (
+            schema,
+            paths,
+            with_columns,
+            skip_rows,
+            n_rows,
+            row_index,
+            include_file_paths,
+            predicate,
+            parquet_options,
+        )
+        self.children = ()
+        if self.skip_rows < 0:
+            # TODO: polars has this implemented for parquet,
+            # maybe we can do this too?
+            raise NotImplementedError("slice pushdown for negative slices")
+        if self.cloud_options is not None and any(
+            self.cloud_options.get(k) is not None for k in ("aws", "azure", "gcp")
+        ):
+            raise NotImplementedError(
+                "Read from cloud storage"
+            )  # pragma: no cover; no test yet
+        if (
+            self.row_index is not None
+            and self.with_columns is not None
+            and len(self.with_columns) == 0
+        ):
+            raise NotImplementedError(
+                "Reading only parquet metadata to produce row index."
+            )
+
+    def get_hashable(self) -> Hashable:
+        """Hashable representation of the node."""
+        schema_hash = tuple(self.schema.items())
+        return (
+            type(self),
+            schema_hash,
+            json.dumps(self.cloud_options),
+            tuple(self.paths),
+            tuple(self.with_columns) if self.with_columns is not None else None,
+            self.skip_rows,
+            self.n_rows,
+            self.row_index,
+            self.include_file_paths,
+            self.predicate,
+            self.parquet_options,
+        )
+
+    @staticmethod
+    @nvtx_annotate_cudf_polars(message="ParquetScan._get_row_count_from_metadata")
+    def _get_row_count_from_metadata(
+        paths: list[str], skip_rows: int, n_rows: int
+    ) -> int:
+        # Zero-width parquet files lose their row count when read through
+        # pylibcudf. See https://github.com/rapidsai/cudf/issues/21428
+        meta = plc.io.parquet_metadata.read_parquet_metadata(plc.io.SourceInfo(paths))
+        num_rows = meta.num_rows() - skip_rows
+        if n_rows != -1:
+            num_rows = min(num_rows, n_rows)
+        return max(num_rows, 0)
+
+    @classmethod
+    @log_do_evaluate
+    @nvtx_annotate_cudf_polars(message="ParquetScan")
+    def do_evaluate(
+        cls,
+        schema: Schema,
+        paths: list[str],
+        with_columns: list[str] | None,
+        skip_rows: int,
+        n_rows: int,
+        row_index: tuple[str, int] | None,
+        include_file_paths: str | None,
+        predicate: expr.NamedExpr | None,
+        parquet_options: ParquetOptions,
+        *,
+        context: IRExecutionContext,
+    ) -> DataFrame:
+        """Evaluate and return a dataframe."""
+        stream = context.get_cuda_stream()
+        filters = None
+        if predicate is not None and row_index is None:
+            # Can't apply filters during read if we have a row index.
+            filters = to_parquet_filter(
+                _prepare_parquet_predicate(
+                    predicate.value, paths, schema, with_columns
+                ),
+                stream=stream,
+            )
+        parquet_reader_options = (
+            plc.io.parquet.ParquetReaderOptions.builder(plc.io.SourceInfo(paths))
+            .decimal_width(plc.TypeId.DECIMAL128)
+            .build()
+        )
+
+        if with_columns is not None:
+            parquet_reader_options.set_column_names(with_columns)
+        if filters is not None:
+            parquet_reader_options.set_filter(filters)
+        if n_rows != -1:
+            parquet_reader_options.set_num_rows(n_rows)
+        if skip_rows != 0:
+            parquet_reader_options.set_skip_rows(skip_rows)
+        if parquet_options.chunked:
+            reader = plc.io.parquet.ChunkedParquetReader(
+                parquet_reader_options,
+                chunk_read_limit=parquet_options.chunk_read_limit,
+                pass_read_limit=parquet_options.pass_read_limit,
+                stream=stream,
+            )
+            chunk = reader.read_chunk()
+            # TODO: Nested column names
+            names = chunk.column_names(include_children=False)
+            concatenated_columns = chunk.tbl.columns()
+            while reader.has_next():
+                columns = reader.read_chunk().tbl.columns()
+                # Discard columns while concatenating to reduce memory footprint.
+                # Reverse order to avoid O(n^2) list popping cost.
+                for i in reversed(range(len(concatenated_columns))):
+                    concatenated_columns[i] = plc.concatenate.concatenate(
+                        [concatenated_columns[i], columns.pop()], stream=stream
+                    )
+            num_rows = (
+                cls._get_row_count_from_metadata(paths, skip_rows, n_rows)
+                if not names
+                else None
+            )
+            df = DataFrame.from_table(
+                plc.Table(concatenated_columns),
+                names=names,
+                dtypes=[schema[name] for name in names],
+                stream=stream,
+                num_rows=num_rows,
+            )
+            if include_file_paths is not None:
+                df = Scan.add_file_paths(  # pragma: no cover
+                    include_file_paths, paths, chunk.num_rows_per_source, df
+                )
+        else:
+            tbl_w_meta = plc.io.parquet.read_parquet(
+                parquet_reader_options, stream=stream
+            )
+            # TODO: consider nested column names?
+            col_names = tbl_w_meta.column_names(include_children=False)
+            num_rows = (
+                cls._get_row_count_from_metadata(paths, skip_rows, n_rows)
+                if not col_names
+                else None
+            )
+            df = DataFrame.from_table(
+                tbl_w_meta.tbl,
+                col_names,
+                [schema[name] for name in col_names],
+                stream=stream,
+                num_rows=num_rows,
+            )
+            if include_file_paths is not None:
+                df = Scan.add_file_paths(
+                    include_file_paths, paths, tbl_w_meta.num_rows_per_source, df
+                )
+        if filters is not None:
+            # Mask must have been applied.
+            return df
+        if row_index is not None:
+            name, offset = row_index
+            offset += skip_rows
+            dtype = schema[name]
+            step = plc.Scalar.from_py(1, dtype.plc_type, stream=stream)
+            init = plc.Scalar.from_py(offset, dtype.plc_type, stream=stream)
+            index_col = Column(
+                plc.filling.sequence(df.num_rows, init, step, stream=stream),
+                is_sorted=plc.types.Sorted.YES,
+                order=plc.types.Order.ASCENDING,
+                null_order=plc.types.NullOrder.AFTER,
+                name=name,
+                dtype=dtype,
+            )
+            df = DataFrame([index_col, *df.columns], stream=df.stream)
+            # Reorder to the row-index column is always first.
+            df = df.select(schema) if next(iter(schema)) != name else df
+        assert all(
+            c.obj.type() == schema[name].plc_type for name, c in df.column_map.items()
+        )
+        if predicate is None:
+            return df
+        (mask,) = broadcast(
+            predicate.evaluate(df), target_length=df.num_rows, stream=df.stream
+        )
+        return df.filter(mask)
 
 
 class Sink(IR):
@@ -1524,14 +1661,13 @@ class Select(IR):
             translation phase should fail earlier.
         """
         if (
-            isinstance(self.children[0], Scan)
+            isinstance(self.children[0], ParquetScan)
             and Select._is_len_expr(self.exprs)
-            and self.children[0].typ == "parquet"
             and self.children[0].predicate is None
         ):  # pragma: no cover
             stream = context.get_cuda_stream()
             scan = self.children[0]
-            effective_rows = Scan._get_parquet_row_count_from_metadata(
+            effective_rows = ParquetScan._get_row_count_from_metadata(
                 scan.paths, scan.skip_rows, scan.n_rows
             )
             dtype = DataType(pl.UInt32())

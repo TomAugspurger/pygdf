@@ -29,13 +29,14 @@ from cudf_polars.dsl.ir import (
     GroupBy,
     HStack,
     Join,
+    ParquetScan,
     Scan,
     Select,
     Sort,
 )
 from cudf_polars.dsl.translate import Translator
 from cudf_polars.dsl.traversal import traversal
-from cudf_polars.streaming.base import IOPartitionFlavor
+from cudf_polars.streaming.base import IOPartitionFlavor, IOPartitionPlan
 from cudf_polars.streaming.io import StreamingScan, scan_partition_plan
 from cudf_polars.streaming.parallel import lower_ir_graph
 from cudf_polars.streaming.shuffle import Shuffle
@@ -168,7 +169,10 @@ def collect_partition_plan(
         if source is None:
             continue
 
-        plan = scan_partition_plan(base_scan, stats, config)
+        if isinstance(base_scan, ParquetScan):
+            plan = scan_partition_plan(base_scan, stats, config)
+        else:
+            plan = IOPartitionPlan(factor=1, flavor=IOPartitionFlavor.SINGLE_FILE)
         projected_bytes = sum(
             sz
             for col in base_scan.schema
@@ -394,6 +398,7 @@ def _repr_ir_tree(
         and config is not None
         and stats is not None
         and isinstance(ir, StreamingScan)
+        and isinstance(ir.base_scan, ParquetScan)
         and (source := stats.scan_stats.get(ir.base_scan)) is not None
     ):
         plan = scan_partition_plan(ir.base_scan, stats, config)

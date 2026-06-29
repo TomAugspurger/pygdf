@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import polars as pl
 
 from cudf_polars import Translator
 from cudf_polars.containers import DataType
-from cudf_polars.dsl.ir import IRExecutionContext, Scan
+from cudf_polars.dsl.ir import IRExecutionContext, ParquetScan
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.streaming.base import IOPartitionFlavor, IOPartitionPlan
 from cudf_polars.streaming.io import (
@@ -181,11 +181,9 @@ def test_scan_union(engine: pl.GPUEngine, tmp_path: Path) -> None:
     assert_gpu_result_equal(q, engine=engine)
 
 
-def _make_parquet_scan(paths: list[str]) -> Scan:
-    return Scan(
+def _make_parquet_scan(paths: list[str]) -> ParquetScan:
+    return ParquetScan(
         {"x": DataType(pl.Int64())},
-        "parquet",
-        {},
         None,
         paths,
         None,
@@ -239,7 +237,6 @@ def test_expand_scan_for_rank_fused_and_single_read(
         partition_count,
         rank=rank,
         nranks=nranks,
-        parquet_options=ParquetOptions(),
     )
     for scan, expected_paths in zip(
         streaming_scan.scans, expected_path_groups, strict=True
@@ -268,7 +265,6 @@ def test_expand_scan_for_rank_split_files(
         partition_count,
         rank=rank,
         nranks=2,
-        parquet_options=ParquetOptions(),
     )
     assert len(streaming_scan.scans) == len(expected_splits)
     for scan, (split_index, total_splits) in zip(
@@ -283,7 +279,7 @@ def test_expand_scan_for_rank_split_files(
 def test_streaming_scan_raises() -> None:
     # This isn't reachable by normal cudf-polars usage.
     scan = _make_parquet_scan(["file.parquet"])
-    fused = FusedScan(scan.schema, scan, scan.paths, scan.parquet_options)
+    fused = FusedScan(scan.schema, scan, scan.paths)
     ctx = IRExecutionContext()
     with pytest.raises(NotImplementedError, match=r"StreamingScan.do_evaluate"):
         StreamingScan.do_evaluate([fused], scan, context=ctx)
