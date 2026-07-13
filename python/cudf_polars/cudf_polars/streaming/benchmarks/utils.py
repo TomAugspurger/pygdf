@@ -372,10 +372,10 @@ def get_data(path: str | Path, table_name: str, suffix: str = "") -> pl.LazyFram
     local filesystem, falls back to scanning ``{path}/{table_name}`` as a
     directory of parquet files.
     """
-    file_path = Path(path) / f"{table_name}{suffix}"
-    if suffix and not file_path.exists():
-        # Directory-based layout: e.g. tpch-rs partitioned output
-        return pl.scan_parquet(Path(path) / table_name)
+    file_path = f"{path}/{table_name}{suffix}"
+    # if suffix and not file_path.exists():
+    #     # Directory-based layout: e.g. tpch-rs partitioned output
+    #     return pl.scan_parquet(Path(path) / table_name)
     return pl.scan_parquet(file_path)
 
 
