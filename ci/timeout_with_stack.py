@@ -107,13 +107,16 @@ def capture_stack_trace(pid: int, stack_type=StackType.C) -> None:
     """
     if stack_type is StackType.C:
         bt_command = "thread apply all bt"
-        print(f"\nCapturing C stack trace for process {pid}:")
+        print(f"\nCapturing C stack trace for process {pid}:", flush=True)
     else:
         bt_command = "thread apply all py-bt"
-        print(f"\nCapturing Python stack trace for process {pid}:")
+        print(f"\nCapturing Python stack trace for process {pid}:", flush=True)
     gdb = shutil.which("gdb")
     if gdb is None:
-        print(f"Skipping stack trace for process {pid}: gdb not found")
+        print(
+            f"Skipping stack trace for process {pid}: gdb not found",
+            flush=True,
+        )
         return
 
     try:
@@ -138,12 +141,12 @@ def capture_stack_trace(pid: int, stack_type=StackType.C) -> None:
             timeout=120,
         )
     except subprocess.TimeoutExpired:
-        print(f"Timed out capturing stack trace for process {pid}")
+        print(f"Timed out capturing stack trace for process {pid}", flush=True)
         return
 
-    print(proc.stdout)
+    print(proc.stdout, flush=True)
     if proc.stderr:
-        print(proc.stderr, file=sys.stderr)
+        print(proc.stderr, file=sys.stderr, flush=True)
 
 
 def capture_all_stacks(pid: int, *, enable_python: bool = False) -> None:
@@ -246,7 +249,7 @@ def install_signal_handler(pid: int, *signals: signal.Signals) -> None:
     """
 
     def handler(signum: int, frame: FrameType | None) -> None:
-        print(f"Received {signum=}, terminating process tree")
+        print(f"Received {signum=}, terminating process tree", flush=True)
         terminate_process_tree(pid)
         sys.exit(signum)
 
@@ -311,17 +314,17 @@ def run_with_timeout(
                 return process.returncode
             time.sleep(0.1)
 
-        print(f"\nProcess timed out after {timeout} seconds")
-        print("Capturing stack traces for all processes...")
+        print(f"\nProcess timed out after {timeout} seconds", flush=True)
+        print("Capturing stack traces for all processes...", flush=True)
 
         # Capture stacks for parent and all children
         capture_all_stacks(process.pid, enable_python=enable_python)
 
         # Terminate the entire process tree
-        print("\nTerminating process tree...")
+        print("\nTerminating process tree...", flush=True)
         terminate_process_tree(process.pid)
     except KeyboardInterrupt:
-        print("\nReceived keyboard interrupt")
+        print("\nReceived keyboard interrupt", flush=True)
         terminate_process_tree(process.pid)
         return signal.SIGINT
     else:
