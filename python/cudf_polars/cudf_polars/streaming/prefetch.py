@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -210,6 +211,40 @@ def _plan_hybrid_scan_prefetch(
         filter_host=None,
         payload_host=None,
     )
+
+
+def record_scan_byte_ranges(
+    scan: SplitScan,
+    stream: Stream,
+) -> dict | None:
+    """Plan byte ranges for one scan and return a JSON-serializable record, or None."""
+    planned = _plan_hybrid_scan_prefetch(scan, stream)
+    if planned is None or not planned.row_group_indices:
+        return None
+    return {
+        "path": scan.paths[0],
+        "split_index": scan.split_index,
+        "total_splits": scan.total_splits,
+        "row_group_indices": planned.row_group_indices,
+        "filter_ranges": [
+            {"offset": r.offset, "size": r.size} for r in planned.filter_ranges
+        ],
+        "payload_ranges": [
+            {"offset": r.offset, "size": r.size} for r in planned.payload_ranges
+        ],
+    }
+
+
+def _serialize_byte_ranges(file_path: str, records: list[dict]) -> None:
+    """Write a list of byte-range records to a JSON file."""
+    with open(file_path, "w") as f:
+        json.dump(records, f)
+
+
+def _load_byte_ranges(file_path: str) -> list[dict]:
+    """Load byte-range records from a JSON file."""
+    with open(file_path) as f:
+        return json.load(f)
 
 
 def prefetch_scan_byte_ranges(
@@ -544,3 +579,183 @@ class HybridScanPrefetchExecutor:
     def result(self, task_idx: int) -> PrefetchedByteRanges | None:
         """Block until the prefetch result for ``task_idx`` is ready."""
         return self.futures[task_idx].result()
+
+    def wait_all(self) -> None:
+        """Block until every prefetch future has completed.
+
+        Call this before starting the scan loop when you want all data
+        resident in pinned host memory before any scan task runs
+        (scenario a: perfect foresight + wait).
+        """
+        for f in self.futures:
+            f.result()
+
+    @classmethod
+    def record_to_file(
+        cls,
+        scans: list[SplitScan],
+        file_path: str,
+        num_workers: int,
+    ) -> None:
+        """Run _plan_hybrid_scan_prefetch for all scans and save results to a JSON file.
+
+        This is the "record" half of the prefetching_byte_ranges experiment:
+        it eagerly computes which byte ranges would be requested (including
+        stats/bloom pruning) and persists them so a later run can replay them
+        without any planning overhead.
+        """
+        executor = ThreadPoolExecutor(
+            max_workers=num_workers,
+            initializer=cls.init_stream,
+            thread_name_prefix="hybrid-record",
+        )
+        futures = [
+            executor.submit(
+                record_scan_byte_ranges,
+                scan,
+                cls.thread_local.stream,
+            )
+            for scan in scans
+        ]
+        executor.shutdown(wait=True)
+        records = [f.result() for f in futures if f.result() is not None]
+        _serialize_byte_ranges(file_path, records)
+
+    @classmethod
+    def from_file(
+        cls,
+        scans: list[SplitScan],
+        file_path: str,
+        num_workers: int,
+        context: Context,
+        cucascade_pool_capacity: int | None = None,
+        cucascade_n_reactors: int | None = None,
+        cucascade_max_connections: int | None = None,
+        cucascade_chunk_size: int | None = None,
+        cucascade_max_n_chunks: int | None = None,
+        cucascade_enable_cache: bool = False,
+    ) -> Self:
+        """Create a prefetch executor from pre-recorded byte ranges.
+
+        This is the "replay" half of the prefetching_byte_ranges experiment.
+        It issues all datasource.fadvise() calls immediately (before any scan
+        task runs), then submits background tasks that skip stats pruning and
+        go straight to PinnedBuffer allocation + read_all_ranges_async.
+
+        Combine with wait_all() to block until all IO completes before the
+        first scan task starts (scenario a: pinned-memory read).
+        Without wait_all() you get scenario b: perfect foresight, no wait.
+        """
+        if cucascade is None:
+            raise ImportError(
+                "HybridScanPrefetchExecutor.from_file requires the cucascade package"
+            )
+
+        records = _load_byte_ranges(file_path)
+        # Build lookup: (path, split_index, total_splits) -> record
+        lookup: dict[tuple[str, int, int], dict] = {
+            (r["path"], r["split_index"], r["total_splits"]): r for r in records
+        }
+
+        first_path = scans[0].paths[0] if scans else ""
+        engine = _get_cucascade_engine(
+            first_path,
+            cucascade_pool_capacity,
+            cucascade_n_reactors,
+            cucascade_max_connections,
+            cucascade_chunk_size,
+            cucascade_max_n_chunks,
+            cucascade_enable_cache,
+        )
+
+        _, dev_id = cudart.cudaGetDevice()
+        pinned_mr = context.br().pinned_mr
+        if pinned_mr is None:
+            raise ValueError(
+                "HybridScanPrefetchExecutor.from_file requires a PinnedMemoryResource; "
+                "enable pinned memory via --pinned-memory."
+            )
+        loop = asyncio.get_running_loop()
+
+        # Open one datasource per unique file path.
+        datasource_cache: dict[str, Any] = {}
+        for scan in scans:
+            path = scan.paths[0]
+            if path not in datasource_cache:
+                datasource_cache[path] = engine.open(path)
+
+        # Issue ALL fadvise calls immediately so cucascade starts downloading
+        # everything before the first scan task even starts (perfect foresight).
+        for scan in scans:
+            key = (scan.paths[0], scan.split_index, scan.total_splits)
+            record = lookup.get(key)
+            if record is None:
+                continue
+            all_ranges = record["filter_ranges"] + record["payload_ranges"]
+            if not all_ranges:
+                continue
+            datasource = datasource_cache[scan.paths[0]].duplicate()
+            datasource.fadvise(
+                [(r["offset"], r["size"]) for r in all_ranges], dev_id
+            )
+
+        executor = ThreadPoolExecutor(
+            max_workers=num_workers,
+            initializer=cls.init_stream,
+            thread_name_prefix="hybrid-prefetch-file",
+        )
+
+        def task(s: SplitScan) -> PrefetchedByteRanges | None:
+            key = (s.paths[0], s.split_index, s.total_splits)
+            record = lookup.get(key)
+            if record is None:
+                return None
+
+            stream = cls.thread_local.stream
+            filter_ranges = [
+                plc.io.text.ByteRangeInfo(r["offset"], r["size"])
+                for r in record["filter_ranges"]
+            ]
+            payload_ranges = [
+                plc.io.text.ByteRangeInfo(r["offset"], r["size"])
+                for r in record["payload_ranges"]
+            ]
+            row_group_indices: list[int] = record["row_group_indices"]
+
+            filter_bytes = sum(r.size for r in filter_ranges)
+            payload_bytes = sum(r.size for r in payload_ranges)
+
+            if not filter_bytes and not payload_bytes:
+                return PrefetchedByteRanges.empty()
+
+            datasource = datasource_cache[s.paths[0]].duplicate()
+
+            filter_buf = PinnedBuffer(pinned_mr, filter_bytes, stream, context, loop)
+            payload_buf = PinnedBuffer(pinned_mr, payload_bytes, stream, context, loop)
+
+            filter_future = datasource.read_all_ranges_async(
+                [(r.offset, r.size) for r in filter_ranges], filter_buf.array
+            )
+            payload_future = datasource.read_all_ranges_async(
+                [(r.offset, r.size) for r in payload_ranges], payload_buf.array
+            )
+
+            return PrefetchedByteRanges(
+                row_group_indices=row_group_indices,
+                filter_ranges=filter_ranges,
+                payload_ranges=payload_ranges,
+                filter_host=filter_buf.array,
+                payload_host=payload_buf.array,
+                filter_futures=[filter_future],
+                payload_futures=[payload_future],
+                filter_buf=filter_buf,
+                payload_buf=payload_buf,
+            )
+
+        futures = [executor.submit(task, scan) for scan in scans]
+        return cls(
+            futures,
+            executor,
+            engine=engine,
+            datasource_cache=datasource_cache,
+        )
