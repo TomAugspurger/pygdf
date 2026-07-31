@@ -413,14 +413,16 @@ def _get_cucascade_engine(
             if plc.io.SourceInfo._is_remote_uri(path):
                 # TODO: replace with cucascade.RestEngine.from_environment() once
                 # cuCascade exposes a factory that reads standard AWS env vars directly.
-                _cucascade_engine = cucascade.RestEngine(
-                    access_key_id=os.environ.get("AWS_ACCESS_KEY_ID", ""),
-                    secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
-                    session_token=os.environ.get("AWS_SESSION_TOKEN", ""),
-                    region=os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
-                    endpoint=os.environ.get("AWS_ENDPOINT_URL", ""),
-                    **kwargs,
-                )
+                rest_kwargs: dict[str, Any] = {
+                    "access_key_id": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+                    "secret_access_key": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+                    "session_token": os.environ.get("AWS_SESSION_TOKEN", ""),
+                    "region": os.environ.get("AWS_DEFAULT_REGION", "us-east-1"),
+                }
+                endpoint = os.environ.get("AWS_ENDPOINT_URL", "")
+                if endpoint:
+                    rest_kwargs["endpoint"] = endpoint
+                _cucascade_engine = cucascade.RestEngine(**rest_kwargs, **kwargs)
             else:
                 _cucascade_engine = cucascade.UringEngine(**kwargs)
     return _cucascade_engine
