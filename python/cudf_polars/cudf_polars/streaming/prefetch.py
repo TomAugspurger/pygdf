@@ -601,6 +601,11 @@ class HybridScanPrefetchExecutor:
                 continue
             for io_f in (*res.filter_futures, *res.payload_futures):
                 io_f.get()
+            # Clear so copy_host_ranges_to_device doesn't call .get() a second
+            # time on the same cucascade IOFutures (which may be one-shot).
+            # The data is already in the pinned buffer; the copy still works.
+            res.filter_futures.clear()
+            res.payload_futures.clear()
 
     @classmethod
     def record_to_file(
