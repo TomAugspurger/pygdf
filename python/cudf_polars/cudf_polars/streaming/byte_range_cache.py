@@ -5,8 +5,8 @@ Prototype byte-range recorder and pinned-host cache for hybrid-scan prefetch.
 
 This is a process-scoped prototype for manually recording parquet byte-range
 reads issued via kvikio ``pread``, dumping them to JSON, and pre-populating a
-pinned (or host) cache so subsequent ``pread_ranges`` calls can skip HTTP/CuFile
-I/O on exact ``(path, offset, size)`` hits.
+pinned (or host) cache so subsequent ``pread_ranges`` calls can reuse an
+already-packed buffer on an exact ordered range-group hit.
 
 Cache entries allocated from a ``PinnedMemoryResource`` do **not** participate
 in rapidsmpf ``reserve_memory`` accounting and may oversubscribe the pinned
@@ -18,7 +18,7 @@ from __future__ import annotations
 import ctypes
 import json
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -42,20 +42,42 @@ def byte_view(buf: memoryview) -> memoryview:
 
 
 @dataclass(frozen=True)
-class ByteRangeRequest:
-    """A single file byte-range request."""
+class ByteRange:
+    """One file byte range."""
 
-    path: str
     offset: int
     size: int
 
-    def as_key(self) -> tuple[str, int, int]:
-        """Return the cache key for this request."""
-        return (self.path, self.offset, self.size)
+
+@dataclass(frozen=True)
+class ByteRangeRequest:
+    """One ordered group of ranges packed into a single host buffer."""
+
+    path: str
+    ranges: tuple[ByteRange, ...]
+
+    def as_key(self) -> tuple[str, tuple[tuple[int, int], ...]]:
+        """Return the cache key for this packed request."""
+        return (
+            self.path,
+            tuple((r.offset, r.size) for r in self.ranges),
+        )
+
+    @property
+    def nbytes(self) -> int:
+        """Return the packed buffer size."""
+        return sum(r.size for r in self.ranges)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable form with ``ranges`` as a list."""
+        return {
+            "path": self.path,
+            "ranges": [{"offset": r.offset, "size": r.size} for r in self.ranges],
+        }
 
 
 class _CacheEntry:
-    """Owns host bytes for one cached range (pinned MR or plain bytearray)."""
+    """Owns one packed range-group buffer (pinned MR or plain bytearray)."""
 
     __slots__ = ("array", "nbytes", "pinned")
 
@@ -66,22 +88,21 @@ class _CacheEntry:
 
     def __init__(
         self,
-        data: memoryview,
+        nbytes: int,
         *,
         pinned_mr: PinnedMemoryResource | None = None,
         stream: Stream | None = None,
     ) -> None:
-        self.nbytes = len(data)
+        self.nbytes = nbytes
         if pinned_mr is not None and stream is not None:
             ptr = pinned_mr.allocate(self.nbytes, stream)
             self.pinned = (pinned_mr, ptr, stream)
             self.array = byte_view(
                 memoryview((ctypes.c_uint8 * self.nbytes).from_address(ptr))
             )
-            self.array[:] = byte_view(data)
         else:
             self.pinned = None
-            self.array = memoryview(bytearray(byte_view(data)))
+            self.array = memoryview(bytearray(self.nbytes))
 
     def __del__(self) -> None:
         # Guard against partial init (e.g. if allocate raised).
@@ -92,11 +113,11 @@ class _CacheEntry:
 
 
 class ByteRangeCache:
-    """Exact-match ``(path, offset, size)`` host/pinned cache."""
+    """Exact-match ordered range-group host/pinned cache."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._entries: dict[tuple[str, int, int], _CacheEntry] = {}
+        self._entries: dict[tuple[str, tuple[tuple[int, int], ...]], _CacheEntry] = {}
         self._pinned_mr: PinnedMemoryResource | None = None
         self._stream: Stream | None = None
 
@@ -110,26 +131,51 @@ class ByteRangeCache:
             self._pinned_mr = pinned_mr
             self._stream = stream
 
-    def get(self, path: str, offset: int, size: int) -> memoryview | None:
-        """Return a view of cached bytes, or ``None`` on miss."""
+    def get(
+        self,
+        path: str,
+        ranges: Sequence[ByteRange],
+    ) -> memoryview | None:
+        """Return the already-packed cached buffer, or ``None`` on miss."""
+        key = (path, tuple((r.offset, r.size) for r in ranges))
         with self._lock:
-            entry = self._entries.get((path, offset, size))
+            entry = self._entries.get(key)
             return None if entry is None else entry.array
 
-    def put(self, path: str, offset: int, size: int, data: memoryview) -> None:
-        """Store a copy of ``data`` under ``(path, offset, size)``."""
-        if len(data) != size:
-            raise ValueError(
-                f"data length {len(data)} does not match size={size} "
-                f"for {path!r} offset={offset}"
-            )
-        entry = _CacheEntry(
-            data,
-            pinned_mr=self._pinned_mr,
-            stream=self._stream,
-        )
+    def allocate(self, request: ByteRangeRequest) -> _CacheEntry:
+        """Allocate an uninitialized packed entry for direct pread writes."""
         with self._lock:
-            self._entries[(path, offset, size)] = entry
+            pinned_mr = self._pinned_mr
+            stream = self._stream
+        return _CacheEntry(
+            request.nbytes,
+            pinned_mr=pinned_mr,
+            stream=stream,
+        )
+
+    def put(
+        self,
+        request: ByteRangeRequest,
+        data: memoryview,
+    ) -> None:
+        """Store a packed copy of ``data`` for ``request``."""
+        if len(data) != request.nbytes:
+            raise ValueError(
+                f"data length {len(data)} does not match packed size="
+                f"{request.nbytes} for {request.path!r}"
+            )
+        entry = self.allocate(request)
+        entry.array[:] = byte_view(data)
+        self.put_entry(request, entry)
+
+    def put_entry(
+        self,
+        request: ByteRangeRequest,
+        entry: _CacheEntry,
+    ) -> None:
+        """Install a populated cache-owned entry."""
+        with self._lock:
+            self._entries[request.as_key()] = entry
 
     def clear(self) -> None:
         """Drop all cached entries."""
@@ -141,7 +187,10 @@ class ByteRangeCache:
         with self._lock:
             return len(self._entries)
 
-    def __contains__(self, key: tuple[str, int, int]) -> bool:
+    def __contains__(
+        self,
+        key: tuple[str, tuple[tuple[int, int], ...]],
+    ) -> bool:
         """Return whether ``key`` is present."""
         with self._lock:
             return key in self._entries
@@ -178,19 +227,23 @@ def clear_recorded_byte_ranges() -> None:
         _recorded.clear()
 
 
-def record_byte_range(path: str, offset: int, size: int) -> None:
-    """Record one byte-range request when recording is enabled."""
+def record_byte_ranges(
+    path: str,
+    ranges: Sequence[ByteRange],
+) -> None:
+    """Record one ordered packed range group when recording is enabled."""
     if not _recording_enabled:
         return
+    request = ByteRangeRequest(path=path, ranges=tuple(ranges))
     with _recorder_lock:
         if _recording_enabled:
-            _recorded.append(ByteRangeRequest(path=path, offset=offset, size=size))
+            _recorded.append(request)
 
 
 def get_recorded_byte_ranges() -> list[dict[str, Any]]:
-    """Return recorded ranges as JSON-serializable dicts."""
+    """Return recorded packed range groups as JSON-serializable dicts."""
     with _recorder_lock:
-        return [asdict(r) for r in _recorded]
+        return [r.to_dict() for r in _recorded]
 
 
 def dump_recorded_byte_ranges(path: str | Path) -> None:
@@ -202,7 +255,7 @@ def dump_recorded_byte_ranges(path: str | Path) -> None:
 
 
 def load_byte_range_requests(path: str | Path) -> list[dict[str, Any]]:
-    """Load a JSON list of ``{path, offset, size}`` requests."""
+    """Load a JSON list of ``{path, ranges: [{offset, size}, ...]}`` groups."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise TypeError(f"expected a JSON list in {path}, got {type(data).__name__}")
@@ -214,14 +267,72 @@ def _coerce_range_requests(
 ) -> list[ByteRangeRequest]:
     if isinstance(ranges, str | Path):
         ranges = load_byte_range_requests(ranges)
-    return [
-        ByteRangeRequest(
-            path=str(item["path"]),
-            offset=int(item["offset"]),
-            size=int(item["size"]),
+    requests = []
+    for item in ranges:
+        raw_ranges = item.get("ranges")
+        if not isinstance(raw_ranges, list):
+            raise TypeError(
+                "each cache request must contain a 'ranges' list; "
+                "re-record byte ranges with the packed-cache implementation"
+            )
+        requests.append(
+            ByteRangeRequest(
+                path=str(item["path"]),
+                ranges=tuple(
+                    ByteRange(offset=int(r["offset"]), size=int(r["size"]))
+                    for r in raw_ranges
+                ),
+            )
         )
-        for item in ranges
-    ]
+    return requests
+
+
+def _batched_by_reads(
+    requests: Sequence[ByteRangeRequest],
+    batch_size: int,
+) -> list[list[ByteRangeRequest]]:
+    """Group requests so each batch issues at most ``batch_size`` range reads."""
+    batches: list[list[ByteRangeRequest]] = []
+    current: list[ByteRangeRequest] = []
+    reads = 0
+    for request in requests:
+        request_reads = len(request.ranges)
+        if current and reads + request_reads > batch_size:
+            batches.append(current)
+            current = []
+            reads = 0
+        current.append(request)
+        reads += request_reads
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _populate_batch(
+    cache: ByteRangeCache,
+    handle: Any,
+    batch: Sequence[ByteRangeRequest],
+) -> None:
+    """Read one batch of groups directly into cache-owned packed buffers."""
+    pending: list[tuple[ByteRangeRequest, _CacheEntry]] = []
+    futures = []
+    for request in batch:
+        entry = cache.allocate(request)
+        offset = 0
+        for byte_range in request.ranges:
+            futures.append(
+                handle.pread(
+                    entry.array[offset : offset + byte_range.size],
+                    size=byte_range.size,
+                    file_offset=byte_range.offset,
+                )
+            )
+            offset += byte_range.size
+        pending.append((request, entry))
+    for future in futures:
+        future.get()
+    for request, entry in pending:
+        cache.put_entry(request, entry)
 
 
 def _open_handle(path: str) -> Any:
@@ -241,39 +352,40 @@ def populate_byte_range_cache(
     progress: bool = False,
 ) -> int:
     """
-    Manually fetch byte ranges into the process-global host/pinned cache.
+    Manually fetch packed byte-range groups into the process-global cache.
 
-    Reads are issued in concurrent batches per file; a serial read-and-wait
-    loop is far too slow for the thousands of small ranges a scan produces.
+    Each request gets one cache-owned contiguous allocation. Its range reads
+    write directly into their final packed offsets, so a later cache hit can
+    pass that allocation directly to H2D without a host-to-host gather.
 
     Parameters
     ----------
     ranges
-        Either a list of ``{"path", "offset", "size"}`` dicts or a path to a
-        JSON file produced by :func:`dump_recorded_byte_ranges`.
+        Either a list of ``{"path", "ranges": [{"offset", "size"}, ...]}``
+        dicts or a path to JSON produced by
+        :func:`dump_recorded_byte_ranges`.
     pinned_mr
         Optional pinned memory resource. When provided (with ``stream``),
         cache entries are allocated from this pool.
     stream
         CUDA stream paired with ``pinned_mr`` for allocate/deallocate.
     batch_size
-        Number of reads submitted before waiting on the batch.
+        Approximate maximum number of range reads submitted before waiting.
     progress
         Print per-batch progress.
 
     Returns
     -------
     int
-        Number of newly populated cache entries (duplicates and existing hits
-        are skipped).
+        Number of newly populated packed groups.
     """
     cache = get_byte_range_cache()
     if pinned_mr is not None or stream is not None:
         cache.configure(pinned_mr=pinned_mr, stream=stream)
 
     requests = _coerce_range_requests(ranges)
-    # Preserve first-seen order while deduplicating.
-    unique: dict[tuple[str, int, int], ByteRangeRequest] = {}
+    # Preserve first-seen order while deduplicating exact ordered groups.
+    unique: dict[tuple[str, tuple[tuple[int, int], ...]], ByteRangeRequest] = {}
     for req in requests:
         unique.setdefault(req.as_key(), req)
 
@@ -283,32 +395,24 @@ def populate_byte_range_cache(
             continue
         by_path.setdefault(req.path, []).append(req)
 
-    total = sum(len(v) for v in by_path.values())
+    total_groups = sum(len(v) for v in by_path.values())
+    total_ranges = sum(
+        len(req.ranges) for path_reqs in by_path.values() for req in path_reqs
+    )
     populated = 0
+    populated_ranges = 0
     for path, path_reqs in by_path.items():
         handle = _open_handle(path)
         try:
-            for start in range(0, len(path_reqs), batch_size):
-                batch = path_reqs[start : start + batch_size]
-                buf = memoryview(bytearray(sum(r.size for r in batch)))
-                views = []
-                futures = []
-                offset = 0
-                for req in batch:
-                    view = buf[offset : offset + req.size]
-                    futures.append(
-                        handle.pread(view, size=req.size, file_offset=req.offset)
-                    )
-                    views.append(view)
-                    offset += req.size
-                for future in futures:
-                    future.get()
-                for req, view in zip(batch, views, strict=True):
-                    cache.put(req.path, req.offset, req.size, view)
+            for batch in _batched_by_reads(path_reqs, batch_size):
+                _populate_batch(cache, handle, batch)
                 populated += len(batch)
+                populated_ranges += sum(len(req.ranges) for req in batch)
                 if progress:
                     print(
-                        f"byte-range cache: populated {populated}/{total} ranges",
+                        "byte-range cache: populated "
+                        f"{populated}/{total_groups} groups "
+                        f"({populated_ranges}/{total_ranges} ranges)",
                         flush=True,
                     )
         finally:

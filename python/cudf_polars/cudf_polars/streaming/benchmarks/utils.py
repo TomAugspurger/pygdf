@@ -867,7 +867,7 @@ def _finish_byte_range_cache_iteration(
     q_id: int,
     iteration: int,
 ) -> None:
-    """Populate the cache from recorded ranges after iteration 0."""
+    """Populate the cache from recorded packed groups after iteration 0."""
     if not run_config.byte_range_cache or iteration != 0:
         return
     from cudf_polars.streaming.byte_range_cache import (
@@ -879,7 +879,7 @@ def _finish_byte_range_cache_iteration(
     )
 
     disable_byte_range_recording()
-    ranges = get_recorded_byte_ranges()
+    groups = get_recorded_byte_ranges()
     if args.results_directory is not None:
         dump_path = Path(args.results_directory) / f"byte_ranges_q{q_id:02d}.json"
         dump_path.parent.mkdir(parents=True, exist_ok=True)
@@ -888,12 +888,12 @@ def _finish_byte_range_cache_iteration(
 
     pinned_mr, stream = _pinned_mr_from_engine(engine)
     n = populate_byte_range_cache(
-        ranges, pinned_mr=pinned_mr, stream=stream, progress=True
+        groups, pinned_mr=pinned_mr, stream=stream, progress=True
     )
     clear_recorded_byte_ranges()
     print(
-        f"byte-range cache: recorded {len(ranges)} ranges, "
-        f"populated {n} unique entries for query {q_id}",
+        f"byte-range cache: recorded {len(groups)} packed groups, "
+        f"populated {n} unique groups for query {q_id}",
         flush=True,
     )
 

@@ -13,6 +13,8 @@ import pylibcudf as plc
 
 from cudf_polars.streaming import byte_range_cache as brc
 from cudf_polars.streaming.byte_range_cache import (
+    ByteRange,
+    ByteRangeRequest,
     clear_recorded_byte_ranges,
     disable_byte_range_recording,
     dump_recorded_byte_ranges,
@@ -20,7 +22,7 @@ from cudf_polars.streaming.byte_range_cache import (
     get_byte_range_cache,
     get_recorded_byte_ranges,
     load_byte_range_requests,
-    record_byte_range,
+    record_byte_ranges,
 )
 from cudf_polars.streaming.prefetch import pread_ranges
 
@@ -43,13 +45,25 @@ def _reset_byte_range_cache_state():
 
 def test_recorder_accumulates_and_dumps_json(tmp_path: Path):
     enable_byte_range_recording()
-    record_byte_range("s3://bucket/a.parquet", 10, 20)
-    record_byte_range("/data/b.parquet", 0, 8)
+    record_byte_ranges(
+        "s3://bucket/a.parquet",
+        (ByteRange(10, 20), ByteRange(40, 5)),
+    )
+    record_byte_ranges("/data/b.parquet", (ByteRange(0, 8),))
 
     recorded = get_recorded_byte_ranges()
     assert recorded == [
-        {"path": "s3://bucket/a.parquet", "offset": 10, "size": 20},
-        {"path": "/data/b.parquet", "offset": 0, "size": 8},
+        {
+            "path": "s3://bucket/a.parquet",
+            "ranges": [
+                {"offset": 10, "size": 20},
+                {"offset": 40, "size": 5},
+            ],
+        },
+        {
+            "path": "/data/b.parquet",
+            "ranges": [{"offset": 0, "size": 8}],
+        },
     ]
 
     out = tmp_path / "ranges.json"
@@ -58,34 +72,38 @@ def test_recorder_accumulates_and_dumps_json(tmp_path: Path):
 
 
 def test_record_byte_range_noop_when_disabled():
-    record_byte_range("x", 0, 1)
+    record_byte_ranges("x", (ByteRange(0, 1),))
     assert get_recorded_byte_ranges() == []
 
 
 def test_cache_put_get_round_trip():
     cache = get_byte_range_cache()
+    ranges = (ByteRange(4, 3), ByteRange(20, 5))
+    request = ByteRangeRequest("/tmp/f.parquet", ranges)
     data = memoryview(b"abcdefgh")
-    cache.put("/tmp/f.parquet", 4, 8, data)
-    got = cache.get("/tmp/f.parquet", 4, 8)
+    cache.put(request, data)
+    got = cache.get("/tmp/f.parquet", ranges)
     assert got is not None
     assert bytes(got) == b"abcdefgh"
-    assert cache.get("/tmp/f.parquet", 4, 7) is None
+    assert cache.get("/tmp/f.parquet", tuple(reversed(ranges))) is None
 
 
 def test_cache_put_accepts_ctypes_format_view():
     # ctypes buffers report format "<B", which memoryview refuses to slice-assign.
     src = (ctypes.c_uint8 * 4)(1, 2, 3, 4)
     cache = get_byte_range_cache()
-    cache.put("/tmp/f.parquet", 0, 4, memoryview(src))
-    got = cache.get("/tmp/f.parquet", 0, 4)
+    ranges = (ByteRange(0, 4),)
+    cache.put(ByteRangeRequest("/tmp/f.parquet", ranges), memoryview(src))
+    got = cache.get("/tmp/f.parquet", ranges)
     assert got is not None
     assert bytes(got) == b"\x01\x02\x03\x04"
 
 
 def test_cache_put_rejects_size_mismatch():
     cache = get_byte_range_cache()
-    with pytest.raises(ValueError, match="does not match size"):
-        cache.put("/tmp/f.parquet", 0, 2, memoryview(b"abc"))
+    request = ByteRangeRequest("/tmp/f.parquet", (ByteRange(0, 2),))
+    with pytest.raises(ValueError, match="does not match packed size"):
+        cache.put(request, memoryview(b"abc"))
 
 
 class _StubIOFuture:
@@ -124,8 +142,8 @@ def test_pread_ranges_cache_hit_skips_handle(monkeypatch):
         plc.io.text.ByteRangeInfo(200, 4),
     ]
     cache = get_byte_range_cache()
-    cache.put(path, 100, 4, memoryview(b"AAAA"))
-    cache.put(path, 200, 4, memoryview(b"BBBB"))
+    cache_ranges = (ByteRange(100, 4), ByteRange(200, 4))
+    cache.put(ByteRangeRequest(path, cache_ranges), memoryview(b"AAAABBBB"))
 
     handle: Any = _StubHandle()
     enable_byte_range_recording()
@@ -141,12 +159,17 @@ def test_pread_ranges_cache_hit_skips_handle(monkeypatch):
 
     assert handle.calls == []
     assert futures == []
-    assert buf is not None
+    assert buf is None
     assert host is not None
     assert bytes(host[:8]) == b"AAAABBBB"
     assert get_recorded_byte_ranges() == [
-        {"path": path, "offset": 100, "size": 4},
-        {"path": path, "offset": 200, "size": 4},
+        {
+            "path": path,
+            "ranges": [
+                {"offset": 100, "size": 4},
+                {"offset": 200, "size": 4},
+            ],
+        },
     ]
 
 
@@ -177,7 +200,7 @@ def test_pread_ranges_cache_miss_calls_pread(monkeypatch):
     assert bytes(host[:3]) == bytes([(10 + i) % 256 for i in range(3)])
 
 
-def test_pread_ranges_mixed_hit_and_miss(monkeypatch):
+def test_pread_ranges_partial_group_miss_reads_entire_group(monkeypatch):
     monkeypatch.setattr(
         "cudf_polars.streaming.prefetch.PinnedBuffer",
         _FakePinnedBuffer,
@@ -187,7 +210,9 @@ def test_pread_ranges_mixed_hit_and_miss(monkeypatch):
         plc.io.text.ByteRangeInfo(0, 2),
         plc.io.text.ByteRangeInfo(50, 2),
     ]
-    get_byte_range_cache().put(path, 0, 2, memoryview(b"ZZ"))
+    # A cached singleton is not a hit for the ordered two-range group.
+    singleton = ByteRangeRequest(path, (ByteRange(0, 2),))
+    get_byte_range_cache().put(singleton, memoryview(b"ZZ"))
     handle: Any = _StubHandle()
 
     host, futures, _buf = pread_ranges(
@@ -200,11 +225,11 @@ def test_pread_ranges_mixed_hit_and_miss(monkeypatch):
         loop=asyncio.new_event_loop(),
     )
 
-    assert len(handle.calls) == 1
-    assert handle.calls[0]["file_offset"] == 50
-    assert len(futures) == 1
+    assert len(handle.calls) == 2
+    assert [call["file_offset"] for call in handle.calls] == [0, 50]
+    assert len(futures) == 2
     assert host is not None
-    assert bytes(host[:2]) == b"ZZ"
+    assert bytes(host[:2]) == b"\x00\x01"
 
 
 def test_populate_byte_range_cache_from_list(monkeypatch):
@@ -226,17 +251,35 @@ def test_populate_byte_range_cache_from_list(monkeypatch):
 
     n = brc.populate_byte_range_cache(
         [
-            {"path": "/a.parquet", "offset": 0, "size": 3},
-            {"path": "/a.parquet", "offset": 0, "size": 3},  # duplicate
-            {"path": "/b.parquet", "offset": 1, "size": 2},
+            {
+                "path": "/a.parquet",
+                "ranges": [
+                    {"offset": 0, "size": 3},
+                    {"offset": 10, "size": 2},
+                ],
+            },
+            {
+                "path": "/a.parquet",
+                "ranges": [
+                    {"offset": 0, "size": 3},
+                    {"offset": 10, "size": 2},
+                ],
+            },  # duplicate group
+            {
+                "path": "/b.parquet",
+                "ranges": [{"offset": 1, "size": 2}],
+            },
         ]
     )
     assert n == 2
     assert opened == ["/a.parquet", "/b.parquet"]
     cache = get_byte_range_cache()
-    a = cache.get("/a.parquet", 0, 3)
-    b = cache.get("/b.parquet", 1, 2)
+    a = cache.get(
+        "/a.parquet",
+        (ByteRange(0, 3), ByteRange(10, 2)),
+    )
+    b = cache.get("/b.parquet", (ByteRange(1, 2),))
     assert a is not None
     assert b is not None
-    assert bytes(a) == b"xxx"
+    assert bytes(a) == b"xxxxx"
     assert bytes(b) == b"xx"

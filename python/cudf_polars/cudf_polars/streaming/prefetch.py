@@ -19,9 +19,9 @@ from cudf_polars.dsl.ir import _prepare_parquet_predicate
 from cudf_polars.dsl.to_ast import to_parquet_filter
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.streaming.byte_range_cache import (
-    byte_view,
+    ByteRange,
     get_byte_range_cache,
-    record_byte_range,
+    record_byte_ranges,
 )
 from cudf_polars.streaming.io import PrefetchedByteRanges, _fetch_byte_ranges
 
@@ -86,32 +86,32 @@ def pread_ranges(
     """
     Issue concurrent async reads for each range into a single pinned host buffer.
 
-    Exact ``(path, offset, size)`` hits in the process-global byte-range cache are
-    copied into the packed buffer without calling ``handle.pread``. Only cache
-    misses produce IO futures.
+    An exact ordered range-group cache hit returns its already-packed pinned
+    buffer directly. No new host buffer is allocated and no host-to-host copy
+    is performed. Cache misses produce the existing packed pread buffer.
     """
     total = sum(r.size for r in ranges)
     if not total:
         return None, [], None
+    cache_ranges = tuple(ByteRange(offset=r.offset, size=r.size) for r in ranges)
+    record_byte_ranges(path, cache_ranges)
+    cached = get_byte_range_cache().get(path, cache_ranges)
+    if cached is not None:
+        return cached, [], None
+
     buf = PinnedBuffer(pinned_mr, total, stream, context, loop)
     futures = []
     offset = 0
-    cache = get_byte_range_cache()
     with nvtx_annotate_cudf_polars(message=f"pread_ranges:submit:{total}B"):
         for r in ranges:
-            record_byte_range(path, r.offset, r.size)
             dest = buf.array[offset : offset + r.size]
-            cached = cache.get(path, r.offset, r.size)
-            if cached is not None:
-                byte_view(dest)[:] = byte_view(cached)
-            else:
-                futures.append(
-                    handle.pread(
-                        dest,
-                        size=r.size,
-                        file_offset=r.offset,
-                    )
+            futures.append(
+                handle.pread(
+                    dest,
+                    size=r.size,
+                    file_offset=r.offset,
                 )
+            )
             offset += r.size
     return buf.array, futures, buf
 
