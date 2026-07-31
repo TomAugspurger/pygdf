@@ -9,6 +9,7 @@ import contextlib
 import functools
 import io
 import math
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import polars as pl
@@ -596,6 +597,81 @@ async def read_chunk(
     await send_chunk(context, ch_out, chunk, seq_num, tracer=tracer)
 
 
+async def _run_scan_node_body(
+    context: Context,
+    ir: StreamingScan,
+    ir_context: IRExecutionContext,
+    ch_out: Channel[TableChunk],
+    scans: Sequence[SplitScan] | Sequence[FusedScan],
+    num_producers: int,
+    estimated_chunk_bytes: int,
+    prefetcher: HybridScanPrefetchExecutor | None,
+) -> None:
+    """Inner body of scan_node shared by normal and replay paths."""
+    async with shutdown_on_error(
+        context, ch_out, trace_ir=ir, ir_context=ir_context
+    ) as tracer:
+        await send_metadata(
+            ch_out,
+            context,
+            ChannelMetadata(local_count=len(scans)),
+        )
+
+        if len(scans) == 0:
+            await ch_out.drain(context)
+            return
+
+        if len(scans) == 1 or num_producers == 1:
+            for seq_num, scan in enumerate(scans):
+                await read_chunk(
+                    context,
+                    scan,
+                    seq_num,
+                    ch_out,
+                    ir_context,
+                    estimated_chunk_bytes,
+                    tracer=tracer,
+                    prefetcher=prefetcher,
+                )
+            await ch_out.drain(context)
+            return
+
+        num_producers_local = min(num_producers, len(scans))
+        lineariser = Lineariser(context, ch_out, num_producers_local)
+
+        producer_tasks: list[list[tuple[int, SplitScan | FusedScan]]] = [
+            [] for _ in range(num_producers_local)
+        ]
+        for task_idx, scan in enumerate(scans):
+            producer_id = task_idx % num_producers_local
+            producer_tasks[producer_id].append((task_idx, scan))  # type: ignore[arg-type]
+
+        async def _producer(producer_id: int, ch_out: Channel) -> None:
+            for task_idx, scan in producer_tasks[producer_id]:
+                await read_chunk(
+                    context,
+                    scan,
+                    task_idx,
+                    ch_out,
+                    ir_context,
+                    estimated_chunk_bytes,
+                    tracer=tracer,
+                    prefetcher=prefetcher,
+                )
+            await ch_out.drain(context)
+
+        async with (
+            shutdown_on_error(context, *lineariser.input_channels, trace_ir=ir),
+        ):
+            await gather_in_task_group(
+                lineariser.drain(),
+                *(
+                    _producer(i, ch_in)
+                    for i, ch_in in enumerate(lineariser.input_channels)
+                ),
+            )
+
+
 @define_actor()
 async def scan_node(
     context: Context,
@@ -607,6 +683,8 @@ async def scan_node(
     num_prefetch_workers: int | None,
     prefetch_backend: str | None,
     estimated_chunk_bytes: int,
+    prefetching_byte_ranges: str | None = None,
+    wait_for_prefetch: bool = False,
 ) -> None:
     """
     Scan node for rapidsmpf.
@@ -632,10 +710,18 @@ async def scan_node(
     estimated_chunk_bytes
         Estimated size of each chunk in bytes. Used for memory reservation
         with block spilling to avoid thrashing.
+    prefetching_byte_ranges
+        Path to a JSON file containing pre-recorded byte ranges for prefetching.
+        If the file does not exist, byte ranges are computed and saved (record
+        mode). If the file exists, byte ranges are loaded and used directly
+        (replay mode).
+    wait_for_prefetch
+        If ``True`` and in replay mode, block until all prefetch IO completes
+        before starting any scan tasks.
     """
     scans: Sequence[SplitScan] | Sequence[FusedScan] = ir.scans
-
     first = scans[0] if scans else None
+
     use_prefetch = (
         first is not None
         and ir.scan_type == "split"
@@ -646,12 +732,76 @@ async def scan_node(
         and prefetch_backend is not None
         and context.br().pinned_mr is not None
     )
-    prefetcher: HybridScanPrefetchExecutor | None = (
+
+    # --- prefetching_byte_ranges experiment ---
+    if (
+        prefetching_byte_ranges is not None
+        and first is not None
+        and ir.scan_type == "split"
+        and first.parquet_options.use_hybrid_scan
+        and first.parquet_options.prefetch_file_metadata
+        and first.cached_parquet_info is not None
+        and first.base_scan.predicate is not None
+    ):
+        _split_scans = list(scans)  # type: ignore[arg-type]
+        _num_workers = (
+            num_prefetch_workers
+            if num_prefetch_workers is not None
+            else len(_split_scans)
+        )
+        if not os.path.exists(prefetching_byte_ranges):
+            # Record mode: compute byte ranges and save to file, then fall
+            # through to normal execution below.
+            await ir_context.to_thread(
+                HybridScanPrefetchExecutor.record_to_file,
+                _split_scans,
+                prefetching_byte_ranges,
+                _num_workers,
+            )
+            # Fall through to normal prefetcher / scan below.
+        else:
+            # Replay mode: load pre-recorded ranges, fadvise everything now,
+            # then optionally wait for all IO before starting scans.
+            prefetcher: HybridScanPrefetchExecutor | None = (
+                HybridScanPrefetchExecutor.from_file(
+                    _split_scans,
+                    prefetching_byte_ranges,
+                    _num_workers,
+                    context,
+                    cucascade_pool_capacity=first.parquet_options.cucascade_pool_capacity,
+                    cucascade_n_reactors=first.parquet_options.cucascade_n_reactors,
+                    cucascade_max_connections=first.parquet_options.cucascade_max_connections,
+                    cucascade_chunk_size=first.parquet_options.cucascade_chunk_size,
+                    cucascade_max_n_chunks=first.parquet_options.cucascade_max_n_chunks,
+                    cucascade_enable_cache=first.parquet_options.cucascade_enable_cache,
+                )
+            )
+            if wait_for_prefetch:
+                # Scenario a: block until all IO is complete.  Every scan task
+                # will read from pinned host memory with no S3 wait.
+                await ir_context.to_thread(prefetcher.wait_all)
+            with prefetcher:
+                await _run_scan_node_body(
+                    context,
+                    ir,
+                    ir_context,
+                    ch_out,
+                    scans,
+                    num_producers,
+                    estimated_chunk_bytes,
+                    prefetcher,
+                )
+            return
+    # --- end prefetching_byte_ranges experiment ---
+
+    prefetcher = (
         HybridScanPrefetchExecutor.from_scans(
             list(scans),  # type: ignore[arg-type]
-            num_workers=num_prefetch_workers
-            if num_prefetch_workers is not None
-            else len(scans),
+            num_workers=(
+                num_prefetch_workers
+                if num_prefetch_workers is not None
+                else len(scans)
+            ),
             context=context,
             prefetch_backend=prefetch_backend,  # type: ignore[arg-type]
             cucascade_pool_capacity=first.parquet_options.cucascade_pool_capacity if first is not None else None,
@@ -665,75 +815,16 @@ async def scan_node(
         else None
     )
     with prefetcher or contextlib.nullcontext():
-        async with shutdown_on_error(
-            context, ch_out, trace_ir=ir, ir_context=ir_context
-        ) as tracer:
-            # Send basic metadata
-            await send_metadata(
-                ch_out,
-                context,
-                ChannelMetadata(local_count=len(scans)),
-            )
-
-            # If there is nothing to scan, drain the channel and return
-            if len(scans) == 0:
-                await ch_out.drain(context)
-                return
-
-            # If there is only one scan or one producer, we can
-            # skip the lineariser and read the chunks directly
-            if len(scans) == 1 or num_producers == 1:
-                for seq_num, scan in enumerate(scans):
-                    await read_chunk(
-                        context,
-                        scan,
-                        seq_num,
-                        ch_out,
-                        ir_context,
-                        estimated_chunk_bytes,
-                        tracer=tracer,
-                        prefetcher=prefetcher,
-                    )
-                await ch_out.drain(context)
-                return
-
-            # Use Lineariser to ensure ordered delivery
-            num_producers = min(num_producers, len(scans))
-            lineariser = Lineariser(context, ch_out, num_producers)
-
-            # Assign tasks to producers using round-robin
-            producer_tasks: list[list[tuple[int, SplitScan | FusedScan]]] = [
-                [] for _ in range(num_producers)
-            ]
-            for task_idx, scan in enumerate(scans):
-                producer_id = task_idx % num_producers
-                # mypy resolves __iter__ on union-of-sequences to the common base (IR)
-                producer_tasks[producer_id].append((task_idx, scan))  # type: ignore[arg-type]
-
-            async def _producer(producer_id: int, ch_out: Channel) -> None:
-                for task_idx, scan in producer_tasks[producer_id]:
-                    await read_chunk(
-                        context,
-                        scan,
-                        task_idx,
-                        ch_out,
-                        ir_context,
-                        estimated_chunk_bytes,
-                        tracer=tracer,
-                        prefetcher=prefetcher,
-                    )
-                await ch_out.drain(context)
-
-            async with (
-                shutdown_on_error(context, *lineariser.input_channels, trace_ir=ir),
-            ):
-                await gather_in_task_group(
-                    lineariser.drain(),
-                    *(
-                        _producer(i, ch_in)
-                        for i, ch_in in enumerate(lineariser.input_channels)
-                    ),
-                )
+        await _run_scan_node_body(
+            context,
+            ir,
+            ir_context,
+            ch_out,
+            scans,
+            num_producers,
+            estimated_chunk_bytes,
+            prefetcher,
+        )
 
 
 def make_rapidsmpf_read_parquet_node(
@@ -914,6 +1005,8 @@ def _(
                 estimated_chunk_bytes=(
                     plan.estimated_chunk_bytes or executor.target_partition_size
                 ),
+                prefetching_byte_ranges=parquet_options.prefetching_byte_ranges,
+                wait_for_prefetch=parquet_options.wait_for_prefetch,
             )
         ]
     return nodes, channels
