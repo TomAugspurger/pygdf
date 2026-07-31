@@ -36,6 +36,11 @@ if TYPE_CHECKING:
     from rmm.pylibrmm.stream import Stream
 
 
+def byte_view(buf: memoryview) -> memoryview:
+    """Return an unsigned-byte view; ctypes-backed buffers report format ``<B``."""
+    return buf if buf.format == "B" else buf.cast("B")
+
+
 @dataclass(frozen=True)
 class ByteRangeRequest:
     """A single file byte-range request."""
@@ -70,11 +75,13 @@ class _CacheEntry:
         if pinned_mr is not None and stream is not None:
             ptr = pinned_mr.allocate(self.nbytes, stream)
             self.pinned = (pinned_mr, ptr, stream)
-            self.array = memoryview((ctypes.c_uint8 * self.nbytes).from_address(ptr))
-            self.array[:] = data
+            self.array = byte_view(
+                memoryview((ctypes.c_uint8 * self.nbytes).from_address(ptr))
+            )
+            self.array[:] = byte_view(data)
         else:
             self.pinned = None
-            self.array = memoryview(bytearray(data))
+            self.array = memoryview(bytearray(byte_view(data)))
 
     def __del__(self) -> None:
         # Guard against partial init (e.g. if allocate raised).

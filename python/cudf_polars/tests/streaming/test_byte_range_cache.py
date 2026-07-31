@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
@@ -71,6 +72,16 @@ def test_cache_put_get_round_trip():
     assert cache.get("/tmp/f.parquet", 4, 7) is None
 
 
+def test_cache_put_accepts_ctypes_format_view():
+    # ctypes buffers report format "<B", which memoryview refuses to slice-assign.
+    src = (ctypes.c_uint8 * 4)(1, 2, 3, 4)
+    cache = get_byte_range_cache()
+    cache.put("/tmp/f.parquet", 0, 4, memoryview(src))
+    got = cache.get("/tmp/f.parquet", 0, 4)
+    assert got is not None
+    assert bytes(got) == b"\x01\x02\x03\x04"
+
+
 def test_cache_put_rejects_size_mismatch():
     cache = get_byte_range_cache()
     with pytest.raises(ValueError, match="does not match size"):
@@ -91,14 +102,15 @@ class _StubHandle:
             {"size": size, "file_offset": file_offset, "nbytes": len(buf)}
         )
         # Fill with a recognizable pattern so packed buffer contents are checkable.
-        buf[:] = bytes((file_offset + i) % 256 for i in range(size))
+        buf.cast("B")[:] = bytes((file_offset + i) % 256 for i in range(size))
         return _StubIOFuture()
 
 
 class _FakePinnedBuffer:
     def __init__(self, mr, nbytes, stream, context, loop) -> None:
         self.nbytes = nbytes
-        self.array = memoryview(bytearray(nbytes))
+        # ctypes-backed like the real PinnedBuffer, so the view reports format "<B".
+        self.array = memoryview((ctypes.c_uint8 * nbytes)())
 
 
 def test_pread_ranges_cache_hit_skips_handle(monkeypatch):
@@ -115,7 +127,7 @@ def test_pread_ranges_cache_hit_skips_handle(monkeypatch):
     cache.put(path, 100, 4, memoryview(b"AAAA"))
     cache.put(path, 200, 4, memoryview(b"BBBB"))
 
-    handle = _StubHandle()
+    handle: Any = _StubHandle()
     enable_byte_range_recording()
     host, futures, buf = pread_ranges(
         handle,
@@ -145,7 +157,7 @@ def test_pread_ranges_cache_miss_calls_pread(monkeypatch):
     )
     path = "s3://bucket/miss.parquet"
     ranges = [plc.io.text.ByteRangeInfo(10, 3)]
-    handle = _StubHandle()
+    handle: Any = _StubHandle()
 
     host, futures, buf = pread_ranges(
         handle,
@@ -176,7 +188,7 @@ def test_pread_ranges_mixed_hit_and_miss(monkeypatch):
         plc.io.text.ByteRangeInfo(50, 2),
     ]
     get_byte_range_cache().put(path, 0, 2, memoryview(b"ZZ"))
-    handle = _StubHandle()
+    handle: Any = _StubHandle()
 
     host, futures, _buf = pread_ranges(
         handle,
@@ -222,5 +234,9 @@ def test_populate_byte_range_cache_from_list(monkeypatch):
     assert n == 2
     assert opened == ["/a.parquet", "/b.parquet"]
     cache = get_byte_range_cache()
-    assert bytes(cache.get("/a.parquet", 0, 3)) == b"xxx"
-    assert bytes(cache.get("/b.parquet", 1, 2)) == b"xx"
+    a = cache.get("/a.parquet", 0, 3)
+    b = cache.get("/b.parquet", 1, 2)
+    assert a is not None
+    assert b is not None
+    assert bytes(a) == b"xxx"
+    assert bytes(b) == b"xx"

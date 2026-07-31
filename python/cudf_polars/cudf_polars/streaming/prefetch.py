@@ -19,6 +19,7 @@ from cudf_polars.dsl.ir import _prepare_parquet_predicate
 from cudf_polars.dsl.to_ast import to_parquet_filter
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
 from cudf_polars.streaming.byte_range_cache import (
+    byte_view,
     get_byte_range_cache,
     record_byte_range,
 )
@@ -103,7 +104,7 @@ def pread_ranges(
             dest = buf.array[offset : offset + r.size]
             cached = cache.get(path, r.offset, r.size)
             if cached is not None:
-                dest[:] = cached
+                byte_view(dest)[:] = byte_view(cached)
             else:
                 futures.append(
                     handle.pread(
