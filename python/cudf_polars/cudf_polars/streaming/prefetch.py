@@ -573,10 +573,16 @@ class HybridScanPrefetchExecutor:
 
     def __exit__(self, *args: Any) -> None:
         """Shut down the thread pool, cancelling pending futures."""
+        global _cucascade_engine
         self.executor.shutdown(cancel_futures=True, wait=True)
         self.futures.clear()
         self.datasource_cache.clear()
         self.engine = None
+        # Reset the singleton so the next query gets a fresh pool.  Without
+        # this, cucascade's pinned bounce-buffer pool stays fully allocated
+        # from the previous query and the next engine.open() call (which needs
+        # pool memory for the HEAD request) runs out of memory.
+        _cucascade_engine = None
 
     def result(self, task_idx: int) -> PrefetchedByteRanges | None:
         """Block until the prefetch result for ``task_idx`` is ready."""
