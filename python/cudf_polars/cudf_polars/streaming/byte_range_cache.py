@@ -237,9 +237,14 @@ def populate_byte_range_cache(
     *,
     pinned_mr: PinnedMemoryResource | None = None,
     stream: Stream | None = None,
+    batch_size: int = 256,
+    progress: bool = False,
 ) -> int:
     """
     Manually fetch byte ranges into the process-global host/pinned cache.
+
+    Reads are issued in concurrent batches per file; a serial read-and-wait
+    loop is far too slow for the thousands of small ranges a scan produces.
 
     Parameters
     ----------
@@ -251,6 +256,10 @@ def populate_byte_range_cache(
         cache entries are allocated from this pool.
     stream
         CUDA stream paired with ``pinned_mr`` for allocate/deallocate.
+    batch_size
+        Number of reads submitted before waiting on the batch.
+    progress
+        Print per-batch progress.
 
     Returns
     -------
@@ -274,19 +283,34 @@ def populate_byte_range_cache(
             continue
         by_path.setdefault(req.path, []).append(req)
 
+    total = sum(len(v) for v in by_path.values())
     populated = 0
     for path, path_reqs in by_path.items():
         handle = _open_handle(path)
         try:
-            for req in path_reqs:
-                if req.as_key() in cache:
-                    continue
-                buf = bytearray(req.size)
-                view = memoryview(buf)
-                future = handle.pread(view, size=req.size, file_offset=req.offset)
-                future.get()
-                cache.put(req.path, req.offset, req.size, view)
-                populated += 1
+            for start in range(0, len(path_reqs), batch_size):
+                batch = path_reqs[start : start + batch_size]
+                buf = memoryview(bytearray(sum(r.size for r in batch)))
+                views = []
+                futures = []
+                offset = 0
+                for req in batch:
+                    view = buf[offset : offset + req.size]
+                    futures.append(
+                        handle.pread(view, size=req.size, file_offset=req.offset)
+                    )
+                    views.append(view)
+                    offset += req.size
+                for future in futures:
+                    future.get()
+                for req, view in zip(batch, views, strict=True):
+                    cache.put(req.path, req.offset, req.size, view)
+                populated += len(batch)
+                if progress:
+                    print(
+                        f"byte-range cache: populated {populated}/{total} ranges",
+                        flush=True,
+                    )
         finally:
             close = getattr(handle, "close", None)
             if callable(close):

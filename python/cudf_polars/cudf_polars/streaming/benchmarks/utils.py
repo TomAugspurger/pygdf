@@ -887,7 +887,9 @@ def _finish_byte_range_cache_iteration(
         print(f"byte-range cache: wrote {dump_path}", flush=True)
 
     pinned_mr, stream = _pinned_mr_from_engine(engine)
-    n = populate_byte_range_cache(ranges, pinned_mr=pinned_mr, stream=stream)
+    n = populate_byte_range_cache(
+        ranges, pinned_mr=pinned_mr, stream=stream, progress=True
+    )
     clear_recorded_byte_ranges()
     print(
         f"byte-range cache: recorded {len(ranges)} ranges, "
