@@ -18,6 +18,10 @@ from rmm.pylibrmm.stream import Stream
 from cudf_polars.dsl.ir import _prepare_parquet_predicate
 from cudf_polars.dsl.to_ast import to_parquet_filter
 from cudf_polars.dsl.tracing import nvtx_annotate_cudf_polars
+from cudf_polars.streaming.byte_range_cache import (
+    get_byte_range_cache,
+    record_byte_range,
+)
 from cudf_polars.streaming.io import PrefetchedByteRanges, _fetch_byte_ranges
 
 if TYPE_CHECKING:
@@ -71,28 +75,43 @@ class PinnedBuffer:
 
 def pread_ranges(
     handle: CuFile | RemoteFile,
+    path: str,
     ranges: list[plc.io.text.ByteRangeInfo],
     pinned_mr: PinnedMemoryResource,
     stream: Stream,
     context: Context,
     loop: asyncio.AbstractEventLoop,
 ) -> tuple[memoryview | None, list[IOFuture], PinnedBuffer | None]:
-    """Issue concurrent async reads for each range into a single pinned host buffer."""
+    """
+    Issue concurrent async reads for each range into a single pinned host buffer.
+
+    Exact ``(path, offset, size)`` hits in the process-global byte-range cache are
+    copied into the packed buffer without calling ``handle.pread``. Only cache
+    misses produce IO futures.
+    """
     total = sum(r.size for r in ranges)
     if not total:
         return None, [], None
     buf = PinnedBuffer(pinned_mr, total, stream, context, loop)
     futures = []
     offset = 0
+    cache = get_byte_range_cache()
     with nvtx_annotate_cudf_polars(message=f"pread_ranges:submit:{total}B"):
         for r in ranges:
-            futures.append(
-                handle.pread(
-                    buf.array[offset : offset + r.size],
-                    size=r.size,
-                    file_offset=r.offset,
+            print(f"pread offset={r.offset} size={r.size}")
+            record_byte_range(path, r.offset, r.size)
+            dest = buf.array[offset : offset + r.size]
+            cached = cache.get(path, r.offset, r.size)
+            if cached is not None:
+                dest[:] = cached
+            else:
+                futures.append(
+                    handle.pread(
+                        dest,
+                        size=r.size,
+                        file_offset=r.offset,
+                    )
                 )
-            )
             offset += r.size
     return buf.array, futures, buf
 
@@ -199,6 +218,7 @@ def prefetch_scan_byte_ranges(
             row_group_indices, options
         )
 
+    path = cached_info[0].path
     handle = cached_info[0].remote_handle()
     filter_bytes = sum(r.size for r in filter_ranges)
     payload_bytes = sum(r.size for r in payload_ranges)
@@ -206,10 +226,10 @@ def prefetch_scan_byte_ranges(
         message=f"pread_filter_and_payload [{scan.split_index + 1}/{scan.total_splits}]:filter={filter_bytes}B,payload={payload_bytes}B"
     ):
         filter_host, filter_futures, filter_buf = pread_ranges(
-            handle, filter_ranges, pinned_mr, stream, context, loop
+            handle, path, filter_ranges, pinned_mr, stream, context, loop
         )
         payload_host, payload_futures, payload_buf = pread_ranges(
-            handle, payload_ranges, pinned_mr, stream, context, loop
+            handle, path, payload_ranges, pinned_mr, stream, context, loop
         )
 
     return PrefetchedByteRanges(
@@ -276,12 +296,14 @@ class HybridScanPrefetchExecutor:
         ValueError
             If ``context.br().pinned_mr`` is ``None``.
         """
+        print("building!")
         pinned_mr = context.br().pinned_mr
         if pinned_mr is None:
             raise ValueError(
                 "HybridScanPrefetchExecutor requires a PinnedMemoryResource; "
                 "enable pinned memory via --pinned-memory."
             )
+        get_byte_range_cache().configure(pinned_mr=pinned_mr, stream=Stream())
         loop = asyncio.get_running_loop()
         executor = ThreadPoolExecutor(
             max_workers=num_workers,
