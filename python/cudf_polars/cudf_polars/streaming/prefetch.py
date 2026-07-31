@@ -99,7 +99,6 @@ def pread_ranges(
     cache = get_byte_range_cache()
     with nvtx_annotate_cudf_polars(message=f"pread_ranges:submit:{total}B"):
         for r in ranges:
-            print(f"pread offset={r.offset} size={r.size}")
             record_byte_range(path, r.offset, r.size)
             dest = buf.array[offset : offset + r.size]
             cached = cache.get(path, r.offset, r.size)
@@ -297,7 +296,6 @@ class HybridScanPrefetchExecutor:
         ValueError
             If ``context.br().pinned_mr`` is ``None``.
         """
-        print("building!")
         pinned_mr = context.br().pinned_mr
         if pinned_mr is None:
             raise ValueError(

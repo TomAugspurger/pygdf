@@ -641,10 +641,6 @@ async def scan_node(
         and first.base_scan.predicate is not None
         and context.br().pinned_mr is not None
     )
-    if first is not None:
-        print(
-            f"use_prefetch: {use_prefetch} {ir.scan_type=} {first.parquet_options.use_hybrid_scan=} {first.parquet_options.prefetch_file_metadata=} {first.cached_parquet_info=} {first.base_scan.predicate=} {context.br().pinned_mr=}"
-        )
     prefetcher: HybridScanPrefetchExecutor | None = (
         HybridScanPrefetchExecutor.from_scans(
             list(scans),  # type: ignore[arg-type]
