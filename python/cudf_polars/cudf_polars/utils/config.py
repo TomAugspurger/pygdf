@@ -281,6 +281,34 @@ class ParquetOptions:
         ``host_read_ranges_async_io`` calls may serve from cache rather than
         fetching from S3. Only used when ``prefetch_backend`` is
         ``"cucascade"``. Default is ``False``.
+    prefetching_byte_ranges
+        Path to a JSON file for recording / replaying hybrid-scan byte ranges.
+
+        **Record mode** (path does not exist when the query runs): the engine
+        computes the filter and payload byte ranges for every ``SplitScan`` up
+        front (running stats + bloom-filter pruning as usual) and writes them to
+        this file.  Normal query execution then proceeds unchanged.
+
+        **Replay mode** (path already exists): the engine loads the pre-recorded
+        ranges and issues *all* ``datasource.fadvise()`` calls immediately before
+        any scan task begins.  Background threads then skip stats pruning and go
+        straight to ``read_all_ranges_async``.  This simulates perfect
+        foreknowledge of which byte ranges will be needed and measures the
+        theoretical IO lower bound.
+
+        Only meaningful when ``use_hybrid_scan=True``,
+        ``prefetch_file_metadata=True``, and ``prefetch_backend="cucascade"``.
+        Default is ``None`` (feature disabled).
+    wait_for_prefetch
+        When ``True`` and in replay mode (``prefetching_byte_ranges`` points to
+        an existing file), block all scan tasks until every prefetch future has
+        completed before the first scan begins.  This means all data is already
+        resident in pinned host memory when scans run, measuring pure H→D
+        transfer and decode with no S3 latency on the critical path.
+
+        When ``False`` (default), scans run concurrently with in-flight IO,
+        which is the realistic overlap scenario.
+        Ignored when ``prefetching_byte_ranges`` is ``None``.
     use_jit_filter
         Whether to use JIT compilation for post-read filtering in Parquet scans.
         When enabled, filter predicates are JIT-compiled to CUDA kernels for
@@ -383,6 +411,16 @@ class ParquetOptions:
             f"{_env_prefix}__CUCASCADE_ENABLE_CACHE", _bool_converter, default=False
         )
     )
+    prefetching_byte_ranges: str | None = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__PREFETCHING_BYTE_RANGES", str, default=None
+        )
+    )
+    wait_for_prefetch: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__WAIT_FOR_PREFETCH", _bool_converter, default=False
+        )
+    )
     use_jit_filter: bool = dataclasses.field(
         default_factory=_make_default_factory(
             f"{_env_prefix}__USE_JIT_FILTER",
@@ -449,6 +487,12 @@ class ParquetOptions:
             raise TypeError("cucascade_enable_cache must be a bool")
         if not isinstance(self.use_jit_filter, bool):
             raise TypeError("use_jit_filter must be a bool")
+        if self.prefetching_byte_ranges is not None and not isinstance(
+            self.prefetching_byte_ranges, str
+        ):
+            raise TypeError("prefetching_byte_ranges must be a str or None")
+        if not isinstance(self.wait_for_prefetch, bool):
+            raise TypeError("wait_for_prefetch must be a bool")
 
 
 def default_target_partition_size(min_device_size: int | None) -> int:
