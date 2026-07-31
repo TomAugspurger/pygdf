@@ -581,14 +581,18 @@ class HybridScanPrefetchExecutor:
         return self.futures[task_idx].result()
 
     def wait_all(self) -> None:
-        """Block until every prefetch future has completed.
+        """Block until every prefetch future and its underlying IO have completed.
 
-        Call this before starting the scan loop when you want all data
-        resident in pinned host memory before any scan task runs
-        (scenario a: perfect foresight + wait).
+        After this returns, all data is resident in pinned host memory.
+        Call this (via ir_context.to_thread) before starting scans for
+        scenario a: pure H→D transfer with zero S3 latency on the critical path.
         """
         for f in self.futures:
-            f.result()
+            res = f.result()
+            if res is None:
+                continue
+            for io_f in (*res.filter_futures, *res.payload_futures):
+                io_f.get()
 
     @classmethod
     def record_to_file(
@@ -609,16 +613,13 @@ class HybridScanPrefetchExecutor:
             initializer=cls.init_stream,
             thread_name_prefix="hybrid-record",
         )
-        futures = [
-            executor.submit(
-                record_scan_byte_ranges,
-                scan,
-                cls.thread_local.stream,
-            )
-            for scan in scans
-        ]
+
+        def _task(s: SplitScan) -> dict | None:
+            return record_scan_byte_ranges(s, cls.thread_local.stream)
+
+        futures = [executor.submit(_task, scan) for scan in scans]
         executor.shutdown(wait=True)
-        records = [f.result() for f in futures if f.result() is not None]
+        records = [r for f in futures if (r := f.result()) is not None]
         _serialize_byte_ranges(file_path, records)
 
     @classmethod
@@ -684,8 +685,8 @@ class HybridScanPrefetchExecutor:
             if path not in datasource_cache:
                 datasource_cache[path] = engine.open(path)
 
-        # Issue ALL fadvise calls immediately so cucascade starts downloading
-        # everything before the first scan task even starts (perfect foresight).
+        # Build per-split duplicates and issue all fadvise calls immediately
+        split_datasources: dict[tuple[str, int, int], Any] = {}
         for scan in scans:
             key = (scan.paths[0], scan.split_index, scan.total_splits)
             record = lookup.get(key)
@@ -694,10 +695,9 @@ class HybridScanPrefetchExecutor:
             all_ranges = record["filter_ranges"] + record["payload_ranges"]
             if not all_ranges:
                 continue
-            datasource = datasource_cache[scan.paths[0]].duplicate()
-            datasource.fadvise(
-                [(r["offset"], r["size"]) for r in all_ranges], dev_id
-            )
+            ds = datasource_cache[scan.paths[0]].duplicate()
+            ds.fadvise([(r["offset"], r["size"]) for r in all_ranges], dev_id)
+            split_datasources[key] = ds  # keep alive so cucascade can serve from cache
 
         executor = ThreadPoolExecutor(
             max_workers=num_workers,
@@ -728,7 +728,9 @@ class HybridScanPrefetchExecutor:
             if not filter_bytes and not payload_bytes:
                 return PrefetchedByteRanges.empty()
 
-            datasource = datasource_cache[s.paths[0]].duplicate()
+            datasource = split_datasources.get(key)
+            if datasource is None:
+                return None
 
             filter_buf = PinnedBuffer(pinned_mr, filter_bytes, stream, context, loop)
             payload_buf = PinnedBuffer(pinned_mr, payload_bytes, stream, context, loop)

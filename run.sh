@@ -58,7 +58,7 @@ export KVIKIO_TASK_SIZE=67108864
 #
 # SCENARIO c — Realistic foresight, no wait (current baseline, default).
 #   Prefetch fires only after metadata is read; scans overlap with IO.
-#   Leave both vars unset (or set PREFETCHING_BYTE_RANGES to empty string).
+#   Leave PREFETCHING_BYTE_RANGES unset (empty string is NOT safe — leave it unset).
 # ---------------------------------------------------------------------------
 
 python -m cudf_polars.streaming.benchmarks.pdsh \

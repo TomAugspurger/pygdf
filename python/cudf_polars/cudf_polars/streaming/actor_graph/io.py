@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import hashlib
 import io
 import math
 import os
@@ -79,6 +80,12 @@ if TYPE_CHECKING:
     )
     from cudf_polars.streaming.io import FusedScan, PrefetchedByteRanges, SplitScan
     from cudf_polars.utils.config import ParquetOptions
+
+
+def _scoped_byte_range_path(base_path: str, scan_paths: list[str]) -> str:
+    """Return a scan-scoped path so multi-table queries don't collide."""
+    h = hashlib.md5(",".join(sorted(scan_paths)).encode()).hexdigest()[:8]
+    return f"{base_path}.{h}"
 
 
 class Lineariser:
@@ -735,7 +742,7 @@ async def scan_node(
 
     # --- prefetching_byte_ranges experiment ---
     if (
-        prefetching_byte_ranges is not None
+        prefetching_byte_ranges  # truthy check — rejects None and empty string
         and first is not None
         and ir.scan_type == "split"
         and first.parquet_options.use_hybrid_scan
@@ -749,23 +756,30 @@ async def scan_node(
             if num_prefetch_workers is not None
             else len(_split_scans)
         )
-        if not os.path.exists(prefetching_byte_ranges):
+        # Derive a per-scan-node path so multi-table queries don't collide.
+        _scoped_path = _scoped_byte_range_path(
+            prefetching_byte_ranges, [s.paths[0] for s in _split_scans]
+        )
+        if not os.path.exists(_scoped_path):
             # Record mode: compute byte ranges and save to file, then fall
             # through to normal execution below.
             await ir_context.to_thread(
                 HybridScanPrefetchExecutor.record_to_file,
                 _split_scans,
-                prefetching_byte_ranges,
+                _scoped_path,
                 _num_workers,
             )
             # Fall through to normal prefetcher / scan below.
-        else:
+        elif (
+            prefetch_backend == "cucascade"
+            and context.br().pinned_mr is not None
+        ):
             # Replay mode: load pre-recorded ranges, fadvise everything now,
             # then optionally wait for all IO before starting scans.
             prefetcher: HybridScanPrefetchExecutor | None = (
                 HybridScanPrefetchExecutor.from_file(
                     _split_scans,
-                    prefetching_byte_ranges,
+                    _scoped_path,
                     _num_workers,
                     context,
                     cucascade_pool_capacity=first.parquet_options.cucascade_pool_capacity,
@@ -792,6 +806,8 @@ async def scan_node(
                     prefetcher,
                 )
             return
+        # else: replay preconditions not met (wrong backend or no pinned MR);
+        # fall through to normal prefetcher / scan path below.
     # --- end prefetching_byte_ranges experiment ---
 
     prefetcher = (
