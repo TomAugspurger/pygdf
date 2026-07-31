@@ -479,6 +479,7 @@ class RunConfig:
     # Run parameters
     iterations: int
     io_mode: Literal["cold", "lukewarm", "hot"] = "lukewarm"
+    byte_range_cache: bool = False
     collect_traces: bool = False
     native_parquet: bool = True
     max_io_threads: int = 2
@@ -522,6 +523,11 @@ class RunConfig:
             raise ValueError(
                 "--io-mode hot requires at least 2 iterations: "
                 "iteration 0 warms the cache, iterations 1+ are the hot measurements."
+            )
+        if self.byte_range_cache and self.iterations < 2:
+            raise ValueError(
+                "--byte-range-cache requires at least 2 iterations: "
+                "iteration 0 records ranges, iterations 1+ read from the cache."
             )
 
         # Update `extra_info.environment` with the captured environment variables.
@@ -628,6 +634,7 @@ class RunConfig:
             frontend=args.frontend,
             iterations=args.iterations,
             io_mode=args.io_mode,
+            byte_range_cache=args.byte_range_cache,
             collect_traces=args.collect_traces,
             native_parquet=args.native_parquet,
             max_io_threads=args.max_io_threads,
@@ -661,6 +668,7 @@ class RunConfig:
             "frontend": self.frontend,
             "iterations": self.iterations,
             "io_mode": self.io_mode,
+            "byte_range_cache": self.byte_range_cache,
             "collect_traces": self.collect_traces,
             "native_parquet": self.native_parquet,
             "max_io_threads": self.max_io_threads,
@@ -806,6 +814,86 @@ def drop_file_page_cache_recursively(path: os.PathLike | str) -> None:
     for f in p.rglob("*"):
         if f.is_file():
             kvikio.drop_file_page_cache(f)
+
+
+def _pinned_mr_from_engine(
+    engine: pl.GPUEngine | None,
+) -> tuple[Any, Any]:
+    """Return ``(pinned_mr, stream)`` from a streaming engine, or ``(None, None)``."""
+    if not CUDF_POLARS_AVAILABLE or not isinstance(engine, StreamingEngine):
+        return None, None
+    context = getattr(engine, "context", None)
+    if context is None:
+        return None, None
+    pinned_mr = context.br().pinned_mr
+    if pinned_mr is None:
+        return None, None
+    from rmm.pylibrmm.stream import Stream
+
+    return pinned_mr, Stream()
+
+
+def _begin_byte_range_cache_iteration(
+    run_config: RunConfig,
+    *,
+    q_id: int,
+    iteration: int,
+) -> None:
+    """Clear and start recording on iteration 0 when ``--byte-range-cache`` is set."""
+    if not run_config.byte_range_cache or iteration != 0:
+        return
+    from cudf_polars.streaming.byte_range_cache import (
+        clear_recorded_byte_ranges,
+        disable_byte_range_recording,
+        enable_byte_range_recording,
+        get_byte_range_cache,
+    )
+
+    disable_byte_range_recording()
+    clear_recorded_byte_ranges()
+    get_byte_range_cache().clear()
+    enable_byte_range_recording()
+    print(
+        f"byte-range cache: recording prefetch ranges for query {q_id} iteration 0",
+        flush=True,
+    )
+
+
+def _finish_byte_range_cache_iteration(
+    run_config: RunConfig,
+    args: argparse.Namespace,
+    engine: pl.GPUEngine | None,
+    *,
+    q_id: int,
+    iteration: int,
+) -> None:
+    """Populate the cache from recorded ranges after iteration 0."""
+    if not run_config.byte_range_cache or iteration != 0:
+        return
+    from cudf_polars.streaming.byte_range_cache import (
+        clear_recorded_byte_ranges,
+        disable_byte_range_recording,
+        dump_recorded_byte_ranges,
+        get_recorded_byte_ranges,
+        populate_byte_range_cache,
+    )
+
+    disable_byte_range_recording()
+    ranges = get_recorded_byte_ranges()
+    if args.results_directory is not None:
+        dump_path = Path(args.results_directory) / f"byte_ranges_q{q_id:02d}.json"
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        dump_recorded_byte_ranges(dump_path)
+        print(f"byte-range cache: wrote {dump_path}", flush=True)
+
+    pinned_mr, stream = _pinned_mr_from_engine(engine)
+    n = populate_byte_range_cache(ranges, pinned_mr=pinned_mr, stream=stream)
+    clear_recorded_byte_ranges()
+    print(
+        f"byte-range cache: recorded {len(ranges)} ranges, "
+        f"populated {n} unique entries for query {q_id}",
+        flush=True,
+    )
 
 
 def execute_query(
@@ -1084,6 +1172,7 @@ def run_polars_query(
                     )
                     engine._run(setup_logging, q_id, i)
 
+        _begin_byte_range_cache_iteration(run_config, q_id=q_id, iteration=i)
         try:
             record = run_polars_query_iteration(
                 q_id=q_id,
@@ -1107,8 +1196,17 @@ def run_polars_query(
                 status="error",
                 traceback=traceback.format_exc(),
             )
+            if run_config.byte_range_cache and i == 0:
+                from cudf_polars.streaming.byte_range_cache import (
+                    disable_byte_range_recording,
+                )
+
+                disable_byte_range_recording()
 
         else:
+            _finish_byte_range_cache_iteration(
+                run_config, args, engine, q_id=q_id, iteration=i
+            )
             if record.validation_result and record.validation_result.status == "Failed":
                 validation_failed = True
                 print(
@@ -2003,6 +2101,17 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
                 - hot      : One untimed warmup iteration to populate cache before measured runs"""),
     )
     parser.add_argument(
+        "--byte-range-cache",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=textwrap.dedent("""\
+            Prototype: cache hybrid-scan prefetch byte ranges across iterations.
+            Iteration 0 records (path, offset, size) reads and then populates an
+            in-process host/pinned cache; later iterations serve hits before HTTP.
+            Requires hybrid scan + metadata prefetch + pinned memory, and at least
+            2 iterations. Process-local (works with --frontend spmd; not Ray/Dask)."""),
+    )
+    parser.add_argument(
         "--collect-traces",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -2218,6 +2327,14 @@ def run_polars(benchmark: Any, args: argparse.Namespace) -> None:
             f"--collect-traces is not supported with --frontend {run_config.frontend}; "
             "cudf-polars tracing only applies to GPU frontends "
             "(in-memory, dask, ray, spmd)."
+        )
+
+    if run_config.byte_range_cache and run_config.frontend in ("ray", "dask"):
+        warnings.warn(
+            "--byte-range-cache is process-local and will not populate worker "
+            f"caches under --frontend {run_config.frontend}; prefer --frontend spmd.",
+            UserWarning,
+            stacklevel=1,
         )
 
     if run_config.validation_method is not None:
