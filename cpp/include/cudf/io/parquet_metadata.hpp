@@ -329,6 +329,21 @@ std::unique_ptr<table> read_parquet_column_chunk_bounds(
   cuda::stream_ref stream   = cudf::get_default_stream(),
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
+/**
+ * @copydoc cudf::io::read_parquet_column_chunk_bounds
+ *
+ * Takes pointers so that callers holding footers that are not contiguous in memory - for example
+ * the individually allocated footers behind pylibcudf's `FileMetaData` - do not have to copy them
+ * into a vector first.
+ *
+ * @throw std::invalid_argument if any pointer is null
+ */
+std::unique_ptr<table> read_parquet_column_chunk_bounds(
+  std::span<parquet::FileMetaData const* const> parquet_metadatas,
+  std::span<std::string const> column_names,
+  cuda::stream_ref stream   = cudf::get_default_stream(),
+  cudf::memory_resources mr = cudf::get_current_device_resource_ref());
+
 /** @} */  // end of group
 }  // namespace io
 }  // namespace CUDF_EXPORT cudf

@@ -36,7 +36,7 @@ using parquet::detail::row_group_info;
  */
 struct metadata : public metadata_base {
   explicit metadata(cudf::host_span<uint8_t const> footer_bytes);
-  explicit metadata(FileMetaData const& other) { static_cast<FileMetaData&>(*this) = other; }
+  explicit metadata(FileMetaData const& other) : metadata_base(FileMetaData{other}) {}
   metadata(metadata const& other)            = delete;
   metadata(metadata&& other)                 = default;
   metadata& operator=(metadata const& other) = delete;

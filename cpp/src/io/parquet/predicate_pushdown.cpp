@@ -46,7 +46,7 @@ bool aggregate_reader_metadata::any_row_group_stats_available(
       if (row_group_indices.empty()) { continue; }
 
       auto const& first_row_group =
-        per_file_metadata[src_idx].row_groups[row_group_indices.front()];
+        per_file_metadata[src_idx].footer().row_groups[row_group_indices.front()];
       auto const mapped_schema_idx = map_schema_index(schema_idx, static_cast<int>(src_idx));
       colchunk_offset =
         find_colchunk_iter_offset(first_row_group, mapped_schema_idx, colchunk_offset);
@@ -194,7 +194,7 @@ aggregate_reader_metadata::filter_row_groups(
   // Collect equality literals for each input table column for bloom filtering
   auto const equality_literals =
     equality_literals_collector{
-      filter.get(), output_dtypes, output_column_schemas, per_file_metadata[0].schema}
+      filter.get(), output_dtypes, output_column_schemas, per_file_metadata[0].schema()}
       .get_literals();
 
   // Collect schema indices of columns with equality predicate(s)

@@ -36,6 +36,57 @@ namespace parquet::detail {
 class reader_impl;
 
 /**
+ * @brief Pre-materialized Parquet footers handed to the reader
+ *
+ * The reader either takes ownership of the footers - the right model for temporaries such as the
+ * return value of `read_parquet_footers()` - or borrows footers that the caller keeps alive and
+ * may reuse across reads. Borrowed footers are never modified by the reader.
+ */
+class file_metadata_inputs {
+ public:
+  file_metadata_inputs() = default;
+
+  /**
+   * @brief Hand the reader ownership of the footers
+   *
+   * @param footers Footers to move into the reader
+   */
+  file_metadata_inputs(std::vector<FileMetaData>&& footers) : _owned{std::move(footers)} {}
+
+  /**
+   * @brief Lend the reader footers owned by the caller
+   *
+   * @param footers Footers that must outlive the reader
+   */
+  file_metadata_inputs(std::span<FileMetaData const* const> footers)
+    : _borrowed(footers.begin(), footers.end())
+  {
+  }
+
+  /// @brief Whether no footers were provided, in which case the reader parses its own
+  [[nodiscard]] bool empty() const { return _owned.empty() and _borrowed.empty(); }
+
+  /// @brief Number of footers provided
+  [[nodiscard]] std::size_t size() const
+  {
+    return _owned.empty() ? _borrowed.size() : _owned.size();
+  }
+
+  /// @brief Whether the reader owns the footers
+  [[nodiscard]] bool is_owning() const { return not _owned.empty(); }
+
+  /// @brief The owned footers
+  [[nodiscard]] std::vector<FileMetaData>&& owned() && { return std::move(_owned); }
+
+  /// @brief The borrowed footers
+  [[nodiscard]] std::span<FileMetaData const* const> borrowed() const { return _borrowed; }
+
+ private:
+  std::vector<FileMetaData> _owned;
+  std::vector<FileMetaData const*> _borrowed;
+};
+
+/**
  * @brief Class to read Parquet dataset data into columns.
  */
 class reader {
@@ -58,7 +109,7 @@ class reader {
    * @param mr Device memory resource to use for device memory allocation
    */
   explicit reader(std::vector<std::unique_ptr<cudf::io::datasource>>&& sources,
-                  std::vector<FileMetaData>&& parquet_metadatas,
+                  file_metadata_inputs&& parquet_metadatas,
                   parquet_reader_options const& options,
                   cuda::stream_ref stream,
                   rmm::device_async_resource_ref mr);
@@ -145,7 +196,7 @@ class chunked_reader : private reader {
   explicit chunked_reader(std::size_t chunk_read_limit,
                           std::size_t pass_read_limit,
                           std::vector<std::unique_ptr<cudf::io::datasource>>&& sources,
-                          std::vector<parquet::FileMetaData>&& parquet_metadatas,
+                          file_metadata_inputs&& parquet_metadatas,
                           parquet_reader_options const& options,
                           cuda::stream_ref stream,
                           rmm::device_async_resource_ref mr);

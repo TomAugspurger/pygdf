@@ -10,7 +10,7 @@ namespace cudf::io::parquet::detail {
 reader::reader() = default;
 
 reader::reader(std::vector<std::unique_ptr<datasource>>&& sources,
-               std::vector<FileMetaData>&& parquet_metadatas,
+               file_metadata_inputs&& parquet_metadatas,
                parquet_reader_options const& options,
                cuda::stream_ref stream,
                rmm::device_async_resource_ref mr)
@@ -26,7 +26,7 @@ table_with_metadata reader::read() { return _impl->read(); }
 chunked_reader::chunked_reader(std::size_t chunk_read_limit,
                                std::size_t pass_read_limit,
                                std::vector<std::unique_ptr<datasource>>&& sources,
-                               std::vector<FileMetaData>&& parquet_metadatas,
+                               file_metadata_inputs&& parquet_metadatas,
                                parquet_reader_options const& options,
                                cuda::stream_ref stream,
                                rmm::device_async_resource_ref mr)

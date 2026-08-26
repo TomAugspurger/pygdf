@@ -53,7 +53,7 @@ class reader_impl {
    * @param mr Device memory resource to use for device memory allocation
    */
   explicit reader_impl(std::vector<std::unique_ptr<datasource>>&& sources,
-                       std::vector<FileMetaData>&& parquet_metadatas,
+                       file_metadata_inputs&& parquet_metadatas,
                        parquet_reader_options const& options,
                        cuda::stream_ref stream,
                        rmm::device_async_resource_ref mr);
@@ -102,7 +102,7 @@ class reader_impl {
   explicit reader_impl(std::size_t chunk_read_limit,
                        std::size_t pass_read_limit,
                        std::vector<std::unique_ptr<datasource>>&& sources,
-                       std::vector<FileMetaData>&& parquet_metadatas,
+                       file_metadata_inputs&& parquet_metadatas,
                        parquet_reader_options const& options,
                        cuda::stream_ref stream,
                        rmm::device_async_resource_ref mr);

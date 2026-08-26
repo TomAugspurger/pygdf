@@ -498,14 +498,14 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
 reader_impl::reader_impl() : _stream{cudaStream_t{nullptr}}, _options{} {}
 
 reader_impl::reader_impl(std::vector<std::unique_ptr<datasource>>&& sources,
-                         std::vector<FileMetaData>&& parquet_metadatas,
+                         file_metadata_inputs&& parquet_metadatas,
                          parquet_reader_options const& options,
                          cuda::stream_ref stream,
                          rmm::device_async_resource_ref mr)
   : reader_impl(0 /*chunk_read_limit*/,
                 0 /*input_pass_read_limit*/,
                 std::forward<std::vector<std::unique_ptr<cudf::io::datasource>>>(sources),
-                std::forward<std::vector<FileMetaData>>(parquet_metadatas),
+                std::move(parquet_metadatas),
                 options,
                 stream,
                 mr)
@@ -515,7 +515,7 @@ reader_impl::reader_impl(std::vector<std::unique_ptr<datasource>>&& sources,
 reader_impl::reader_impl(std::size_t chunk_read_limit,
                          std::size_t pass_read_limit,
                          std::vector<std::unique_ptr<datasource>>&& sources,
-                         std::vector<FileMetaData>&& file_metadatas,
+                         file_metadata_inputs&& file_metadatas,
                          parquet_reader_options const& options,
                          cuda::stream_ref stream,
                          rmm::device_async_resource_ref mr)
@@ -550,14 +550,14 @@ reader_impl::reader_impl(std::size_t chunk_read_limit,
   CUDF_EXPECTS(file_metadatas.empty() or file_metadatas.size() == _sources.size(),
                "Encountered a mismatch in the number of provided data sources and metadatas");
 
-  _metadata = file_metadatas.empty() ? std::make_shared<aggregate_reader_metadata>(
-                                         _sources,
-                                         options.is_enabled_use_arrow_schema(),
-                                         has_cols_from_mismatched_sources(options))
-                                     : std::make_shared<aggregate_reader_metadata>(
-                                         std::forward<std::vector<FileMetaData>>(file_metadatas),
-                                         options.is_enabled_use_arrow_schema(),
-                                         has_cols_from_mismatched_sources(options));
+  _metadata =
+    file_metadatas.empty()
+      ? std::make_shared<aggregate_reader_metadata>(_sources,
+                                                    options.is_enabled_use_arrow_schema(),
+                                                    has_cols_from_mismatched_sources(options))
+      : std::make_shared<aggregate_reader_metadata>(std::move(file_metadatas),
+                                                    options.is_enabled_use_arrow_schema(),
+                                                    has_cols_from_mismatched_sources(options));
 
   // Number of input sources
   _num_sources = _sources.size();

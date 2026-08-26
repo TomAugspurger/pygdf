@@ -9,12 +9,15 @@
 
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/io/datasource.hpp>
+#include <cudf/io/detail/parquet.hpp>
 #include <cudf/io/parquet.hpp>
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/types.hpp>
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <span>
@@ -155,22 +158,87 @@ struct row_group_size_info {
   std::optional<size_type> cached_offset = std::nullopt);
 
 /**
- * @brief Class for parsing dataset metadata
+ * @brief Handle to a dataset footer, either owned or borrowed
+ *
+ * Parsing a footer (and the schema rewrites that go with it) requires a mutable object, so the
+ * parse path owns its `FileMetaData`. A footer that was materialized elsewhere - by
+ * `read_parquet_footers()` or by a Python caller - is borrowed and never written: the few schema
+ * fields the reader rewrites (`repetition_type`, `arrow_type`) go into an overlay copy of the
+ * schema tree, which is small compared to the row groups and page indexes.
  */
-struct metadata : public FileMetaData {
-  metadata() = default;
+class metadata {
+ public:
+  metadata();
   explicit metadata(datasource* source, bool read_page_indexes = true);
   explicit metadata(FileMetaData&& other);
+
+  /**
+   * @brief Borrow a footer owned by the caller
+   *
+   * @param footer Footer that must outlive this handle
+   */
+  explicit metadata(FileMetaData const* footer);
+
   metadata(metadata const& other)            = delete;
   metadata(metadata&& other)                 = default;
   metadata& operator=(metadata const& other) = delete;
   metadata& operator=(metadata&& other)      = default;
   ~metadata();
 
+  /**
+   * @brief Get the footer, whether owned or borrowed
+   *
+   * The returned object is never modified after this handle is constructed. Use `schema()` instead
+   * of `footer().schema` to pick up the reader's schema rewrites.
+   */
+  [[nodiscard]] FileMetaData const& footer() const
+  {
+    return _borrowed != nullptr ? *_borrowed : *_owned;
+  }
+
+  /**
+   * @brief Get the schema tree as seen by the reader
+   */
+  [[nodiscard]] std::vector<SchemaElement> const& schema() const
+  {
+    return _schema_overlay.has_value() ? *_schema_overlay : footer().schema;
+  }
+
+  /**
+   * @brief Get the schema tree for writing, copying it out of the footer on first use
+   */
+  [[nodiscard]] std::vector<SchemaElement>& mutable_schema();
+
+  /**
+   * @brief Whether this handle owns its footer
+   */
+  [[nodiscard]] bool owns_footer() const { return _owned != nullptr; }
+
+  /**
+   * @brief Copy the footer out, including the reader's schema rewrites
+   */
+  [[nodiscard]] FileMetaData materialize() const;
+
+  /**
+   * @brief Parse the page index and hang it off the owned footer's column chunks
+   *
+   * @param page_index_bytes Host bytes of the page index
+   * @param min_offset File offset the page index bytes start at
+   */
   void setup_page_index(cudf::host_span<uint8_t const> page_index_bytes, int64_t min_offset);
 
  protected:
+  /**
+   * @brief Get the owned footer for parse-time mutation
+   */
+  [[nodiscard]] FileMetaData& owned_footer();
+
   void sanitize_schema();
+
+ private:
+  std::unique_ptr<FileMetaData> _owned;
+  FileMetaData const* _borrowed = nullptr;
+  std::optional<std::vector<SchemaElement>> _schema_overlay;
 };
 
 /**
@@ -449,7 +517,7 @@ class aggregate_reader_metadata {
                             bool has_cols_from_mismatched_srcs,
                             bool read_page_indexes = true);
 
-  aggregate_reader_metadata(std::vector<FileMetaData>&& parquet_metadatas,
+  aggregate_reader_metadata(file_metadata_inputs&& parquet_metadatas,
                             bool use_arrow_schema,
                             bool has_cols_from_mismatched_srcs);
 
@@ -500,7 +568,13 @@ class aggregate_reader_metadata {
    */
   [[nodiscard]] std::vector<FileMetaData> get_parquet_metadatas() const
   {
-    return std::vector<FileMetaData>{per_file_metadata.begin(), per_file_metadata.end()};
+    std::vector<FileMetaData> metadatas;
+    metadatas.reserve(per_file_metadata.size());
+    std::transform(per_file_metadata.begin(),
+                   per_file_metadata.end(),
+                   std::back_inserter(metadatas),
+                   [](auto const& pfm) { return pfm.materialize(); });
+    return metadatas;
   }
 
   /**
@@ -625,7 +699,7 @@ class aggregate_reader_metadata {
       schema_idx >= 0 and pfm_idx >= 0 and std::cmp_less(pfm_idx, per_file_metadata.size()),
       "Parquet reader encountered an invalid schema_idx or pfm_idx",
       std::out_of_range);
-    return per_file_metadata[pfm_idx].schema[schema_idx];
+    return per_file_metadata[pfm_idx].schema()[schema_idx];
   }
 
   [[nodiscard]] auto const& get_schema_tree(int pfm_idx = 0) const
@@ -633,7 +707,7 @@ class aggregate_reader_metadata {
     CUDF_EXPECTS(pfm_idx >= 0 and std::cmp_less(pfm_idx, per_file_metadata.size()),
                  "Parquet reader encountered an invalid pfm_idx",
                  std::out_of_range);
-    return per_file_metadata[pfm_idx].schema;
+    return per_file_metadata[pfm_idx].schema();
   }
 
   [[nodiscard]] auto const& get_key_value_metadata() const& { return keyval_maps; }
@@ -651,16 +725,16 @@ class aggregate_reader_metadata {
    */
   [[nodiscard]] inline int get_output_nesting_depth(int schema_index) const
   {
-    auto& pfm = per_file_metadata[0];
-    int depth = 0;
+    auto const& schema = per_file_metadata[0].schema();
+    int depth          = 0;
 
     // walk upwards, skipping repeated fields
     while (schema_index > 0) {
-      auto const& elm = pfm.schema[schema_index];
+      auto const& elm = schema[schema_index];
       if (!elm.is_stub()) { depth++; }
       // schema of one-level encoding list doesn't contain nesting information, so we need to
       // manually add an extra nesting level
-      if (elm.is_one_level_list(pfm.schema[elm.parent_idx])) { depth++; }
+      if (elm.is_one_level_list(schema[elm.parent_idx])) { depth++; }
       schema_index = elm.parent_idx;
     }
     return depth;

@@ -309,7 +309,7 @@ struct page_stats_caster : public stats_caster_base {
     // Compute timestamp scale factor for precision conversion
     auto const ts_scale = [&] {
       if constexpr (cudf::is_timestamp<T>()) {
-        auto const& schema = per_file_metadata[0].schema[schema_idx];
+        auto const& schema = per_file_metadata[0].schema()[schema_idx];
         return parquet::detail::calc_timestamp_scale(schema.logical_type,
                                                      static_cast<int32_t>(T::period::den));
       }
@@ -326,7 +326,7 @@ struct page_stats_caster : public stats_caster_base {
         // For all column chunks in this source
         auto const& rg_indices = row_group_indices[src_idx];
         std::for_each(rg_indices.cbegin(), rg_indices.cend(), [&](auto rg_idx) {
-          auto const& row_group = per_file_metadata[src_idx].row_groups[rg_idx];
+          auto const& row_group = per_file_metadata[src_idx].footer().row_groups[rg_idx];
           // Find colchunk_iter in row_group.columns. Guaranteed to be found as already verified
           // in compute_page_row_offsets_and_colchunk_page_offsets()
           auto colchunk_iter = std::find_if(

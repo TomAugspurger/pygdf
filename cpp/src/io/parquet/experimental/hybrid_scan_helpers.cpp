@@ -106,8 +106,8 @@ metadata::metadata(cudf::host_span<uint8_t const> footer_bytes)
   CUDF_FUNC_RANGE();
 
   CompactProtocolReader cp(footer_bytes.data(), footer_bytes.size());
-  cp.read(this);
-  auto const is_schema_initialized = cp.InitSchema(this);
+  cp.read(&owned_footer());
+  auto const is_schema_initialized = cp.InitSchema(&owned_footer());
   CUDF_EXPECTS(is_schema_initialized, "Cannot initialize schema");
   sanitize_schema();
 }
@@ -154,7 +154,7 @@ void aggregate_reader_metadata::initialize_internals(bool use_arrow_schema,
   // Force all non-nullable (REQUIRED) columns to be nullable without modifying REPEATED columns to
   // preserve list structures
   std::for_each(per_file_metadata.begin(), per_file_metadata.end(), [](auto& pfm) {
-    auto& schema = pfm.schema;
+    auto& schema = pfm.mutable_schema();
     std::for_each(schema.begin() + 1, schema.end(), [](auto& col) {
       // TODO: Store information of whichever column schema we modified here and restore it to
       // `REQUIRED` if we end up not pruning any pages out of it
@@ -182,7 +182,7 @@ std::vector<text::byte_range_info> aggregate_reader_metadata::page_index_byte_ra
                  per_file_metadata.end(),
                  std::back_inserter(page_index_byte_ranges),
                  [](auto const& file_metadata) -> text::byte_range_info {
-                   return page_index_byte_range(file_metadata);
+                   return page_index_byte_range(file_metadata.footer());
                  });
 
   return page_index_byte_ranges;
@@ -198,7 +198,7 @@ std::pair<bool, bool> aggregate_reader_metadata::page_index_presence(
   auto has_offset = true;
 
   for (size_type src_idx = 0; std::cmp_less(src_idx, row_group_indices.size()); ++src_idx) {
-    auto const& file_metadata = per_file_metadata[src_idx];
+    auto const& file_metadata = per_file_metadata[src_idx].footer();
     for (auto const schema_idx : schema_indices) {
       auto const mapped_schema_idx = map_schema_index(schema_idx, src_idx);
       std::optional<size_type> colchunk_offset;
@@ -228,7 +228,7 @@ std::pair<bool, bool> aggregate_reader_metadata::page_index_presence(
 
 std::vector<FileMetaData> aggregate_reader_metadata::parquet_metadatas() const
 {
-  return {per_file_metadata.begin(), per_file_metadata.end()};
+  return get_parquet_metadatas();
 }
 
 void aggregate_reader_metadata::setup_page_indexes(
@@ -241,7 +241,7 @@ void aggregate_reader_metadata::setup_page_indexes(
   std::for_each(iter, iter + page_index_bytes.size(), [&](auto const& pair) {
     // Get the page index bytes and file metadata
     auto const& [pgidx_bytes, file_metadata] = pair;
-    auto const& row_groups                   = file_metadata.row_groups;
+    auto const& row_groups                   = file_metadata.footer().row_groups;
 
     // Return early if empty page index buffer span
     if (pgidx_bytes.empty()) { return; }
@@ -250,7 +250,7 @@ void aggregate_reader_metadata::setup_page_indexes(
     CUDF_EXPECTS(not row_groups.empty() and not row_groups.front().columns.empty(),
                  "No column chunks in Parquet schema to read page index for");
 
-    auto const expected_byte_range = page_index_byte_range(file_metadata);
+    auto const expected_byte_range = page_index_byte_range(file_metadata.footer());
 
     CUDF_EXPECTS(not expected_byte_range.is_empty() and
                    std::cmp_equal(pgidx_bytes.size(), expected_byte_range.size()),
@@ -270,7 +270,7 @@ std::vector<std::vector<size_type>> aggregate_reader_metadata::all_row_groups(
     auto iter = cuda::zip_iterator(opts_row_groups.begin(), per_file_metadata.begin());
     std::for_each(iter, iter + opts_row_groups.size(), [&](auto const& pair) {
       auto const& [file_row_groups, file_metadata] = pair;
-      auto const& row_groups                       = file_metadata.row_groups;
+      auto const& row_groups                       = file_metadata.footer().row_groups;
       for (auto const rg_idx : file_row_groups) {
         CUDF_EXPECTS(rg_idx >= 0 and std::cmp_less(rg_idx, row_groups.size()),
                      "Encountered out-of-bounds row group index for data source",
@@ -286,7 +286,7 @@ std::vector<std::vector<size_type>> aggregate_reader_metadata::all_row_groups(
                  per_file_metadata.end(),
                  std::back_inserter(row_groups),
                  [](auto const& pfm) {
-                   std::vector<size_type> indices(pfm.row_groups.size());
+                   std::vector<size_type> indices(pfm.footer().row_groups.size());
                    std::iota(indices.begin(), indices.end(), size_type{0});
                    return indices;
                  });
@@ -305,7 +305,7 @@ std::size_t aggregate_reader_metadata::total_rows_in_row_groups(
     cuda::counting_iterator{row_group_indices.size()},
     std::size_t{0},
     [&](auto sum, auto const src_idx) {
-      auto const& file_metadata = per_file_metadata[src_idx];
+      auto const& file_metadata = per_file_metadata[src_idx].footer();
       return std::accumulate(
         row_group_indices[src_idx].begin(),
         row_group_indices[src_idx].end(),
@@ -452,7 +452,7 @@ aggregate_reader_metadata::bloom_filters_byte_ranges(
       filter.get(),
       host_span<data_type const>{output_dtypes.data(), output_dtypes.size()},
       host_span<cudf::size_type const>{output_column_schemas.data(), output_column_schemas.size()},
-      per_file_metadata[0].schema}
+      per_file_metadata[0].schema()}
       .get_literals();
 
   // Collect schema indices of columns with equality predicate(s)
@@ -558,17 +558,17 @@ aggregate_reader_metadata::dictionary_pages_byte_ranges(
   std::vector<std::optional<size_type>> colchunk_offsets(dictionary_col_schemas.size());
 
   // For all sources
-  std::for_each(cuda::counting_iterator<std::size_t>{0},
-                cuda::counting_iterator{row_group_indices.size()},
-                [&](auto const src_index) {
-                  // Get all row group indices in the data source
-                  auto const& rg_indices = row_group_indices[src_index];
-                  // For all row groups
-                  std::for_each(rg_indices.cbegin(), rg_indices.cend(), [&](auto const rg_index) {
-                    auto const& row_group = per_file_metadata[src_index].row_groups[rg_index];
-                    // For all dictionary column chunks
-                    std::for_each(
-                      cuda::counting_iterator<std::size_t>{0},
+  std::for_each(
+    cuda::counting_iterator<std::size_t>{0},
+    cuda::counting_iterator{row_group_indices.size()},
+    [&](auto const src_index) {
+      // Get all row group indices in the data source
+      auto const& rg_indices = row_group_indices[src_index];
+      // For all row groups
+      std::for_each(rg_indices.cbegin(), rg_indices.cend(), [&](auto const rg_index) {
+        auto const& row_group = per_file_metadata[src_index].footer().row_groups[rg_index];
+        // For all dictionary column chunks
+        std::for_each(cuda::counting_iterator<std::size_t>{0},
                       cuda::counting_iterator{dictionary_col_schemas.size()},
                       [&](auto const col) {
                         // Map the schema index to this source
@@ -634,8 +634,8 @@ aggregate_reader_metadata::dictionary_pages_byte_ranges(
                         dictionary_page_bytes.emplace_back(dictionary_offset, dictionary_size);
                         dictionary_page_source_map.emplace_back(static_cast<size_type>(src_index));
                       });
-                  });
-                });
+      });
+    });
 
   if (not have_dictionary_pages) { return {}; }
 
@@ -688,7 +688,7 @@ aggregate_reader_metadata::filter_row_groups_with_bloom_filters(
       filter.get(),
       host_span<data_type const>{output_dtypes.data(), output_dtypes.size()},
       host_span<cudf::size_type const>{output_column_schemas.data(), output_column_schemas.size()},
-      per_file_metadata[0].schema}
+      per_file_metadata[0].schema()}
       .get_literals();
 
   // Collect schema indices of columns with equality predicate(s)
