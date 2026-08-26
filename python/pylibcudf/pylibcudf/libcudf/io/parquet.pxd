@@ -6,6 +6,7 @@ from libcpp.functional cimport reference_wrapper
 from libcpp.map cimport map
 from libcpp.memory cimport shared_ptr, unique_ptr
 from libcpp.optional cimport optional
+from libcpp.span cimport span as std_span
 from libcpp.string cimport string
 from libcpp.vector cimport vector
 from pylibcudf.exception_handler cimport libcudf_exception_handler
@@ -26,6 +27,8 @@ from pylibcudf.libcudf.table.table_view cimport table_view
 from pylibcudf.libcudf.types cimport data_type, size_type, type_id
 from cuda.bindings.cyruntime cimport cudaStream_t
 from rmm.librmm.memory_resource cimport device_async_resource_ref
+
+ctypedef const FileMetaData* const_FileMetaData_ptr
 
 
 cdef extern from "cudf/io/parquet.hpp" namespace "cudf::io" nogil:
@@ -137,7 +140,7 @@ cdef extern from "cudf/io/parquet.hpp" namespace "cudf::io" nogil:
     ) except +libcudf_exception_handler
     cdef table_with_metadata read_parquet(
         vector[unique_ptr[datasource]] sources,
-        vector[FileMetaData] parquet_metadatas,
+        std_span[const_FileMetaData_ptr] parquet_metadatas,
         const parquet_reader_options& args,
         cudaStream_t stream,
         device_async_resource_ref mr
@@ -324,7 +327,7 @@ cdef extern from "cudf/io/parquet.hpp" namespace "cudf::io" nogil:
         chunked_parquet_reader(
             size_t chunk_read_limit,
             vector[unique_ptr[datasource]] sources,
-            vector[FileMetaData] parquet_metadatas,
+            std_span[const_FileMetaData_ptr] parquet_metadatas,
             const parquet_reader_options& options,
             cudaStream_t stream,
             device_async_resource_ref mr
@@ -340,7 +343,7 @@ cdef extern from "cudf/io/parquet.hpp" namespace "cudf::io" nogil:
             size_t chunk_read_limit,
             size_t pass_read_limit,
             vector[unique_ptr[datasource]] sources,
-            vector[FileMetaData] parquet_metadatas,
+            std_span[const_FileMetaData_ptr] parquet_metadatas,
             const parquet_reader_options& options,
             cudaStream_t stream,
             device_async_resource_ref mr

@@ -80,6 +80,8 @@ cdef class ChunkedParquetReader:
     cdef Stream _stream
     cdef DeviceMemoryResource mr
     cdef unique_ptr[cpp_chunked_parquet_reader] reader
+    # Keeps borrowed FileMetaData alive for the reader's lifetime
+    cdef tuple _metadata_holders
 
     cpdef bool has_next(self)
     cpdef TableWithMetadata read_chunk(self, DeviceMemoryResource mr=*)

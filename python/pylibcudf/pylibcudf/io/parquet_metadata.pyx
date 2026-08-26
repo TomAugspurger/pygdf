@@ -43,7 +43,7 @@ if TYPE_CHECKING:
 
 ctypedef const unique_ptr[datasource] const_unique_ptr_datasource
 ctypedef const string const_string
-ctypedef const cpp_FileMetaData const_cpp_FileMetaData
+ctypedef const cpp_FileMetaData* const_cpp_FileMetaData_ptr
 
 
 __all__ = [
@@ -830,7 +830,7 @@ cpdef Table read_parquet_column_chunk_bounds(
         column after that. For ``columns[i]``, the minimum column is at
         ``2 + 2 * i`` and the maximum column is at ``3 + 2 * i``.
     """
-    cdef vector[cpp_FileMetaData] c_metadatas
+    cdef vector[const_cpp_FileMetaData_ptr] c_metadatas
     cdef vector[string] c_columns
     cdef unique_ptr[cpp_table] c_result
     cdef object metadata_obj
@@ -839,10 +839,12 @@ cpdef Table read_parquet_column_chunk_bounds(
     cdef cudaStream_t _cs = _stream.view().value()
     mr = _get_memory_resource(mr)
 
-    for metadata_obj in file_metadatas:
+    # libcudf borrows the footers; `metadata_holders` keeps the wrappers alive
+    metadata_holders = tuple(file_metadatas)
+    for metadata_obj in metadata_holders:
         if not isinstance(metadata_obj, FileMetaData):
             raise TypeError("file_metadatas must contain only FileMetaData objects")
-        c_metadatas.push_back(dereference((<FileMetaData>metadata_obj).c_obj))
+        c_metadatas.push_back((<FileMetaData>metadata_obj).c_obj.get())
 
     if isinstance(columns, str):
         raise TypeError("columns must be a sequence of strings")
@@ -854,7 +856,7 @@ cpdef Table read_parquet_column_chunk_bounds(
 
     with nogil:
         c_result = cpp_parquet_metadata.read_parquet_column_chunk_bounds(
-            std_span[const_cpp_FileMetaData](
+            std_span[const_cpp_FileMetaData_ptr](
                 c_metadatas.data(), c_metadatas.size()
             ),
             std_span[const_string](c_columns.data(), c_columns.size()),

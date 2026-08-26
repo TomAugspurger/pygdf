@@ -8,6 +8,7 @@ from libc.stdint cimport int32_t, int64_t, uint8_t
 
 from libcpp cimport bool
 from libcpp.memory cimport unique_ptr, make_unique
+from libcpp.span cimport span as std_span
 from libcpp.string cimport string
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
@@ -39,7 +40,8 @@ from pylibcudf.libcudf.io.parquet cimport (
     chunked_parquet_writer_options,
     merge_row_group_metadata as cpp_merge_row_group_metadata,
 )
-from pylibcudf.libcudf.io.parquet_schema cimport FileMetaData as cpp_FileMetaData
+from pylibcudf.libcudf.io.parquet cimport const_FileMetaData_ptr \
+    as const_cpp_FileMetaData_ptr
 from pylibcudf.libcudf.io.types cimport (
     compression_type,
     dictionary_policy as dictionary_policy_t,
@@ -82,17 +84,16 @@ def _warn_deprecated(api_name, new_api):
     )
 
 
-cdef vector[cpp_FileMetaData*] _parquet_metadata_ptrs(
+cdef vector[const_cpp_FileMetaData_ptr] _parquet_metadata_ptrs(
     object parquet_metadatas,
     size_t num_sources,
 ) except *:
-    """Validate Python FileMetaData list and collect non-owning C++ pointers.
+    """Validate a Python FileMetaData list and collect non-owning C++ pointers.
 
-    The expensive deep clone must happen later under the same ``nogil`` block as
-    ``read_parquet`` / the chunked reader ctor. Returning ``vector[FileMetaData]``
-    from a cdef helper copies again with the GIL held (no libcudf NVTX).
+    libcudf borrows the pointed-to footers rather than copying them, so the caller
+    must keep the Python wrappers alive for as long as the reader runs.
     """
-    cdef vector[cpp_FileMetaData*] metadata_ptrs
+    cdef vector[const_cpp_FileMetaData_ptr] metadata_ptrs
     cdef object metadata
     if parquet_metadatas is None:
         return metadata_ptrs
@@ -615,10 +616,8 @@ cdef class ChunkedParquetReader:
         self._stream = _get_stream(stream)
         self.mr = _get_memory_resource(mr)
         cdef vector[unique_ptr[datasource]] sources
-        cdef vector[cpp_FileMetaData] c_metadatas
-        cdef vector[cpp_FileMetaData*] metadata_ptrs
+        cdef vector[const_cpp_FileMetaData_ptr] metadata_ptrs
         cdef cudaStream_t stream_view = self._stream.view().value()
-        cdef size_t i
         if parquet_metadatas is None:
             with nogil:
                 self.reader.reset(
@@ -633,22 +632,22 @@ cdef class ChunkedParquetReader:
         else:
             with nogil:
                 sources = make_datasources(options.c_obj.get_source())
-            # Pin wrappers for the nogil clone; do not rely on the caller's
-            # mutable parquet_metadatas container remaining unchanged.
-            metadata_holders = tuple(parquet_metadatas)
+            # libcudf borrows these footers for the lifetime of the reader, so hold
+            # the wrappers on the instance rather than relying on the caller's
+            # (possibly mutable) container.
+            self._metadata_holders = tuple(parquet_metadatas)
             metadata_ptrs = _parquet_metadata_ptrs(
-                metadata_holders, sources.size()
+                self._metadata_holders, sources.size()
             )
             with nogil:
-                c_metadatas.reserve(metadata_ptrs.size())
-                for i in range(metadata_ptrs.size()):
-                    c_metadatas.push_back(dereference(metadata_ptrs[i]))
                 self.reader.reset(
                     new cpp_chunked_parquet_reader(
                         chunk_read_limit,
                         pass_read_limit,
                         move(sources),
-                        move(c_metadatas),
+                        std_span[const_cpp_FileMetaData_ptr](
+                            metadata_ptrs.data(), metadata_ptrs.size()
+                        ),
                         options.c_obj,
                         stream_view,
                         self.mr.get_mr()
@@ -722,31 +721,27 @@ cpdef TableWithMetadata read_parquet(
     cdef Stream s = _get_stream(stream)
     cdef cudaStream_t _cs = s.view().value()
     cdef vector[unique_ptr[datasource]] sources
-    cdef vector[cpp_FileMetaData] c_metadatas
-    cdef vector[cpp_FileMetaData*] metadata_ptrs
+    cdef vector[const_cpp_FileMetaData_ptr] metadata_ptrs
     cdef table_with_metadata c_result
-    cdef size_t i
     mr = _get_memory_resource(mr)
     if parquet_metadatas is None:
         with nogil:
             c_result = move(cpp_read_parquet(options.c_obj, _cs, mr.get_mr()))
     else:
-        # Collect pointers under GIL; clone + read must share one nogil block so
-        # Cython does not deep-copy vector[FileMetaData] while holding the GIL.
         with nogil:
             sources = make_datasources(options.c_obj.get_source())
-        # Pin wrappers for the nogil clone; do not rely on the caller's
-        # mutable parquet_metadatas container remaining unchanged.
+        # libcudf borrows these footers for the duration of the read; the local
+        # tuple keeps them alive and shields us from a caller mutating their
+        # container mid-read.
         metadata_holders = tuple(parquet_metadatas)
         metadata_ptrs = _parquet_metadata_ptrs(metadata_holders, sources.size())
         with nogil:
-            c_metadatas.reserve(metadata_ptrs.size())
-            for i in range(metadata_ptrs.size()):
-                c_metadatas.push_back(dereference(metadata_ptrs[i]))
             c_result = move(
                 cpp_read_parquet(
                     move(sources),
-                    move(c_metadatas),
+                    std_span[const_cpp_FileMetaData_ptr](
+                        metadata_ptrs.data(), metadata_ptrs.size()
+                    ),
                     options.c_obj,
                     _cs,
                     mr.get_mr(),
