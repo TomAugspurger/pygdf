@@ -25,7 +25,7 @@ from rapidsmpf.statistics import Statistics
 from rapidsmpf.streaming.core.context import Context
 
 import cudf_polars.quent
-import cudf_polars.quent._logging
+import cudf_polars.quent._runtime
 import cudf_polars.quent._types
 from cudf_polars.engine import persisted_result, rank_local_store
 from cudf_polars.engine.core import (
@@ -52,7 +52,7 @@ from cudf_polars.quent._context import (
     LocalQuentContext,
     WorkerResources,
 )
-from cudf_polars.quent._types import Worker
+from cudf_polars.quent._types import Backend, Worker
 from cudf_polars.unstable import unstable
 from cudf_polars.utils.config import (
     MemoryResourceConfig,
@@ -288,8 +288,8 @@ class RankActor:
         self._comm: Communicator | None = None
         self._ctx: Context | None = None
         if quent_enabled:
-            self._quent_logger: cudf_polars.quent._logging.QuentLogger | None = (
-                cudf_polars.quent._logging.QuentLogger()
+            self._quent_logger: cudf_polars.quent._runtime.QuentSession | None = (
+                cudf_polars.quent._runtime.QuentSession()
             )
         else:
             self._quent_logger = None
@@ -352,7 +352,10 @@ class RankActor:
         barrier(self._comm)
         # Now we can declare the Quent worker resources, which depends on self._comm
         if self._quent_logger is not None:
-            self._quent_logger.emit(self._quent_worker._init())
+            self._quent_logger.worker(self._quent_worker.id).initialized(
+                instance_name=self._quent_worker.instance_name,
+                engine=self._quent_logger.to_uuid(self._quent_worker.engine.id),
+            )
             self.worker_resources = WorkerResources.build(
                 instance_suffix=f"RankActor-{self._quent_worker.id.hex[:8]}",
                 engine_id=self._quent_engine.id,
@@ -439,7 +442,7 @@ class RankActor:
             if self.worker_resources is not None:
                 self.worker_resources.finalize(self._quent_logger)
 
-            self._quent_logger.emit(self._quent_worker._exit())
+            self._quent_logger.worker(self._quent_worker.id).exited()
             return self._drain_quent_events()
         return []
 
@@ -832,9 +835,11 @@ class RayEngine(StreamingEngine):
             "quent_context"
         )
         if quent_context is not None:
-            self._quent_logger = cudf_polars.quent._logging.QuentLogger()
+            self._quent_logger = cudf_polars.quent._runtime.QuentSession()
             executor_options.setdefault("quent_context", quent_context)
-            quent_context._emit_engine_init_events(self._quent_logger)
+            quent_context._emit_engine_init_events(
+                self._quent_logger, backend=Backend.RAY
+            )
             engine = quent_context.engine
         else:
             self._quent_logger = None

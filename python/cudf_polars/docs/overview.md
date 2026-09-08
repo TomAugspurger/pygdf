@@ -720,55 +720,26 @@ See the [Quent] README for more on visualizing the captured data.
 
 ### Implementation Notes
 
-Quent tracing is currently implemented manually.
+The telemetry model is declared in `python/cudf_polars/quent/model.yaml`.
+Quent validates that schema and generates the Rust instrumentation types,
+Python handles, and type stubs. Event payloads and finite-state transitions are
+therefore defined in one place rather than assembled as Python dictionaries.
 
-`cudf_polars.quent._types` defines one dataclass per `Entity` from the quent
-data processing domain (e.g.  `Engine`, `Worker`, etc.). We prefer to reference
-other entities through instances of that type, rather than by ID. For example, a
-`Worker` has an `engine` field, rather than an `engine_id` field. This prevents
-accidentally using the ID for an entity of the wrong type.
-
-All IDs in `cudf_polars.quent` are UUIDs rather than integers or strings.
-
-Currently, we don't implement the finite state machines discussed in quent. Our
-instrumentation is very-much bolted on, rather than integrated into the
-functioning of cudf-polars. Instead of FSMs, our entities have a method for the
-various phases they move through:
-
-```python
-class Worker:
-    def init(self, ...) -> Event: ...
-    def exit(self, ...) -> Event: ...
-
-class Plan:
-    def declare(self, ...) -> Event: ...
-```
-
-Each of those returns an `Event`, another in-memory data structure representing the event.
-cudf-polars just manually calls those methods at the appropriate places.
+The generated extension is built by the Maturin project under
+`python/cudf_polars/quent/bridge`. Tracing is optional: constructing a
+`QuentContext` does not load the extension, but enabling it on an engine requires
+the extension to be installed.
 
 Ranks need to coordinate on the creation of some entities. For example, each
 actor in a `RayEngine` needs to use the same `engine_id` so that plans can be
 associated with the engine correctly. We store these types of worker-independent
 entities on a new `QuentContext` class, which is provided to the engine via
-`StreamingExecutor.quent_context`.
+`StreamingExecutor.quent_context`. `LocalQuentContext` combines those shared
+identities with rank-local generated handles and resources.
 
-Rank-local properties (like a `QuentLogger` (see below) or `Worker` entity)
-should be propagated through functions in a
-`cudf_polars.quent._context.LocalQuentContext`.
-
-`cudf_polars.quent._logging.QuentLogger` connects the `Event` objects to the
-actual events. When we want record something, we call
-`quent_logger.emit(event)`. For now, these events are just buffered in-memory
-but that could be adapted (and likely will in the future, to directly send these
-events to some collector). At the moment, we build on structlog, but this could
-probably be relaxed pretty easily. We aren't currently relying on any advanced
-features from structlog.
-
-Each rank has its own `QuentLogger`, which is constructed upon initialization of
-that rank's "worker" (`RankActor`, `_WorkerContext`). Each `StreamingEngine` subclass
-also has a `_quent_logger` attribute for "client-side" logs that records things like
-the engine start and exit events.
+Each rank has a `QuentSession` backed by Quent's generated callback exporter.
+The client engine has a separate session for engine-level events. This keeps
+events in memory until shutdown without routing them through `structlog`.
 
 Upon `StreamingEngine.shutdown`, all events are gathered from the workers and persisted
 on the (now closed) engine at `StreamingEngine._quent_events`.
@@ -796,6 +767,9 @@ Quent's names.
 | `IR` | `Operator` | A node in the query plan. |
 | - | `Port` | The input or output of some Operator. In cudf-polars, intermediate results are typically passed between IR nodes / operators as a `pylibcudf.Table` |
 | - | `Edge` | A connection between two `Port`s. |
+| `IR.do_evaluate` | `Evaluate` | Synchronous host-side evaluation of an IR node. |
+| rapidsmpf streaming actor | `Actor` | Actor lifetime and aggregate chunk/byte statistics. |
+| worker I/O or rank link | `DataChannel` | A concrete resource used for data transfer. |
 
 
 [Quent]: https://github.com/rapidsai/quent

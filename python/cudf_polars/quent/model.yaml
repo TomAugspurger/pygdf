@@ -1,0 +1,193 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+quent: alpha
+model: CudfPolars
+doc: Telemetry model for the cudf-polars distributed streaming executor.
+
+records:
+  Implementation:
+    fields:
+      name: string
+      version: string
+      backend: string
+
+  PlanEdge:
+    fields:
+      source: { ref: Port }
+      target: { ref: Port }
+
+  OperatorStatistics:
+    fields:
+      input_bytes: u64
+      output_bytes: u64
+      output_rows: { option: u64 }
+      chunk_count: u64
+      duplicated: bool
+      decision: { option: string }
+
+entities:
+  Engine:
+    doc: A cudf-polars streaming engine.
+    events:
+      initialized:
+        attributes:
+          instance_name: string
+          implementation: Implementation
+      exited: {}
+
+  QueryGroup:
+    doc: A user-selected logical group of queries.
+    events:
+      declared:
+        attributes:
+          instance_name: { option: string }
+          engine: { scope-ref: Engine }
+
+  Worker:
+    doc: A rank that executes a physical query plan.
+    events:
+      initialized:
+        attributes:
+          instance_name: string
+          engine: { scope-ref: Engine }
+      exited: {}
+
+  Plan:
+    doc: A logical or physical cudf-polars IR graph.
+    events:
+      declared:
+        attributes:
+          instance_name: string
+          query: { scope-ref: Query }
+          parent_plan: { option: { ref: Plan } }
+          worker: { option: { ref: Worker } }
+          edges: { list: PlanEdge }
+
+  Operator:
+    doc: A node in a logical or physical plan.
+    events:
+      declared:
+        attributes:
+          plan: { scope-ref: Plan }
+          parent_operators: { list: { ref: Operator } }
+          instance_name: string
+          type_name: string
+          attributes: dynamic
+      statistics:
+        multi: true
+        attributes:
+          values: OperatorStatistics
+
+  Port:
+    doc: A named input or output of an operator.
+    events:
+      declared:
+        attributes:
+          operator: { scope-ref: Operator }
+          instance_name: string
+
+  ThreadPool:
+    doc: The host thread pool owned by a worker.
+    events:
+      declared:
+        attributes:
+          instance_name: string
+          worker: { scope-ref: Worker }
+
+  Processor:
+    doc: A host thread used to evaluate cudf-polars IR.
+    resource: true
+    events:
+      declared:
+        attributes:
+          instance_name: string
+          thread_pool: { scope-ref: ThreadPool }
+
+  Memory:
+    doc: A worker-local memory or storage resource.
+    resource:
+      bytes: { kind: occupancy, known-bounds: true }
+    events:
+      declared:
+        attributes:
+          instance_name: string
+          resource_type: string
+          worker: { scope-ref: Worker }
+          limits: { sets-resource-bounds: true }
+      resized:
+        multi: true
+        attributes:
+          limits: { sets-resource-bounds: true }
+
+  DataChannel:
+    doc: A concrete data path used by a worker for I/O or inter-rank transfer.
+    resource:
+      bytes: { kind: rate }
+    events:
+      declared:
+        attributes:
+          instance_name: string
+          channel_type: string
+          worker: { scope-ref: Worker }
+          source: { ref: Memory }
+          target: { ref: Memory }
+
+fsms:
+  Query:
+    doc: One collect or sink operation.
+    states:
+      initialized:
+        initial: true
+        attributes:
+          instance_name: string
+          query_group: { scope-ref: QueryGroup }
+        to: [planning]
+      planning:
+        to: [executing]
+      executing:
+        to: [exited]
+      exited: {}
+
+  Evaluate:
+    doc: Synchronous host-side evaluation of one IR node.
+    states:
+      queued:
+        initial: true
+        attributes:
+          instance_name: string
+          operator: { scope-ref: Operator }
+          worker: { ref: Worker }
+        to: [running]
+      running:
+        attributes:
+          io: bool
+          input_bytes: u64
+          processor: { option: { uses: Processor } }
+          memory: { option: { uses: Memory } }
+          channel: { option: { uses: DataChannel } }
+        to: [exited]
+      exited:
+        attributes:
+          succeeded: bool
+          output_bytes: u64
+
+  Actor:
+    doc: Lifetime of one rapidsmpf streaming actor for an operator.
+    states:
+      started:
+        initial: true
+        attributes:
+          operator: { scope-ref: Operator }
+          worker: { ref: Worker }
+        to: [running]
+      running:
+        to: [exited]
+      exited:
+        attributes:
+          input_bytes: u64
+          output_bytes: u64
+          output_rows: { option: u64 }
+          chunk_count: u64
+          duplicated: bool
+          decision: { option: string }

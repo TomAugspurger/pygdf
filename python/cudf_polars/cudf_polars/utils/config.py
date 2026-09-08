@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.engine.ray import RankActor
     from cudf_polars.quent._context import QuentContext, WorkerResources
-    from cudf_polars.quent._logging import QuentLogger
+    from cudf_polars.quent._runtime import QuentSession
 
 
 __all__ = [
@@ -732,7 +732,7 @@ class SPMDContext:
     py_executor: ThreadPoolExecutor
     engine_id: uuid.UUID
     worker_id: uuid.UUID
-    quent_logger: QuentLogger | None
+    quent_logger: QuentSession | None
     worker_resources: WorkerResources | None = None
 
 
@@ -756,7 +756,7 @@ class RayContext:
     """
 
     rank_actors: list[ActorHandle[RankActor]]
-    quent_logger: QuentLogger | None
+    quent_logger: QuentSession | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -786,7 +786,7 @@ class DaskContext:
 
     client: distributed.Client
     rapidsmpf_id: str
-    quent_logger: QuentLogger | None
+    quent_logger: QuentSession | None
     owned_client: distributed.Client | None = None
     owned_cluster: Any | None = None
 

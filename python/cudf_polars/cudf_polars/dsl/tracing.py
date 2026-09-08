@@ -10,6 +10,7 @@ import enum
 import functools
 import os
 import time
+import uuid
 from typing import TYPE_CHECKING, Any, Concatenate, Literal, ParamSpec
 
 import nvtx
@@ -174,7 +175,7 @@ def log_do_evaluate(
             *args: P.args,
             **kwargs: P.kwargs,
         ) -> cudf_polars.containers.DataFrame:
-            from cudf_polars.quent._types import Task
+            from cudf_polars.quent._types import Evaluate
 
             log = structlog.get_logger()
 
@@ -188,18 +189,25 @@ def log_do_evaluate(
             ir_execution_context: IRExecutionContext = kwargs["context"]  # type: ignore[assignment]
 
             if ir_execution_context.quent_ir_execution_context is not None:
-                quent_task = Task.from_ir(
-                    cls, ir_execution_context.quent_ir_execution_context
+                quent_context = ir_execution_context.quent_ir_execution_context
+                token = uuid.uuid4()
+                quent_evaluate = Evaluate(
+                    operator=quent_context.quent_operator,
+                    worker=quent_context.worker,
+                    instance_name=(
+                        f"{cls.__name__}-{quent_context.quent_operator.id.hex[:8]}-"
+                        f"{token.hex[:8]}"
+                    ),
                 )
-                ir_execution_context.quent_ir_execution_context.context._emit_task_begin_events(
+                quent_context.context._emit_evaluate_begin_events(
                     cls,
-                    quent_task,
-                    ir_execution_context.quent_ir_execution_context,
+                    quent_evaluate,
+                    quent_context,
                     input_frames_bytes=sum(frame._size_bytes for frame in frames),
                 )
 
             else:
-                quent_task = None
+                quent_evaluate = None
 
             before_start = time.monotonic_ns()
             before = make_snapshot(
@@ -219,13 +227,11 @@ def log_do_evaluate(
                 raise
             finally:
                 if (
-                    quent_task is not None
+                    quent_evaluate is not None
                     and ir_execution_context.quent_ir_execution_context is not None
                 ):
-                    # TODO: This should emit some Chunk-level statistics (duration, rows, bytes, schema, etc.)
-                    ir_execution_context.quent_ir_execution_context.context._emit_task_end_events(
-                        cls,
-                        quent_task,
+                    ir_execution_context.quent_ir_execution_context.context._emit_evaluate_end_events(
+                        quent_evaluate,
                         ir_execution_context.quent_ir_execution_context,
                         result,
                     )

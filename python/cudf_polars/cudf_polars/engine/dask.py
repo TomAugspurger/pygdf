@@ -29,7 +29,7 @@ from rapidsmpf.statistics import Statistics
 from rapidsmpf.streaming.core.context import Context
 
 import cudf_polars.quent
-import cudf_polars.quent._logging
+import cudf_polars.quent._runtime
 import cudf_polars.quent._types
 from cudf_polars.engine import persisted_result, rank_local_store
 from cudf_polars.engine.core import (
@@ -142,7 +142,7 @@ class _WorkerContext:
     ctx: Context | None
     py_executor: ThreadPoolExecutor | None
     base_mr: rmm.mr.DeviceMemoryResource | None
-    quent_logger: cudf_polars.quent._logging.QuentLogger | None
+    quent_logger: cudf_polars.quent._runtime.QuentSession | None
     quent_worker: cudf_polars.quent._types.Worker
     statistics: Statistics
     mr: RmmResourceAdaptor | None = None  # set after `Context` is built (below).
@@ -310,8 +310,8 @@ def _setup_root(
     )
 
     if quent_context is not None:
-        quent_logger: cudf_polars.quent._logging.QuentLogger | None = (
-            cudf_polars.quent._logging.QuentLogger()
+        quent_logger: cudf_polars.quent._runtime.QuentSession | None = (
+            cudf_polars.quent._runtime.QuentSession()
         )
     else:
         quent_logger = None
@@ -437,7 +437,7 @@ def _setup_worker(
     )
 
     if quent_context is not None:
-        quent_logger = cudf_polars.quent._logging.QuentLogger()
+        quent_logger = cudf_polars.quent._runtime.QuentSession()
         worker_resources = WorkerResources.build(
             instance_suffix=f"rank-{comm.rank}",
             engine_id=engine_id,
@@ -445,7 +445,10 @@ def _setup_worker(
             rank=comm.rank,
             nranks=comm.nranks,
         )
-        quent_logger.emit(quent_worker._init())
+        quent_logger.worker(quent_worker.id).initialized(
+            instance_name=quent_worker.instance_name,
+            engine=quent_logger.to_uuid(quent_worker.engine.id),
+        )
         worker_resources.declare(quent_logger)
     else:
         quent_logger = None
@@ -495,7 +498,7 @@ def _teardown_worker(
         if mp_ctx.quent_logger is not None:
             if mp_ctx.worker_resources is not None:
                 mp_ctx.worker_resources.finalize(mp_ctx.quent_logger)
-            mp_ctx.quent_logger.emit(mp_ctx.quent_worker._exit())
+            mp_ctx.quent_logger.worker(mp_ctx.quent_worker.id).exited()
             traces = mp_ctx.quent_logger.drain()
 
         # Drop this engine's persisted partitions before the Context is torn down,
@@ -980,7 +983,7 @@ class DaskEngine(StreamingEngine):
             "quent_context"
         )
         if quent_context is not None:
-            self._quent_logger = cudf_polars.quent._logging.QuentLogger()
+            self._quent_logger = cudf_polars.quent._runtime.QuentSession()
         else:
             self._quent_logger = None
 
@@ -1006,7 +1009,9 @@ class DaskEngine(StreamingEngine):
         if quent_context is not None:
             executor_options.setdefault("quent_context", quent_context)
             assert self._quent_logger is not None
-            quent_context._emit_engine_init_events(self._quent_logger)
+            quent_context._emit_engine_init_events(
+                self._quent_logger, backend=cudf_polars.quent._types.Backend.DASK
+            )
             rapidsmpf_id = str(quent_context.engine.id)
             engine_id = quent_context.engine.id
         else:

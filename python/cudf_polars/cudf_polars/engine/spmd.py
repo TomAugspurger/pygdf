@@ -32,7 +32,7 @@ from rapidsmpf.statistics import Statistics
 from rapidsmpf.streaming.core.context import Context
 
 import cudf_polars.quent
-import cudf_polars.quent._logging
+import cudf_polars.quent._runtime
 from cudf_polars.containers import DataFrame, DataType
 from cudf_polars.engine import persisted_result, rank_local_store
 from cudf_polars.engine.core import (
@@ -59,7 +59,7 @@ from cudf_polars.quent._context import (
     LocalQuentContext,
     WorkerResources,
 )
-from cudf_polars.quent._types import Worker
+from cudf_polars.quent._types import Backend, Worker
 from cudf_polars.streaming.actor_graph.collectives.common import reserve_op_id
 from cudf_polars.streaming.actor_graph.utils import set_memory_resource
 from cudf_polars.unstable import unstable
@@ -442,7 +442,7 @@ class SPMDEngine(StreamingEngine):
             "quent_context"
         )
         if quent_context is not None:
-            self._quent_logger = cudf_polars.quent._logging.QuentLogger()
+            self._quent_logger = cudf_polars.quent._runtime.QuentSession()
         else:
             self._quent_logger = None
 
@@ -510,7 +510,9 @@ class SPMDEngine(StreamingEngine):
             if quent_context is not None:
                 executor_options["quent_context"] = quent_context
                 assert self._quent_logger is not None
-                quent_context._emit_engine_init_events(self._quent_logger)
+                quent_context._emit_engine_init_events(
+                    self._quent_logger, backend=Backend.SPMD
+                )
                 engine_id = quent_context.engine.id
             else:
                 engine_id = uuid.uuid4()
@@ -524,7 +526,10 @@ class SPMDEngine(StreamingEngine):
             worker_resources: WorkerResources | None = None
             if quent_context is not None:
                 assert self._quent_logger is not None
-                self._quent_logger.emit(self._quent_worker._init())
+                self._quent_logger.worker(self._quent_worker.id).initialized(
+                    instance_name=self._quent_worker.instance_name,
+                    engine=self._quent_logger.to_uuid(self._quent_worker.engine.id),
+                )
 
                 worker_resources = WorkerResources.build(
                     instance_suffix=f"rank-{self.rank}",
@@ -895,7 +900,7 @@ class SPMDEngine(StreamingEngine):
         if self._quent_logger is not None:
             if self._worker_resources is not None:
                 self._worker_resources.finalize(self._quent_logger)
-            self._quent_logger.emit(self._quent_worker._exit())
+            self._quent_logger.worker(self._quent_worker.id).exited()
 
         quent_context: cudf_polars.quent.QuentContext | None = self.config[
             "executor_options"

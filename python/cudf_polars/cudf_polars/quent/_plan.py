@@ -6,15 +6,15 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.quent._types import (
-    Attribute,
     Edge,
     Operator,
     Plan,
     Port,
+    dynamic_attributes,
     new_quent_id,
 )
 from cudf_polars.streaming.explain import SerializablePlan
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     import uuid
 
     from cudf_polars.dsl.ir import IR
-    from cudf_polars.quent._types import Query, Value, Worker
+    from cudf_polars.quent._types import Query, Worker
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 _JOIN_TYPES = frozenset({"Join", "ConditionalJoin"})
@@ -73,6 +73,10 @@ def build_plan(
     operators: list[Operator] = []
     all_ports: list[Port] = []
     edges: list[Edge] = []
+    if query is None:
+        if parent_plan is None:
+            raise ValueError("A plan requires either a query or a parent plan.")
+        query = parent_plan.query
     plan = Plan(
         id=plan_id,
         query=query,
@@ -86,21 +90,15 @@ def build_plan(
         serializable_node = serializable_plan.nodes[node_id]
 
         operator_id = new_quent_id()
-        custom_attributes = [
-            Attribute(name="node_id", value=node_id),
-            *(
-                # SerializablePlan properties are JSON-shaped values that map
-                # onto Quent Attribute Value (scalars, homogeneous lists, structs).
-                Attribute(name=key, value=cast("Value | None", value))
-                for key, value in serializable_node.properties.items()
-            ),
-        ]
+        attributes = dynamic_attributes(
+            {"node_id": node_id, **serializable_node.properties}
+        )
         operator = Operator(
             id=operator_id,
             plan=plan,
             parent_operators=parent_ops.get(node_id, []),
             type_name=serializable_node.type,
-            custom_attributes=custom_attributes,
+            attributes=attributes,
         )
         operator_by_ir_id[node_id] = operator
         operators.append(operator)

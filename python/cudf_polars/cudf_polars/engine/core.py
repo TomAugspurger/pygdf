@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from rapidsmpf.memory.buffer_resource import BufferResource
     from rapidsmpf.streaming.core.context import Context
 
-    import cudf_polars.quent._logging
+    import cudf_polars.quent._runtime
     import cudf_polars.quent._types
     from cudf_polars.dsl.ir import IR
     from cudf_polars.dsl.translate import Translator
@@ -315,7 +315,7 @@ class StreamingEngine(pl.GPUEngine):
         when :meth:`shutdown` is called. If ``None``, an empty stack is created.
     """
 
-    _quent_logger: cudf_polars.quent._logging.QuentLogger | None
+    _quent_logger: cudf_polars.quent._runtime.QuentSession | None
     rapidsmpf_options: rapidsmpf.config.Options
     # Process-wide registry of every live :class:`StreamingEngine`. Used by
     # :class:`DefaultSingletonEngine` to enforce that no other engine is
