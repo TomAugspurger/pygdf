@@ -11,6 +11,7 @@ records:
       name: string
       version: string
       backend: string
+      custom_attributes: dynamic
 
   PlanEdge:
     fields:
@@ -30,11 +31,13 @@ entities:
   Engine:
     doc: A cudf-polars streaming engine.
     events:
-      initialized:
+      # These event names and attributes intentionally retain the query-engine
+      # wire format used by quent-open's distributed-context indexer.
+      init:
         attributes:
           instance_name: string
           implementation: Implementation
-      exited: {}
+      exit: {}
 
   QueryGroup:
     doc: A user-selected logical group of queries.
@@ -47,11 +50,14 @@ entities:
   Worker:
     doc: A rank that executes a physical query plan.
     events:
-      initialized:
+      # parent_engine_id is the legacy wire-format index key; engine keeps the
+      # schema-level typed relationship used by the generated model.
+      init:
         attributes:
           instance_name: string
           engine: { scope-ref: Engine }
-      exited: {}
+          parent_engine_id: string
+      exit: {}
 
   Plan:
     doc: A logical or physical cudf-polars IR graph.

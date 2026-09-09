@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import json
-import re
 import uuid
 import zipfile
 from typing import TYPE_CHECKING, Any
@@ -16,23 +15,35 @@ if TYPE_CHECKING:
 
 SIDECAR_FILE_NAME = "model.qmi"
 EXTENSION = "ndjson"
-MODEL_QMI: dict[str, Any] = {
-    "quent": {
-        "version": "0.1.0",
-        "commit": "0743198",
-        "remote": "https://github.com/rapidsai/quent",
-    },
-    "model": {
-        "name": "CudfPolars",
-        "package": "cudf-polars-quent",
-        "type_path": "_quent::CudfPolarsEvent",
-        "source": {"path": "python/cudf_polars/quent/model.yaml"},
-    },
-}
+
+# Schema-generated streams are named after the entity ("Engine"), but
+# `quent-open` discovers engines and their worker contexts by scanning the
+# snake-case stream names its older `entity!` models export. Without these
+# aliases the viewer builds and then lists no engines at all, so mirror the two
+# streams that indexer reads. Keys are generated names; values are the aliases.
+INDEX_STREAM_ALIASES = {"Engine": "engine", "Worker": "worker"}
 
 
-def _entity_directory(name: str) -> str:
-    return re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+def to_index_line(line: dict[str, Any]) -> dict[str, Any]:
+    """
+    Rewrite one event into the shape the legacy query-engine types deserialize.
+
+    Those types spell every event as a newtype variant wrapping a struct, so an
+    event without attributes has to be ``{"Exit": null}``. The schema generates
+    a unit variant instead, which serializes to the bare string ``"Exit"`` and
+    fails the indexer's whole stream, not just that event.
+    """
+    data = line["data"]
+    if isinstance(data, str):
+        return {**line, "data": {data: None}}
+    return line
+
+
+def _model_qmi() -> dict[str, Any]:
+    """Return build provenance embedded in the generated extension."""
+    from cudf_polars import _quent
+
+    return json.loads(_quent.model_qmi())
 
 
 def to_export_line(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -41,7 +52,7 @@ def to_export_line(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     if len(data) != 1:
         raise ValueError(f"Expected one generated entity wrapper, got {data!r}")
     entity_name, payload = next(iter(data.items()))
-    return _entity_directory(entity_name), {
+    return entity_name, {
         "id": event["id"],
         "timestamp": event["timestamp"],
         "data": payload,
@@ -70,23 +81,29 @@ def write_quent_export(
     ) as archive:
         archive.writestr(
             f"{context_dir}/{SIDECAR_FILE_NAME}",
-            json.dumps(MODEL_QMI if sidecar is None else sidecar, indent=2) + "\n",
+            json.dumps(_model_qmi() if sidecar is None else sidecar, indent=2) + "\n",
         )
         for directory, lines in grouped.items():
-            stream = f"{context_dir}/{directory}/{uuid.uuid4()}.{EXTENSION}"
-            archive.writestr(
-                stream,
-                "\n".join(json.dumps(line, separators=(",", ":")) for line in lines)
-                + "\n",
-            )
+            streams = [(directory, lines)]
+            if (alias := INDEX_STREAM_ALIASES.get(directory)) is not None:
+                streams.append((alias, [to_index_line(line) for line in lines]))
+            for name, stream in streams:
+                archive.writestr(
+                    f"{context_dir}/{name}/{uuid.uuid4()}.{EXTENSION}",
+                    "\n".join(
+                        json.dumps(line, separators=(",", ":")) for line in stream
+                    )
+                    + "\n",
+                )
     temporary.replace(quent_archive)
     return quent_archive
 
 
 __all__ = [
     "EXTENSION",
-    "MODEL_QMI",
+    "INDEX_STREAM_ALIASES",
     "SIDECAR_FILE_NAME",
     "to_export_line",
+    "to_index_line",
     "write_quent_export",
 ]

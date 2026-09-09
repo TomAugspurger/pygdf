@@ -445,9 +445,10 @@ def _setup_worker(
             rank=comm.rank,
             nranks=comm.nranks,
         )
-        quent_logger.worker(quent_worker.id).initialized(
+        quent_logger.worker(quent_worker.id).init(
             instance_name=quent_worker.instance_name,
             engine=quent_logger.to_uuid(quent_worker.engine.id),
+            parent_engine_id=str(quent_worker.engine.id),
         )
         worker_resources.declare(quent_logger)
     else:
@@ -498,7 +499,7 @@ def _teardown_worker(
         if mp_ctx.quent_logger is not None:
             if mp_ctx.worker_resources is not None:
                 mp_ctx.worker_resources.finalize(mp_ctx.quent_logger)
-            mp_ctx.quent_logger.worker(mp_ctx.quent_worker.id).exited()
+            mp_ctx.quent_logger.worker(mp_ctx.quent_worker.id).exit()
             traces = mp_ctx.quent_logger.drain()
 
         # Drop this engine's persisted partitions before the Context is torn down,

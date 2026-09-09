@@ -4,6 +4,8 @@
 use std::path::{Path, PathBuf};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    quent_build_info::emit_source();
+
     let model = Path::new(env!("CARGO_MANIFEST_DIR")).join("../model.yaml");
     println!("cargo:rerun-if-changed={}", model.display());
 
@@ -17,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &quent_instrumentation_build::Options {
             serde: true,
             umbrella_event: true,
+            analyzer_package: Some("cudf-polars-quent-analyzer".to_owned()),
             record_derives: &["Clone"],
             ..Default::default()
         },
@@ -37,6 +40,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_dir = PathBuf::from(std::env::var("OUT_DIR")?);
     let mut bindings = quent_schema_codegen_python::emit(&parsed.schema, &options)?;
     for file in &mut bindings {
+        file.content = file.content.replace(
+            "pub fn uuid(&self) -> PyUuid",
+            "pub fn entity_uuid(&self) -> PyUuid",
+        );
+        file.content = file.content.replace(
+            "#[pymodule(name = \"_quent\")]",
+            "#[pyfunction]\n    fn model_qmi() -> PyResult<String> {\n        use quent_instrumentation::Model;\n        let info = quent_instrumentation::build_info::ArtifactInfo::new(\n            crate::CudfPolars::model_info(),\n        );\n        serde_json::to_string_pretty(&info).map_err(|error| {\n            pyo3::exceptions::PyRuntimeError::new_err(error.to_string())\n        })\n    }\n    #[pymodule(name = \"_quent\")]",
+        );
+        file.content = file.content.replace(
+            "pub fn _quent(module: &Bound<'_, PyModule>) -> PyResult<()> {\n",
+            "pub fn _quent(module: &Bound<'_, PyModule>) -> PyResult<()> {\n        module.add_function(wrap_pyfunction!(model_qmi, module)?)?;\n",
+        );
         file.content = file.content.replace(
             "impl PyUuid {\n",
             "impl PyUuid {\n        #[new]\n        pub fn new(value: &str) -> PyResult<Self> {\n            use std::str::FromStr;\n            let inner = quent_instrumentation::Uuid::from_str(value)\n                .map_err(|error| pyo3::exceptions::PyValueError::new_err(error.to_string()))?;\n            Ok(Self { inner })\n        }\n",
@@ -65,6 +80,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     quent_schema_codegen_python::write_generated_files(&bindings, &out_dir)?;
     let mut stubs = quent_schema_codegen_python::emit_stubs(&parsed.schema, &options)?;
     for file in &mut stubs {
+        file.content = file.content.replace(
+            "T = TypeVar(\"T\")\n",
+            "T = TypeVar(\"T\")\n\ndef model_qmi() -> str: ...\n",
+        );
+        file.content = file.content.replace(
+            "    def uuid(self) -> Uuid: ...",
+            "    def entity_uuid(self) -> Uuid: ...",
+        );
         file.content = file.content.replace(
             "class Uuid:\n",
             "class Uuid:\n    def __init__(self, value: str) -> None: ...\n",

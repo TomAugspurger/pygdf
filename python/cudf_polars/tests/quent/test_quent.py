@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 
 import pytest
@@ -18,6 +19,7 @@ from cudf_polars.quent._types import (
     Operator,
     Plan,
     Port,
+    Query,
     ThreadPool,
     Worker,
     dynamic_attributes,
@@ -63,14 +65,36 @@ def test_context_lifecycle_uses_generated_handles(
     assert str(query.id) == query_events[0]["id"]
 
 
+def test_query_group_is_declared_once_across_derived_contexts(
+    quent_context: QuentContext,
+) -> None:
+    # Benchmarks re-derive the context per iteration while keeping one session,
+    # so the dedupe has to key off the session rather than the context object.
+    session = QuentSession()
+    quent_context._emit_query_group_events(session)
+    for iteration in range(2):
+        derived = dataclasses.replace(
+            quent_context, query=Query(instance_name=f"Iteration {iteration}")
+        )
+        derived._emit_query_group_events(session)
+
+    events = _events(session)
+    assert [next(iter(event["data"])) for event in events] == ["QueryGroup"]
+
+
 def test_once_event_is_checked_by_generated_handle() -> None:
     session = QuentSession()
     identifier = uuid.uuid4()
     handle = session.engine(identifier)
-    implementation = {"name": "cudf-polars", "version": "test", "backend": "spmd"}
-    handle.initialized(instance_name="engine", implementation=implementation)  # type: ignore[arg-type]
+    implementation = {
+        "name": "cudf-polars",
+        "version": "test",
+        "backend": "spmd",
+        "custom_attributes": {"backend": "spmd"},
+    }
+    handle.init(instance_name="engine", implementation=implementation)  # type: ignore[arg-type]
     with pytest.raises(RuntimeError, match="already emitted"):
-        handle.initialized(instance_name="engine", implementation=implementation)  # type: ignore[arg-type]
+        handle.init(instance_name="engine", implementation=implementation)  # type: ignore[arg-type]
     session.drain()
 
 

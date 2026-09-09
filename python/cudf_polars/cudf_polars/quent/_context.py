@@ -12,7 +12,7 @@ import uuid
 from typing import TYPE_CHECKING
 
 from cudf_polars.quent._plan import build_parent_operators_map, build_plan
-from cudf_polars.quent._runtime import QuentSession
+from cudf_polars.quent._runtime import EntityKind, QuentSession
 from cudf_polars.quent._types import (
     Backend,
     DataChannel,
@@ -78,13 +78,6 @@ class QuentContext:
     query_group: QueryGroup = dataclasses.field(default_factory=QueryGroup)
     query: Query = dataclasses.field(default_factory=Query)
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "_query_group_cache_", set())
-
-    @property
-    def _query_group_cache(self) -> set[uuid.UUID]:
-        return self._query_group_cache_  # type: ignore[attr-defined]
-
     def _serialize(self) -> bytes:
         payload = {
             "engine": {
@@ -132,22 +125,24 @@ class QuentContext:
         self, session: QuentSession, *, backend: Backend | None = None
     ) -> None:
         implementation = self.engine.implementation
-        session.engine(self.engine.id).initialized(
+        session.engine(self.engine.id).init(
             instance_name=f"cudf-polars-{str(self.engine.id)[:8]}",
             implementation={
                 "name": implementation.name,
                 "version": implementation.version,
                 "backend": str(backend or implementation.backend),
+                "custom_attributes": {
+                    "backend": str(backend or implementation.backend)
+                },
             },
         )
 
     def _emit_engine_exit_events(self, session: QuentSession) -> None:
-        session.engine(self.engine.id).exited()
+        session.engine(self.engine.id).exit()
 
     def _emit_query_group_events(self, session: QuentSession) -> None:
-        if self.query_group.id in self._query_group_cache:
+        if not session.declare_once(EntityKind.QUERY_GROUP, self.query_group.id):
             return
-        self._query_group_cache.add(self.query_group.id)
         session.query_group(self.query_group.id).declared(
             instance_name=self.query_group.instance_name,
             engine=session.to_uuid(self.engine.id),

@@ -352,9 +352,10 @@ class RankActor:
         barrier(self._comm)
         # Now we can declare the Quent worker resources, which depends on self._comm
         if self._quent_logger is not None:
-            self._quent_logger.worker(self._quent_worker.id).initialized(
+            self._quent_logger.worker(self._quent_worker.id).init(
                 instance_name=self._quent_worker.instance_name,
                 engine=self._quent_logger.to_uuid(self._quent_worker.engine.id),
+                parent_engine_id=str(self._quent_worker.engine.id),
             )
             self.worker_resources = WorkerResources.build(
                 instance_suffix=f"RankActor-{self._quent_worker.id.hex[:8]}",
@@ -442,7 +443,7 @@ class RankActor:
             if self.worker_resources is not None:
                 self.worker_resources.finalize(self._quent_logger)
 
-            self._quent_logger.worker(self._quent_worker.id).exited()
+            self._quent_logger.worker(self._quent_worker.id).exit()
             return self._drain_quent_events()
         return []
 

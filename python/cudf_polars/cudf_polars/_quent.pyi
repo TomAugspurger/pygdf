@@ -10,6 +10,8 @@ from typing import Generic, TypeVar, TypedDict
 
 T = TypeVar("T")
 
+def model_qmi() -> str: ...
+
 class Uuid:
     def __init__(self, value: str) -> None: ...
     def __str__(self) -> str: ...
@@ -26,6 +28,7 @@ class ImplementationDict(TypedDict):
     name: str
     version: str
     backend: str
+    custom_attributes: Mapping[str, bool | int | float | str | None]
 
 class OperatorStatisticsDict(TypedDict):
     input_bytes: int
@@ -59,13 +62,13 @@ class Observer(Generic[T]):
 
 class Handle:
     @property
-    def uuid(self) -> Uuid: ...
+    def entity_uuid(self) -> Uuid: ...
 
 class EngineHandle(Handle):
-    def initialized(
+    def init(
         self, *, instance_name: str, implementation: ImplementationDict
     ) -> None: ...
-    def exited(self) -> None: ...
+    def exit(self) -> None: ...
 
 class QueryGroupHandle(Handle):
     def declared(
@@ -73,10 +76,14 @@ class QueryGroupHandle(Handle):
     ) -> None: ...
 
 class WorkerHandle(Handle):
-    def initialized(
-        self, *, instance_name: str, engine: EngineHandle | Uuid
+    def init(
+        self,
+        *,
+        instance_name: str,
+        engine: EngineHandle | Uuid,
+        parent_engine_id: str,
     ) -> None: ...
-    def exited(self) -> None: ...
+    def exit(self) -> None: ...
 
 class PlanHandle(Handle):
     def declared(

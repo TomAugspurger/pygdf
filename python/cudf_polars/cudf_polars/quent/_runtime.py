@@ -55,6 +55,7 @@ class QuentSession:
         self._events: list[dict[str, Any]] = []
         self._lock = threading.Lock()
         self._handles: dict[tuple[EntityKind, uuid.UUID], Any] = {}
+        self._declared: set[tuple[EntityKind, uuid.UUID]] = set()
         self._context = _quent.Context(
             _quent.ExporterOptions.callback(self._record_event)
         )
@@ -70,6 +71,22 @@ class QuentSession:
         """Convert a Python UUID to the generated binding's UUID type."""
         assert _quent is not None
         return _quent.Uuid(str(value))
+
+    def declare_once(self, kind: EntityKind, identifier: uuid.UUID) -> bool:
+        """
+        Claim the right to emit an entity's once-only declaration event.
+
+        The generated bindings raise if an entity instance is declared twice,
+        so callers reachable more than once per session must gate their emit
+        on this. Ownership lives here because the session, not any individual
+        caller, is what the generated bindings track once-events against.
+        """
+        key = (kind, identifier)
+        with self._lock:
+            if key in self._declared:
+                return False
+            self._declared.add(key)
+            return True
 
     def _get_handle(
         self,

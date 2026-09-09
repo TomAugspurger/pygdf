@@ -87,14 +87,14 @@ def test_custom_schema_events(
     engine_events = _of_type(events, "Engine")
     assert len(engine_events) == 2
     assert engine_events[0]["id"] == str(quent_context.engine.id)
-    assert "Initialized" in engine_events[0]["data"]["Engine"]
-    assert engine_events[1]["data"]["Engine"] == "Exited"
+    assert "Init" in engine_events[0]["data"]["Engine"]
+    assert engine_events[1]["data"]["Engine"] == "Exit"
 
     worker_events = _of_type(events, "Worker")
     initialized = [
         event for event in worker_events if isinstance(event["data"]["Worker"], dict)
     ]
-    exited = [event for event in worker_events if event["data"]["Worker"] == "Exited"]
+    exited = [event for event in worker_events if event["data"]["Worker"] == "Exit"]
     assert {event["id"] for event in initialized} == {event["id"] for event in exited}
 
     assert len(_of_type(events, "QueryGroup")) == 1

@@ -12,13 +12,14 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { version = "0.29", features = ["abi3-py311"] }
-quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent.git", rev = "0743198" }
-quent-instrumentation = { git = "https://github.com/rapidsai/quent.git", rev = "0743198", features = ["serde", "io-callback", "io-ndjson"] }
-quent-io = { git = "https://github.com/rapidsai/quent.git", rev = "0743198", default-features = false, features = ["ndjson"] }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab", features = ["serde", "io-callback", "io-ndjson"] }
+quent-io = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab", default-features = false, features = ["ndjson"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]
-quent-instrumentation-build = { git = "https://github.com/rapidsai/quent.git", rev = "0743198" }
-quent-schema-codegen-python = { git = "https://github.com/rapidsai/quent.git", rev = "0743198" }
-quent-yaml = { git = "https://github.com/rapidsai/quent.git", rev = "0743198" }
+quent-build-info = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-instrumentation-build = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-schema-codegen-python = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-yaml = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }

@@ -730,6 +730,11 @@ The generated extension is built by the Maturin project under
 `QuentContext` does not load the extension, but enabling it on an engine requires
 the extension to be installed.
 
+Trace archives include build provenance embedded by the generated extension.
+The `cudf-polars-quent-analyzer` crate under
+`python/cudf_polars/quent/analyzer` consumes the same YAML schema and provides
+the query-engine viewer entry used by `quent-open`.
+
 Ranks need to coordinate on the creation of some entities. For example, each
 actor in a `RayEngine` needs to use the same `engine_id` so that plans can be
 associated with the engine correctly. We store these types of worker-independent
