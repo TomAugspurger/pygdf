@@ -159,21 +159,29 @@ def evaluate_pipeline_spmd_mode(
             worker_resources=spmd_context.worker_resources,
         )
 
-    df, metadata = evaluate_on_rank(
-        context,
-        comm,
-        py_executor,
-        ir,
-        config_options,
-        local_quent_context=local_quent_context,
-        query_id=query_id,
-    )
+    try:
+        df, metadata = evaluate_on_rank(
+            context,
+            comm,
+            py_executor,
+            ir,
+            config_options,
+            local_quent_context=local_quent_context,
+            query_id=query_id,
+        )
+    except BaseException as error:
+        if quent_context is not None:
+            assert local_quent_context is not None
+            quent_context._emit_query_failed_event(
+                local_quent_context.logger, local_quent_context.query, error
+            )
+        raise
     if quent_context is not None:
         assert config_options.executor.spmd_context.quent_logger is not None
         assert local_quent_context is not None
         # Device memory and the disk->device channel are engine-scoped and are
         # finalized once at engine shutdown, not per query.
-        quent_context._emit_query_exit_events(
+        quent_context._emit_query_completed_event(
             config_options.executor.spmd_context.quent_logger,
             local_quent_context.query,
         )

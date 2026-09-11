@@ -28,17 +28,6 @@ records:
       decision: { option: string }
 
 entities:
-  Engine:
-    doc: A cudf-polars streaming engine.
-    events:
-      # These event names and attributes intentionally retain the query-engine
-      # wire format used by quent-open's distributed-context indexer.
-      init:
-        attributes:
-          instance_name: string
-          implementation: Implementation
-      exit: {}
-
   QueryGroup:
     doc: A user-selected logical group of queries.
     events:
@@ -46,18 +35,6 @@ entities:
         attributes:
           instance_name: { option: string }
           engine: { scope-ref: Engine }
-
-  Worker:
-    doc: A rank that executes a physical query plan.
-    events:
-      # parent_engine_id is the legacy wire-format index key; engine keeps the
-      # schema-level typed relationship used by the generated model.
-      init:
-        attributes:
-          instance_name: string
-          engine: { scope-ref: Engine }
-          parent_engine_id: string
-      exit: {}
 
   Plan:
     doc: A logical or physical cudf-polars IR graph.
@@ -110,21 +87,30 @@ entities:
           instance_name: string
           thread_pool: { scope-ref: ThreadPool }
 
-  Memory:
-    doc: A worker-local memory or storage resource.
+  DeviceMemory:
+    doc: A bounded worker-local device-memory resource.
     resource:
       bytes: { kind: occupancy, known-bounds: true }
     events:
       declared:
         attributes:
           instance_name: string
-          resource_type: string
           worker: { scope-ref: Worker }
           limits: { sets-resource-bounds: true }
       resized:
         multi: true
         attributes:
           limits: { sets-resource-bounds: true }
+
+  Storage:
+    doc: A worker-local storage resource whose capacity may be unknown.
+    resource:
+      bytes: { kind: occupancy }
+    events:
+      declared:
+        attributes:
+          instance_name: string
+          worker: { scope-ref: Worker }
 
   DataChannel:
     doc: A concrete data path used by a worker for I/O or inter-rank transfer.
@@ -136,10 +122,38 @@ entities:
           instance_name: string
           channel_type: string
           worker: { scope-ref: Worker }
-          source: { ref: Memory }
-          target: { ref: Memory }
+          # Channels may connect either storage or device-memory endpoints.
+          source: ref
+          target: ref
 
 fsms:
+  Engine:
+    doc: A cudf-polars streaming engine.
+    states:
+      # These state names and attributes intentionally retain the query-engine
+      # wire format used by quent-open's distributed-context indexer.
+      init:
+        initial: true
+        attributes:
+          instance_name: string
+          implementation: Implementation
+        to: [exit]
+      exit: {}
+
+  Worker:
+    doc: A rank that executes a physical query plan.
+    states:
+      # parent_engine_id is the legacy wire-format index key; engine keeps the
+      # schema-level typed relationship used by the generated model.
+      init:
+        initial: true
+        attributes:
+          instance_name: string
+          engine: { scope-ref: Engine }
+          parent_engine_id: string
+        to: [exit]
+      exit: {}
+
   Query:
     doc: One collect or sink operation.
     states:
@@ -152,8 +166,11 @@ fsms:
       planning:
         to: [executing]
       executing:
-        to: [exited]
-      exited: {}
+        to: [completed, failed]
+      completed: {}
+      failed:
+        attributes:
+          error: string
 
   Evaluate:
     doc: Synchronous host-side evaluation of one IR node.
@@ -169,14 +186,15 @@ fsms:
         attributes:
           io: bool
           input_bytes: u64
-          processor: { option: { uses: Processor } }
-          memory: { option: { uses: Memory } }
+          processor: { uses: Processor }
           channel: { option: { uses: DataChannel } }
-        to: [exited]
-      exited:
+        to: [completed, failed]
+      completed:
         attributes:
-          succeeded: bool
           output_bytes: u64
+      failed:
+        attributes:
+          error: string
 
   Actor:
     doc: Lifetime of one rapidsmpf streaming actor for an operator.
@@ -188,12 +206,11 @@ fsms:
           worker: { ref: Worker }
         to: [running]
       running:
-        to: [exited]
-      exited:
+        to: [completed, failed]
+      completed:
         attributes:
-          input_bytes: u64
-          output_bytes: u64
-          output_rows: { option: u64 }
-          chunk_count: u64
-          duplicated: bool
-          decision: { option: string }
+          values: OperatorStatistics
+      failed:
+        attributes:
+          error: string
+          values: OperatorStatistics

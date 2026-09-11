@@ -104,7 +104,8 @@ def test_custom_schema_events(
     assert _of_type(events, "Plan")
     assert _of_type(events, "Operator")
     assert _of_type(events, "Actor")
-    assert _of_type(events, "Memory")
+    assert _of_type(events, "DeviceMemory")
+    assert _of_type(events, "Storage")
     if LOG_TRACES:
         assert _of_type(events, "Evaluate")
 
@@ -133,5 +134,9 @@ def test_multiple_collects_get_distinct_queries_and_plans(
     ]
     assert len({event["id"] for event in logical_plans}) == 2
 
-    memory_ids = [event["id"] for event in _of_type(events, "Memory")]
+    memory_ids = [
+        event["id"]
+        for entity in ("DeviceMemory", "Storage")
+        for event in _of_type(events, entity)
+    ]
     assert len(memory_ids) == len(set(memory_ids))

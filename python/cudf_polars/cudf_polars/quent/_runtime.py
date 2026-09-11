@@ -35,7 +35,8 @@ class EntityKind(Enum):
     PORT = auto()
     THREAD_POOL = auto()
     PROCESSOR = auto()
-    MEMORY = auto()
+    DEVICE_MEMORY = auto()
+    STORAGE = auto()
     DATA_CHANNEL = auto()
     QUERY = auto()
     EVALUATE = auto()
@@ -143,9 +144,16 @@ class QuentSession:
             EntityKind.PROCESSOR, identifier, self._context.processor_observer()
         )
 
-    def memory(self, identifier: uuid.UUID) -> quent_bindings.MemoryHandle:
+    def device_memory(self, identifier: uuid.UUID) -> quent_bindings.DeviceMemoryHandle:
         return self._get_handle(
-            EntityKind.MEMORY, identifier, self._context.memory_observer()
+            EntityKind.DEVICE_MEMORY,
+            identifier,
+            self._context.device_memory_observer(),
+        )
+
+    def storage(self, identifier: uuid.UUID) -> quent_bindings.StorageHandle:
+        return self._get_handle(
+            EntityKind.STORAGE, identifier, self._context.storage_observer()
         )
 
     def data_channel(self, identifier: uuid.UUID) -> quent_bindings.DataChannelHandle:

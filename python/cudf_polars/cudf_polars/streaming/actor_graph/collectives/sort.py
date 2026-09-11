@@ -819,10 +819,9 @@ async def sort_actor(
     ch_chunk_store = context.create_channel()
     async with shutdown_on_error(
         context,
-        ch_in,
-        ch_out,
-        ch_sample_replay,
-        ch_chunk_store,
+        chs_in=(ch_in,),
+        chs_out=(ch_out,),
+        auxiliary_channels=(ch_sample_replay, ch_chunk_store),
         trace_ir=ir,
         ir_context=ir_context,
     ) as tracer:

@@ -13,6 +13,8 @@ from cudf_polars.dsl.tracing import LOG_TRACES, Scope
 from cudf_polars.streaming.explain import SerializablePlan
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from cudf_streaming.table_chunk import TableChunk
     from rapidsmpf.streaming.core.channel import Channel
     from rapidsmpf.streaming.core.context import Context
@@ -152,6 +154,17 @@ def _message_size(message: Message[Any]) -> int:
 def trace_channel(channel: Channel[T], tracer: ActorTracer | None) -> Channel[T]:
     """Wrap one of an actor's boundary channels to record the bytes crossing it."""
     return cast("Channel[T]", TracingChannel(channel, tracer))
+
+
+def record_channel_metrics(
+    tracer: ActorTracer,
+    *,
+    chs_in: Sequence[Channel[Any]],
+    chs_out: Sequence[Channel[Any]],
+) -> None:
+    """Record byte totals exposed by unwrapped boundary channels."""
+    tracer.input_bytes += sum(channel.metrics().recv_bytes for channel in chs_in)
+    tracer.output_bytes += sum(channel.metrics().send_bytes for channel in chs_out)
 
 
 async def send_chunk(

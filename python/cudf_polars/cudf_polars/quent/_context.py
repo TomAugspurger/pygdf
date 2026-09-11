@@ -17,13 +17,13 @@ from cudf_polars.quent._types import (
     Backend,
     DataChannel,
     DataChannelType,
+    DeviceMemory,
     Engine,
     Implementation,
-    Memory,
-    MemoryType,
     Processor,
     Query,
     QueryGroup,
+    Storage,
     ThreadPool,
 )
 from cudf_polars.utils.config import get_total_device_memory
@@ -157,8 +157,13 @@ class QuentContext:
         handle.planning()
         handle.executing()
 
-    def _emit_query_exit_events(self, session: QuentSession, query: Query) -> None:
-        session.query(query.id).exited()
+    def _emit_query_completed_event(self, session: QuentSession, query: Query) -> None:
+        session.query(query.id).completed()
+
+    def _emit_query_failed_event(
+        self, session: QuentSession, query: Query, error: BaseException
+    ) -> None:
+        session.query(query.id).failed(error=str(error))
 
     def _emit_plan_declarations(
         self,
@@ -247,12 +252,6 @@ class QuentContext:
                 "target": execution_context.logger.to_uuid(processor.id),
                 "data": {},
             },
-            memory={
-                "target": execution_context.logger.to_uuid(
-                    execution_context.worker_resources.device_memory.id
-                ),
-                "data": {"bytes": input_frames_bytes},
-            },
             channel=(
                 {
                     "target": execution_context.logger.to_uuid(
@@ -265,16 +264,19 @@ class QuentContext:
             ),
         )
 
-    def _emit_evaluate_end_events(
+    def _emit_evaluate_end_event(
         self,
         evaluate: Evaluate,
         execution_context: QuentIRExecutionContext,
         result: DataFrame | None,
+        error: BaseException | None,
     ) -> None:
-        execution_context.logger.evaluate(evaluate.id).exited(
-            succeeded=result is not None,
-            output_bytes=result._size_bytes if result is not None else 0,
-        )
+        handle = execution_context.logger.evaluate(evaluate.id)
+        if error is not None:
+            handle.failed(error=str(error))
+        else:
+            assert result is not None
+            handle.completed(output_bytes=result._size_bytes)
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -283,8 +285,8 @@ class WorkerResources:
 
     thread_pool: ThreadPool
     processor_registry: ProcessorRegistry
-    device_memory: Memory
-    filesystem: Memory
+    device_memory: DeviceMemory
+    filesystem: Storage
     disk_to_device_channel: DataChannel
     link_channels: dict[int, DataChannel]
 
@@ -298,17 +300,14 @@ class WorkerResources:
         nranks: int,
     ) -> Self:
         del engine_id
-        device_memory = Memory(
+        device_memory = DeviceMemory(
             instance_name=f"{instance_suffix} device memory",
-            resource_type=MemoryType.DEVICE,
             worker_id=worker_id,
             capacity_bytes=get_total_device_memory() or 0,
         )
-        filesystem = Memory(
+        filesystem = Storage(
             instance_name=f"{instance_suffix} filesystem",
-            resource_type=MemoryType.FILESYSTEM,
             worker_id=worker_id,
-            capacity_bytes=0,
         )
         disk_to_device = DataChannel(
             instance_name=f"{instance_suffix} disk -> device",
@@ -338,13 +337,15 @@ class WorkerResources:
         )
 
     def declare(self, session: QuentSession) -> None:
-        for memory in (self.device_memory, self.filesystem):
-            session.memory(memory.id).declared(
-                instance_name=memory.instance_name,
-                resource_type=str(memory.resource_type),
-                worker=session.to_uuid(memory.worker_id),
-                limits={"bytes": memory.capacity_bytes},
-            )
+        session.device_memory(self.device_memory.id).declared(
+            instance_name=self.device_memory.instance_name,
+            worker=session.to_uuid(self.device_memory.worker_id),
+            limits={"bytes": self.device_memory.capacity_bytes},
+        )
+        session.storage(self.filesystem.id).declared(
+            instance_name=self.filesystem.instance_name,
+            worker=session.to_uuid(self.filesystem.worker_id),
+        )
         session.thread_pool(self.thread_pool.id).declared(
             instance_name=f"Thread Pool {self.thread_pool.id.hex[:8]}",
             worker=session.to_uuid(self.thread_pool.worker_id),

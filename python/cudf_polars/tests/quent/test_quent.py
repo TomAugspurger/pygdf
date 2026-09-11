@@ -39,7 +39,7 @@ def test_context_lifecycle_uses_generated_handles(
     quent_context._emit_engine_init_events(session)
     quent_context._emit_query_group_events(session)
     quent_context._emit_query_events(session, query)
-    quent_context._emit_query_exit_events(session, query)
+    quent_context._emit_query_completed_event(session, query)
     quent_context._emit_engine_exit_events(session)
 
     events = _events(session)
@@ -60,7 +60,7 @@ def test_context_lifecycle_uses_generated_handles(
             else event["data"]["Query"]
         )
         for event in query_events
-    ] == ["Initialized", "Planning", "Executing", "Exited"]
+    ] == ["Initialized", "Planning", "Executing", "Completed"]
     assert str(quent_context.engine.id) == events[0]["id"]
     assert str(query.id) == query_events[0]["id"]
 
@@ -108,7 +108,8 @@ def test_entity_kinds_match_the_declarative_schema() -> None:
         "PORT",
         "THREAD_POOL",
         "PROCESSOR",
-        "MEMORY",
+        "DEVICE_MEMORY",
+        "STORAGE",
         "DATA_CHANNEL",
         "QUERY",
         "EVALUATE",

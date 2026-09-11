@@ -41,13 +41,6 @@ class Backend(enum.StrEnum):
     DASK = "dask"
 
 
-class MemoryType(enum.StrEnum):
-    """Kinds of memory represented in the telemetry schema."""
-
-    DEVICE = "device"
-    FILESYSTEM = "filesystem"
-
-
 class DataChannelType(enum.StrEnum):
     """Kinds of concrete worker data paths."""
 
@@ -158,13 +151,21 @@ class Processor:
 
 
 @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
-class Memory:
-    """A worker-local memory or storage resource."""
+class DeviceMemory:
+    """A bounded worker-local device-memory resource."""
 
     instance_name: str
-    resource_type: MemoryType
     worker_id: uuid.UUID
     capacity_bytes: int
+    id: uuid.UUID = dataclasses.field(default_factory=new_quent_id)
+
+
+@dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
+class Storage:
+    """A worker-local storage resource with unknown capacity."""
+
+    instance_name: str
+    worker_id: uuid.UUID
     id: uuid.UUID = dataclasses.field(default_factory=new_quent_id)
 
 
@@ -175,8 +176,8 @@ class DataChannel:
     instance_name: str
     channel_type: DataChannelType
     worker_id: uuid.UUID
-    source: Memory
-    target: Memory
+    source: DeviceMemory | Storage
+    target: DeviceMemory | Storage
     id: uuid.UUID = dataclasses.field(default_factory=new_quent_id)
 
 
@@ -207,13 +208,12 @@ __all__ = [
     "Backend",
     "DataChannel",
     "DataChannelType",
+    "DeviceMemory",
     "DynamicValue",
     "Edge",
     "Engine",
     "Evaluate",
     "Implementation",
-    "Memory",
-    "MemoryType",
     "Operator",
     "OperatorStatistics",
     "Plan",
@@ -221,6 +221,7 @@ __all__ = [
     "Processor",
     "Query",
     "QueryGroup",
+    "Storage",
     "ThreadPool",
     "Worker",
     "dynamic_attributes",

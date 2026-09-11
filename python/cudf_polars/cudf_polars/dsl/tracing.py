@@ -220,20 +220,23 @@ def log_do_evaluate(
             # argument, followed by the method-specific arguments, and returns a DataFrame.
 
             start = time.monotonic_ns()
+            result: cudf_polars.containers.DataFrame | None = None
+            error: BaseException | None = None
             try:
                 result = func(cls, *args, **kwargs)
-            except Exception:  # pragma: no cover;
-                result = None
+            except BaseException as caught:  # pragma: no cover
+                error = caught
                 raise
             finally:
                 if (
                     quent_evaluate is not None
                     and ir_execution_context.quent_ir_execution_context is not None
                 ):
-                    ir_execution_context.quent_ir_execution_context.context._emit_evaluate_end_events(
+                    ir_execution_context.quent_ir_execution_context.context._emit_evaluate_end_event(
                         quent_evaluate,
                         ir_execution_context.quent_ir_execution_context,
                         result,
+                        error,
                     )
             stop = time.monotonic_ns()
 

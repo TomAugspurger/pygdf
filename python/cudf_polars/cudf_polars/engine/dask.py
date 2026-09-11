@@ -848,14 +848,20 @@ def evaluate_pipeline_dask_mode(
         quent_context._emit_query_events(quent_logger, query)
 
     worker_config = config_options.drop_unserializable()
-    result_map = dask_context.client.run(
-        functools.partial(_worker_evaluate, uid=dask_context.rapidsmpf_id),
-        ir,
-        worker_config,
-        collect_metadata=collect_metadata,
-        quent_context=quent_context,
-        query_id=query_id,
-    )
+    try:
+        result_map = dask_context.client.run(
+            functools.partial(_worker_evaluate, uid=dask_context.rapidsmpf_id),
+            ir,
+            worker_config,
+            collect_metadata=collect_metadata,
+            quent_context=quent_context,
+            query_id=query_id,
+        )
+    except BaseException as error:
+        if quent_context is not None:
+            assert quent_logger is not None
+            quent_context._emit_query_failed_event(quent_logger, query, error)
+        raise
 
     ranked: list[tuple[int, pl.DataFrame]] = []
     metadata_collector: list[ChannelMetadata] = []
@@ -867,7 +873,7 @@ def evaluate_pipeline_dask_mode(
     if quent_context is not None:
         quent_logger = dask_context.quent_logger
         assert quent_logger is not None
-        quent_context._emit_query_exit_events(quent_logger, query)
+        quent_context._emit_query_completed_event(quent_logger, query)
 
     ranked.sort(key=lambda p: p[0])
     dfs = [df for _, df in ranked]

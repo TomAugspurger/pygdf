@@ -367,13 +367,17 @@ fn to_query_engine_event(
                         query_engine::query::Executing {},
                     ),
                 ),
-                QueryEvent::Exited => (3, query_engine::query::QueryTransition::Exit),
+                QueryEvent::Completed => (3, query_engine::query::QueryTransition::Exit),
+                QueryEvent::Failed { .. } => {
+                    (3, query_engine::query::QueryTransition::Exit)
+                }
             };
             query_engine::QueryEngineEvent::Query(FsmEvent { seq, state })
         }
         CudfPolarsEvent::ThreadPool(_)
         | CudfPolarsEvent::Processor(_)
-        | CudfPolarsEvent::Memory(_)
+        | CudfPolarsEvent::DeviceMemory(_)
+        | CudfPolarsEvent::Storage(_)
         | CudfPolarsEvent::DataChannel(_)
         | CudfPolarsEvent::Evaluate(_)
         | CudfPolarsEvent::Actor(_) => return None,
@@ -446,7 +450,11 @@ mod tests {
                     edges: vec![],
                 }),
             ),
-            Event::new(query_id, 8, CudfPolarsEvent::Query(QueryEvent::Exited)),
+            Event::new(
+                query_id,
+                8,
+                CudfPolarsEvent::Query(QueryEvent::Completed),
+            ),
             Event::new(worker_id, 9, CudfPolarsEvent::Worker(WorkerEvent::Exit)),
             Event::new(engine_id, 10, CudfPolarsEvent::Engine(EngineEvent::Exit)),
         ];

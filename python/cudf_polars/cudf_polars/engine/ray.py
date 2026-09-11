@@ -185,18 +185,24 @@ def evaluate_pipeline_ray_mode(
     ir_ref = ray.put(ir)
     # `result` is in actor order, which is NOT rank order, so each actor
     # reports its rank and the partitions are sorted before concatenation.
-    result = ray.get(
-        [
-            rank.evaluate_polars_ir.remote(
-                ir_ref,
-                actor_config_options,
-                collect_metadata=collect_metadata,
-                quent_context=config_options.executor.quent_context,
-                query_id=query_id,
-            )
-            for rank in rank_actors
-        ]
-    )
+    try:
+        result = ray.get(
+            [
+                rank.evaluate_polars_ir.remote(
+                    ir_ref,
+                    actor_config_options,
+                    collect_metadata=collect_metadata,
+                    quent_context=config_options.executor.quent_context,
+                    query_id=query_id,
+                )
+                for rank in rank_actors
+            ]
+        )
+    except BaseException as error:
+        if quent_context is not None:
+            assert quent_logger is not None
+            quent_context._emit_query_failed_event(quent_logger, query, error)
+        raise
     ranked: list[tuple[int, pl.DataFrame]] = []
     metadata_collector: list[ChannelMetadata] = []
     for rank, df, md in result:
@@ -209,7 +215,7 @@ def evaluate_pipeline_ray_mode(
     if quent_context is not None:
         quent_logger = config_options.executor.ray_context.quent_logger
         assert quent_logger is not None
-        quent_context._emit_query_exit_events(quent_logger, query)
+        quent_context._emit_query_completed_event(quent_logger, query)
     return pl.concat(dfs), metadata_collector or None
 
 

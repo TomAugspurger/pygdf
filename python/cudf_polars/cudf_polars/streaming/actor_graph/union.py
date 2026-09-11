@@ -68,7 +68,7 @@ async def union_node(
         The input Channel[TableChunk]s.
     """
     async with shutdown_on_error(
-        context, *chs_in, ch_out, trace_ir=ir, ir_context=ir_context
+        context, chs_in=chs_in, chs_out=(ch_out,), trace_ir=ir, ir_context=ir_context
     ) as tracer:
         chs_in = tuple(trace_channel(ch, tracer) for ch in chs_in)
         ch_out = trace_channel(ch_out, tracer)
