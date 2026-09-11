@@ -275,6 +275,19 @@ async def shutdown_channels_on_error(
         raise
 
 
+@dataclass(frozen=True)
+class ActorScope:
+    """Tracing state and explicit execution context for one Actor lifetime."""
+
+    tracer: ActorTracer
+    ir_context: IRExecutionContext | None
+
+    def require_ir_context(self) -> IRExecutionContext:
+        """Return the Actor-bound context required by evaluation code."""
+        assert self.ir_context is not None
+        return self.ir_context
+
+
 @asynccontextmanager
 async def shutdown_on_error(
     context: Context,
@@ -284,7 +297,7 @@ async def shutdown_on_error(
     *,
     trace_ir: IR,
     ir_context: IRExecutionContext | None = None,
-) -> AsyncIterator[ActorTracer]:
+) -> AsyncIterator[ActorScope]:
     """
     Actor-level shutdown and tracing for rapidsmpf.
 
@@ -336,9 +349,13 @@ async def shutdown_on_error(
         ir_context is not None
         and (quent_execution := ir_context.quent_ir_execution_context) is not None
     ):
-        quent_actor = quent_execution.logger.actor(
-            cudf_polars.quent._types.new_quent_id()
+        actor_id = cudf_polars.quent._types.new_quent_id()
+        quent_execution = replace(quent_execution, actor_id=actor_id)
+        ir_context = replace(
+            ir_context,
+            quent_ir_execution_context=quent_execution,
         )
+        quent_actor = quent_execution.logger.actor(actor_id)
         quent_actor.started(
             operator=quent_execution.logger.to_uuid(quent_execution.quent_operator.id),
             worker=quent_execution.logger.to_uuid(quent_execution.worker.id),
@@ -349,7 +366,7 @@ async def shutdown_on_error(
     with cudf_polars.dsl.tracing.bound_contextvars(**contextvars):
         start = time.monotonic_ns()
         try:
-            yield tracer
+            yield ActorScope(tracer=tracer, ir_context=ir_context)
         except BaseException as caught:
             actor_error = caught
             await shutdown_channels(context, *channels)

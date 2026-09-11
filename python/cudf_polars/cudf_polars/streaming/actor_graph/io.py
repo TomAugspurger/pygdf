@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import functools
 import io
 import math
@@ -34,7 +33,6 @@ from cudf_polars.streaming.actor_graph.dispatch import (
 from cudf_polars.streaming.actor_graph.nodes import define_actor, shutdown_on_error
 from cudf_polars.streaming.actor_graph.tracing import (
     send_chunk,
-    trace_channel,
 )
 from cudf_polars.streaming.actor_graph.utils import (
     ChannelManager,
@@ -202,9 +200,10 @@ async def dataframescan_node(
         ``Cluster.SPMD`` mode.
     """
     async with shutdown_on_error(
-        context, ch_out, trace_ir=ir, ir_context=ir_context
-    ) as tracer:
-        ch_out = trace_channel(ch_out, tracer)
+        context, chs_out=(ch_out,), trace_ir=ir, ir_context=ir_context
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         # Find local partition count.
         nrows = ir.df.shape()[0]
         global_count = math.ceil(nrows / rows_per_partition) if nrows > 0 else 0
@@ -306,11 +305,13 @@ async def dataframescan_node(
                 )
             await ch_out.drain(context)
 
-        async with (
-            shutdown_on_error(
-                context, *lineariser.input_channels, trace_ir=ir, ir_context=ir_context
-            ),
-        ):
+        async with shutdown_on_error(
+            context,
+            auxiliary_channels=tuple(lineariser.input_channels),
+            trace_ir=ir,
+            ir_context=ir_context,
+        ) as inner_actor_scope:
+            ir_context = inner_actor_scope.require_ir_context()
             await gather_in_task_group(
                 lineariser.drain(),
                 *(_producer(i) for i in range(num_producers)),
@@ -448,9 +449,10 @@ async def python_scan_node(
         The output Channel[TableChunk].
     """
     async with shutdown_on_error(
-        context, ch_out, trace_ir=ir, ir_context=ir_context
-    ) as tracer:
-        ch_out = trace_channel(ch_out, tracer)
+        context, chs_out=(ch_out,), trace_ir=ir, ir_context=ir_context
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         rank_aware_source = _find_rank_aware_source(ir.options[0])
         if rank_aware_source is None and comm.nranks > 1 and comm.rank != 0:
             # A plain (rank-unaware) source runs on rank 0 only; other ranks
@@ -645,11 +647,11 @@ async def scan_node(
     scans: Sequence[SplitScan] | Sequence[FusedScan] = ir.scans
 
     async with shutdown_on_error(
-        context, ch_out, trace_ir=ir, ir_context=ir_context
-    ) as tracer:
-        ch_out = trace_channel(ch_out, tracer)
+        context, chs_out=(ch_out,), trace_ir=ir, ir_context=ir_context
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         # Send basic metadata
-        ir_context = dataclasses.replace(ir_context, tracer=tracer)
         await send_metadata(
             ch_out,
             context,
@@ -704,11 +706,13 @@ async def scan_node(
                 )
             await ch_out.drain(context)
 
-        async with (
-            shutdown_on_error(
-                context, *lineariser.input_channels, trace_ir=ir, ir_context=ir_context
-            ),
-        ):
+        async with shutdown_on_error(
+            context,
+            auxiliary_channels=tuple(lineariser.input_channels),
+            trace_ir=ir,
+            ir_context=ir_context,
+        ) as inner_actor_scope:
+            ir_context = inner_actor_scope.require_ir_context()
             await gather_in_task_group(
                 lineariser.drain(),
                 *(_producer(i) for i in range(num_producers)),
@@ -791,10 +795,13 @@ async def sink_node(
     # with other files.
 
     async with shutdown_on_error(
-        context, ch_in, ch_out, ir_context=ir_context, trace_ir=ir
-    ) as tracer:
-        ch_in = trace_channel(ch_in, tracer)
-        ch_out = trace_channel(ch_out, tracer)
+        context,
+        chs_in=(ch_in,),
+        chs_out=(ch_out,),
+        ir_context=ir_context,
+        trace_ir=ir,
+    ) as actor_scope:
+        ir_context = actor_scope.require_ir_context()
         metadata = await recv_metadata(ch_in, context)
         await send_metadata(
             ch_out, context, ChannelMetadata(local_count=1, duplicated=True)

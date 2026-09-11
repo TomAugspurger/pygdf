@@ -59,12 +59,13 @@ async def pushdown_filter_actor(
     collected_samples: Sequence[TableSizeStats] = []
     async with shutdown_on_error(
         context,
-        ch_out,
-        ch_target,
-        ch_domain,
+        chs_in=(ch_target, ch_domain),
+        chs_out=(ch_out,),
         trace_ir=ir,
         ir_context=ir_context,
-    ) as tracer:
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         try:
             target_metadata, domain_metadata = await gather_in_task_group(
                 recv_metadata(ch_target, context),
@@ -182,7 +183,7 @@ async def pushdown_filter_actor(
                 )
                 async with shutdown_on_error(
                     context,
-                    *execution.channels,
+                    auxiliary_channels=tuple(execution.channels),
                     trace_ir=ir,
                     ir_context=ir_context,
                 ):

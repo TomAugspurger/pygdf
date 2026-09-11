@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from cudf_streaming import CardinalityEstimator
@@ -54,7 +54,6 @@ from cudf_polars.streaming.actor_graph.prefilter import (
 from cudf_polars.streaming.actor_graph.tracing import (
     LOG_TRACES,
     send_chunk,
-    trace_channel,
 )
 from cudf_polars.streaming.actor_graph.utils import (
     CUDF_ROW_LIMIT,
@@ -262,16 +261,13 @@ async def broadcast_join_actor(
     """
     async with shutdown_on_error(
         context,
-        ch_out,
-        ch_left,
-        ch_right,
+        chs_in=(ch_left, ch_right),
+        chs_out=(ch_out,),
         trace_ir=ir,
         ir_context=ir_context,
-    ) as tracer:
-        ch_left = trace_channel(ch_left, tracer)
-        ch_right = trace_channel(ch_right, tracer)
-        ch_out = trace_channel(ch_out, tracer)
-        ir_context = replace(ir_context, tracer=tracer)
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         await broadcast_join(
             context,
             comm,
@@ -950,11 +946,11 @@ async def _shuffle_join(
     # note: this is an actor inside of an actor. How should we log that in our traces?
     async with shutdown_on_error(
         context,
-        ch_left_shuffle,
-        ch_right_shuffle,
+        auxiliary_channels=(ch_left_shuffle, ch_right_shuffle),
         trace_ir=ir,
         ir_context=ir_context,
-    ):
+    ) as actor_scope:
+        ir_context = actor_scope.require_ir_context()
         actor_tasks = [
             _global_shuffle(
                 context,
@@ -1112,11 +1108,11 @@ async def _ordered_join(
     ch_right_adjusted = context.create_channel()
     async with shutdown_on_error(
         context,
-        ch_left_adjusted,
-        ch_right_adjusted,
+        auxiliary_channels=(ch_left_adjusted, ch_right_adjusted),
         trace_ir=ir,
         ir_context=ir_context,
-    ):
+    ) as actor_scope:
+        ir_context = actor_scope.require_ir_context()
         await gather_in_task_group(
             _adjust_ordered_join_side(
                 context,
@@ -1698,17 +1694,13 @@ async def join_actor(
     """
     async with shutdown_on_error(
         context,
-        ch_out,
-        ch_left,
-        ch_right,
-        *ch_prefilter_domains,
+        chs_in=(ch_left, ch_right, *ch_prefilter_domains),
+        chs_out=(ch_out,),
         trace_ir=ir,
         ir_context=ir_context,
-    ) as tracer:
-        ch_left = trace_channel(ch_left, tracer)
-        ch_right = trace_channel(ch_right, tracer)
-        ch_out = trace_channel(ch_out, tracer)
-        ir_context = replace(ir_context, tracer=tracer)
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         (
             left_metadata,
             right_metadata,
@@ -1768,12 +1760,15 @@ async def join_actor(
         )
         async with shutdown_on_error(
             context,
-            ch_left_replay,
-            ch_right_replay,
-            *prefilter_execution.channels,
+            auxiliary_channels=(
+                ch_left_replay,
+                ch_right_replay,
+                *prefilter_execution.channels,
+            ),
             trace_ir=ir,
             ir_context=ir_context,
-        ):
+        ) as inner_actor_scope:
+            ir_context = inner_actor_scope.require_ir_context()
             actor_tasks = [
                 replay_buffered_channel(
                     context,

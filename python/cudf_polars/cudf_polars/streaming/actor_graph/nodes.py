@@ -25,7 +25,6 @@ from cudf_polars.streaming.actor_graph.dispatch import (
 )
 from cudf_polars.streaming.actor_graph.tracing import (
     send_chunk,
-    trace_channel,
 )
 from cudf_polars.streaming.actor_graph.utils import (
     ChannelManager,
@@ -94,10 +93,14 @@ async def default_node_single(
     Chunks are processed in the order they are received.
     """
     async with shutdown_on_error(
-        context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
-    ) as tracer:
-        ch_in = trace_channel(ch_in, tracer)
-        ch_out = trace_channel(ch_out, tracer)
+        context,
+        chs_in=(ch_in,),
+        chs_out=(ch_out,),
+        trace_ir=ir,
+        ir_context=ir_context,
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         # Recv metadata and prepare output metadata
         metadata_in = await recv_metadata(ch_in, context)
         partitioning = maybe_remap_partitioning(
@@ -110,10 +113,6 @@ async def default_node_single(
             partitioning=partitioning,
             duplicated=metadata_in.duplicated,
         )
-        import dataclasses
-
-        ir_context = dataclasses.replace(ir_context, tracer=tracer)
-
         # Process chunks (handle empty input for aggregation-like operations)
         await chunkwise_evaluate(
             context,
@@ -159,9 +158,9 @@ async def default_node_multi(
     """
     async with shutdown_on_error(
         context, chs_in=chs_in, chs_out=(ch_out,), trace_ir=ir, ir_context=ir_context
-    ) as tracer:
-        chs_in = tuple(trace_channel(ch, tracer) for ch in chs_in)
-        ch_out = trace_channel(ch_out, tracer)
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         # Merge and forward basic metadata.
         local_count = 1
         duplicated = True
@@ -311,7 +310,11 @@ async def fanout_node_bounded(
     # See: https://github.com/rapidsai/rapidsmpf/issues/560
     # TODO: Use ir_context
     async with shutdown_on_error(
-        context, ch_in, *chs_out, trace_ir=trace_ir, ir_context=ir_context
+        context,
+        chs_in=(ch_in,),
+        chs_out=chs_out,
+        trace_ir=trace_ir,
+        ir_context=ir_context,
     ):
         # Forward metadata to all outputs.
         metadata = await recv_metadata(ch_in, context)
@@ -387,7 +390,11 @@ async def fanout_node_unbounded(
     # See: https://github.com/rapidsai/rapidsmpf/issues/560
     # TODO: Use ir_context
     async with shutdown_on_error(
-        context, ch_in, *chs_out, trace_ir=trace_ir, ir_context=ir_context
+        context,
+        chs_in=(ch_in,),
+        chs_out=chs_out,
+        trace_ir=trace_ir,
+        ir_context=ir_context,
     ):
         # Forward metadata to all outputs.
         metadata = await recv_metadata(ch_in, context)
@@ -623,9 +630,9 @@ async def empty_node(
         The output Channel[TableChunk].
     """
     async with shutdown_on_error(
-        context, ch_out, ir_context=ir_context, trace_ir=ir
-    ) as tracer:
-        ch_out = trace_channel(ch_out, tracer)
+        context, chs_out=(ch_out,), ir_context=ir_context, trace_ir=ir
+    ) as actor_scope:
+        ir_context = actor_scope.require_ir_context()
         # Send metadata indicating a single empty chunk
         await send_metadata(
             ch_out,
@@ -739,7 +746,11 @@ async def metadata_feeder_node(
     """
     # TODO: Use ir_context
     async with shutdown_on_error(
-        context, ch_in, ch_out, trace_ir=ir, ir_context=ir_context
+        context,
+        chs_in=(ch_in,),
+        chs_out=(ch_out,),
+        trace_ir=ir,
+        ir_context=ir_context,
     ):
         await send_metadata(ch_out, context, metadata)
         while (msg := await ch_in.recv(context)) is not None:
@@ -780,7 +791,11 @@ async def metadata_drain_node(
         If None, metadata will not be collected.
     """
     async with shutdown_on_error(
-        context, ch_in, ch_out, ir_context=ir_context, trace_ir=ir
+        context,
+        chs_in=(ch_in,),
+        chs_out=(ch_out,),
+        ir_context=ir_context,
+        trace_ir=ir,
     ):
         # Drain metadata channel (we don't need it after this point)
         msg = await ch_in.recv_metadata(context)

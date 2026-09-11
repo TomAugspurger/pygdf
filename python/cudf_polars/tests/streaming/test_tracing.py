@@ -11,6 +11,7 @@ import subprocess
 import sys
 import textwrap
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
 import pytest
 
@@ -22,7 +23,11 @@ from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame
 from cudf_polars.streaming.actor_graph.io import Lineariser
-from cudf_polars.streaming.actor_graph.tracing import ActorTracer, send_chunk
+from cudf_polars.streaming.actor_graph.tracing import (
+    ActorTracer,
+    record_channel_metrics,
+    send_chunk,
+)
 from cudf_polars.utils.versions import POLARS_VERSION_LT_138
 
 if TYPE_CHECKING:
@@ -47,6 +52,19 @@ def test_actor_tracer_counts_table_chunk_without_table_view(chunk: TableChunk) -
     tracer.add_chunk(chunk=chunk)
     assert tracer.chunk_count == 1
     assert tracer.row_count == 3
+
+
+def test_record_channel_metrics_sums_all_memory_types() -> None:
+    input_channel = Mock()
+    input_channel.metrics.return_value.recv_bytes = {"device": 10, "host": 4}
+    output_channel = Mock()
+    output_channel.metrics.return_value.send_bytes = {"device": 7, "host": 3}
+    tracer = ActorTracer()
+
+    record_channel_metrics(tracer, chs_in=(input_channel,), chs_out=(output_channel,))
+
+    assert tracer.input_bytes == 14
+    assert tracer.output_bytes == 10
 
 
 @pytest.mark.spmd

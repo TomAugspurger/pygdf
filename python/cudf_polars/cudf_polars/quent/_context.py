@@ -239,11 +239,13 @@ class QuentContext:
         input_frames_bytes: int,
     ) -> None:
         processor = execution_context.get_or_declare_processor(threading.get_ident())
+        assert execution_context.actor_id is not None, (
+            "Evaluate events must be emitted from an Actor scope"
+        )
         handle = execution_context.logger.evaluate(evaluate.id)
         handle.queued(
             instance_name=evaluate.instance_name,
-            operator=execution_context.logger.to_uuid(evaluate.operator.id),
-            worker=execution_context.logger.to_uuid(evaluate.worker.id),
+            actor=execution_context.logger.to_uuid(execution_context.actor_id),
         )
         handle.running(
             io=ir_type.is_io_node,
@@ -381,9 +383,10 @@ class LocalQuentContext:
 
 @dataclasses.dataclass(kw_only=True)
 class QuentIRExecutionContext(LocalQuentContext):
-    """Rank-local state with an Operator bound to the current IR node."""
+    """Rank-local state bound to an Operator and, while running, an Actor."""
 
     quent_operator: Operator
+    actor_id: uuid.UUID | None = None
 
     @classmethod
     def from_execution_context(

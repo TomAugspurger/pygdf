@@ -179,8 +179,7 @@ fsms:
         initial: true
         attributes:
           instance_name: string
-          operator: { scope-ref: Operator }
-          worker: { ref: Worker }
+          actor: { scope-ref: Actor }
         to: [running]
       running:
         attributes:

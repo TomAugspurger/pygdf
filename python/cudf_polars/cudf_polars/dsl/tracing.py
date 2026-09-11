@@ -192,8 +192,6 @@ def log_do_evaluate(
                 quent_context = ir_execution_context.quent_ir_execution_context
                 token = uuid.uuid4()
                 quent_evaluate = Evaluate(
-                    operator=quent_context.quent_operator,
-                    worker=quent_context.worker,
                     instance_name=(
                         f"{cls.__name__}-{quent_context.quent_operator.id.hex[:8]}-"
                         f"{token.hex[:8]}"

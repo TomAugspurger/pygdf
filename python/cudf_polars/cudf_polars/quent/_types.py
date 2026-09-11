@@ -185,8 +185,6 @@ class DataChannel:
 class Evaluate:
     """A synchronous host-side IR evaluation."""
 
-    operator: Operator
-    worker: Worker
     instance_name: str
     id: uuid.UUID = dataclasses.field(default_factory=new_quent_id)
 

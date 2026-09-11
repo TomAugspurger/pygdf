@@ -160,8 +160,7 @@ class EvaluateHandle(Handle):
         self,
         *,
         instance_name: str,
-        operator: OperatorHandle | Uuid,
-        worker: WorkerHandle | Uuid,
+        actor: ActorHandle | Uuid,
     ) -> None: ...
     def running(
         self,
