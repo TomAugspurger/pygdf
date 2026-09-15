@@ -6,16 +6,15 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 from cudf_polars.dsl.traversal import traversal
 from cudf_polars.quent._types import (
-    Attribute,
     Edge,
     Operator,
     Plan,
     Port,
-    new_quent_id,
+    dynamic_attributes,
 )
 from cudf_polars.streaming.explain import SerializablePlan
 
@@ -23,7 +22,7 @@ if TYPE_CHECKING:
     import uuid
 
     from cudf_polars.dsl.ir import IR
-    from cudf_polars.quent._types import Query, Value, Worker
+    from cudf_polars.quent._types import Query, Worker
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 _JOIN_TYPES = frozenset({"Join", "ConditionalJoin"})
@@ -66,6 +65,8 @@ def build_plan(
         :attr:`Operator.parent_operators` for physical-plan operators
         that were derived from logical-plan operators during lowering.
     """
+    from cudf_polars import _quent
+
     serializable_plan = SerializablePlan.from_ir(ir, config_options=config_options)
     parent_ops = parent_operators_by_node_id or {}
     operator_by_ir_id: dict[str, Operator] = {}
@@ -73,6 +74,10 @@ def build_plan(
     operators: list[Operator] = []
     all_ports: list[Port] = []
     edges: list[Edge] = []
+    if query is None:
+        if parent_plan is None:
+            raise ValueError("A plan requires either a query or a parent plan.")
+        query = parent_plan.query
     plan = Plan(
         id=plan_id,
         query=query,
@@ -85,22 +90,16 @@ def build_plan(
     for node_id in sorted(serializable_plan.nodes.keys(), key=int):
         serializable_node = serializable_plan.nodes[node_id]
 
-        operator_id = new_quent_id()
-        custom_attributes = [
-            Attribute(name="node_id", value=node_id),
-            *(
-                # SerializablePlan properties are JSON-shaped values that map
-                # onto Quent Attribute Value (scalars, homogeneous lists, structs).
-                Attribute(name=key, value=cast("Value | None", value))
-                for key, value in serializable_node.properties.items()
-            ),
-        ]
+        operator_id = _quent.now_v7()
+        attributes = dynamic_attributes(
+            {"node_id": node_id, **serializable_node.properties}
+        )
         operator = Operator(
             id=operator_id,
             plan=plan,
             parent_operators=parent_ops.get(node_id, []),
             type_name=serializable_node.type,
-            custom_attributes=custom_attributes,
+            attributes=attributes,
         )
         operator_by_ir_id[node_id] = operator
         operators.append(operator)
@@ -108,7 +107,7 @@ def build_plan(
         for port_name in port_names_for_node(
             len(serializable_node.children), serializable_node.type
         ):
-            port = Port(new_quent_id(), operator=operator, instance_name=port_name)
+            port = Port(_quent.now_v7(), operator=operator, instance_name=port_name)
             all_ports.append(port)
             port_lookup[(operator_id, port_name)] = port
 

@@ -1,91 +1,71 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Export Quent events to an archive."""
+"""Archive schema-generated cudf-polars Quent events."""
 
 from __future__ import annotations
 
 import json
+import uuid
 import zipfile
 from typing import TYPE_CHECKING, Any
 
-from cudf_polars.quent._types import EventName, new_quent_id
-
 if TYPE_CHECKING:
-    import uuid
     from pathlib import Path
-
 
 SIDECAR_FILE_NAME = "model.qmi"
 EXTENSION = "ndjson"
 
-MODEL_QMI: dict[str, Any] = {
-    "quent": {
-        "version": "0.1.0",
-        "commit": "153d422ae3392c24dfaf6ac5743a8682f783f864",
-        "remote": "https://github.com/rapidsai/quent",
-    },
-    "model": {
-        "name": "Simulator",
-        "package": "quent-simulator-instrumentation",
-        "type_path": "quent_simulator_instrumentation::SimulatorEvent",
-        "source": {
-            "version": "0.1.0",
-            "commit": "153d422ae3392c24dfaf6ac5743a8682f783f864",
-            "remote": "https://github.com/rapidsai/quent",
-        },
-        "analyzer_package": "quent-simulator-analyzer",
-    },
-}
-
-ENTITY_DIRECTORIES: dict[str, str] = {
-    EventName.ENGINE.value: "engine",
-    EventName.WORKER.value: "worker",
-    EventName.QUERY_GROUP.value: "query_group",
-    EventName.QUERY.value: "query",
-    EventName.PLAN.value: "plan",
-    EventName.OPERATOR.value: "operator",
-    EventName.PORT.value: "port",
-    EventName.TASK.value: "task",
-    EventName.MEMORY.value: "memory",
-    EventName.CHANNEL.value: "channel",
-    EventName.THREAD_POOL.value: "thread_pool",
-    EventName.PROCESSOR.value: "processor",
-    EventName.NETWORK.value: "network",
-}
+# Schema-generated streams are named after the entity ("Engine"), but
+# `quent-open` discovers engines and their worker contexts by scanning the
+# snake-case stream names its older `entity!` models export. Without these
+# aliases the viewer builds and then lists no engines at all, so mirror the two
+# streams that indexer reads. Keys are generated names; values are the aliases.
+INDEX_STREAM_ALIASES = {"Engine": "engine", "Worker": "worker"}
 
 
-def unwrap_event_data(data: dict[str, Any]) -> tuple[str, Any]:
+def to_index_line(line: dict[str, Any]) -> dict[str, Any]:
     """
-    Extract the entity name and unwrapped payload from a buffered event.
+    Rewrite one event into the shape the legacy query-engine types deserialize.
 
-    Buffered events wrap payloads as ``{"Engine": {...}}``; archive export
-    stores the payload directly because the entity type is implied by the
-    subdirectory name.
+    Generated FSM events include a sequence number in every state payload. The
+    legacy index models do not have this field, and wrap attribute-less event
+    structs as newtype variants such as ``{"Exit": null}``.
     """
-    if len(data) != 1:
-        msg = (
-            "Expected event data with exactly one entity wrapper, "
-            f"got {len(data)} keys: {sorted(data)}"
-        )
-        raise ValueError(msg)
-    entity_name, payload = next(iter(data.items()))
-    if entity_name not in ENTITY_DIRECTORIES:
-        msg = f"Unknown Quent entity type: {entity_name!r}"
-        raise ValueError(msg)
-    return entity_name, payload
+    data = line["data"]
+    if isinstance(data, str):
+        return line
+    if isinstance(data, dict) and len(data) == 1:
+        event, payload = next(iter(data.items()))
+        if isinstance(payload, dict):
+            legacy_payload = {
+                key: value for key, value in payload.items() if key != "seq"
+            }
+            return {
+                **line,
+                "data": {event: legacy_payload or None},
+            }
+    return line
+
+
+def _model_qmi() -> dict[str, Any]:
+    """Return build provenance embedded in the generated extension."""
+    from cudf_polars import _quent
+
+    return json.loads(_quent.model_qmi())
 
 
 def to_export_line(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    """Convert a buffered event envelope to archive export line format."""
-    entity_name, payload = unwrap_event_data(event["data"])
-    directory = ENTITY_DIRECTORIES[entity_name]
-    export_line = {
+    """Remove the umbrella entity wrapper used by generated callback events."""
+    data = event["data"]
+    if len(data) != 1:
+        raise ValueError(f"Expected one generated entity wrapper, got {data!r}")
+    entity_name, payload = next(iter(data.items()))
+    return entity_name, {
         "id": event["id"],
         "timestamp": event["timestamp"],
         "data": payload,
     }
-    return directory, export_line
 
 
 def write_quent_export(
@@ -96,49 +76,43 @@ def write_quent_export(
     *,
     sidecar: dict[str, Any] | None = None,
 ) -> Path:
-    """
-    Write Quent events to a ZIP archive.
-
-    Parameters
-    ----------
-    events
-        Buffered Quent event envelopes from ``engine._quent_events``.
-    export_root
-        Directory for exported archives (e.g. ``logs``).
-    context_id
-        Context UUID, typically the engine/run id.
-    quent_archive
-        Quent archive path. The archive will be written to this path.
-    sidecar
-        Optional provenance payload for ``model.qmi``. Defaults to
-        :data:`MODEL_QMI`.
-
-    Returns
-    -------
-    Path
-        The archive path ``export_root/<context_id>.zip``. The archive contains
-        the Quent export layout under a top-level ``<context_id>/`` directory.
-    """
+    """Write gathered generated events to a Quent ZIP archive."""
     grouped: dict[str, list[dict[str, Any]]] = {}
     for event in events:
-        directory, export_line = to_export_line(event)
-        grouped.setdefault(directory, []).append(export_line)
+        directory, line = to_export_line(event)
+        grouped.setdefault(directory, []).append(line)
 
     export_root.mkdir(parents=True, exist_ok=True)
-    tmp_path = export_root / f".{context_id}.zip.tmp"
+    temporary = export_root / f".{context_id}.zip.tmp"
     context_dir = str(context_id)
-
     with zipfile.ZipFile(
-        tmp_path, mode="w", compression=zipfile.ZIP_DEFLATED
+        temporary, mode="w", compression=zipfile.ZIP_DEFLATED
     ) as archive:
         archive.writestr(
             f"{context_dir}/{SIDECAR_FILE_NAME}",
-            json.dumps(MODEL_QMI if sidecar is None else sidecar, indent=2) + "\n",
+            json.dumps(_model_qmi() if sidecar is None else sidecar, indent=2) + "\n",
         )
         for directory, lines in grouped.items():
-            stream_path = f"{context_dir}/{directory}/{new_quent_id()}.{EXTENSION}"
-            contents = [json.dumps(line, separators=(",", ":")) for line in lines]
-            archive.writestr(stream_path, "\n".join(contents) + "\n")
-
-    tmp_path.replace(quent_archive)
+            streams = [(directory, lines)]
+            if (alias := INDEX_STREAM_ALIASES.get(directory)) is not None:
+                streams.append((alias, [to_index_line(line) for line in lines]))
+            for name, stream in streams:
+                archive.writestr(
+                    f"{context_dir}/{name}/{uuid.uuid4()}.{EXTENSION}",
+                    "\n".join(
+                        json.dumps(line, separators=(",", ":")) for line in stream
+                    )
+                    + "\n",
+                )
+    temporary.replace(quent_archive)
     return quent_archive
+
+
+__all__ = [
+    "EXTENSION",
+    "INDEX_STREAM_ALIASES",
+    "SIDECAR_FILE_NAME",
+    "to_export_line",
+    "to_index_line",
+    "write_quent_export",
+]

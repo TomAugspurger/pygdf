@@ -25,7 +25,7 @@ from rapidsmpf.statistics import Statistics
 from rapidsmpf.streaming.core.context import Context
 
 import cudf_polars.quent
-import cudf_polars.quent._logging
+import cudf_polars.quent._runtime
 import cudf_polars.quent._types
 from cudf_polars.engine import persisted_result, rank_local_store
 from cudf_polars.engine.core import (
@@ -52,7 +52,7 @@ from cudf_polars.quent._context import (
     LocalQuentContext,
     WorkerResources,
 )
-from cudf_polars.quent._types import Worker
+from cudf_polars.quent._types import Backend, Worker
 from cudf_polars.unstable import unstable
 from cudf_polars.utils.config import (
     MemoryResourceConfig,
@@ -184,18 +184,24 @@ def evaluate_pipeline_ray_mode(
     ir_ref = ray.put(ir)
     # `result` is in actor order, which is NOT rank order, so each actor
     # reports its rank and the partitions are sorted before concatenation.
-    result = ray.get(
-        [
-            rank.evaluate_polars_ir.remote(
-                ir_ref,
-                actor_config_options,
-                collect_metadata=collect_metadata,
-                quent_context=config_options.executor.quent_context,
-                query_id=query_id,
-            )
-            for rank in rank_actors
-        ]
-    )
+    try:
+        result = ray.get(
+            [
+                rank.evaluate_polars_ir.remote(
+                    ir_ref,
+                    actor_config_options,
+                    collect_metadata=collect_metadata,
+                    quent_context=config_options.executor.quent_context,
+                    query_id=query_id,
+                )
+                for rank in rank_actors
+            ]
+        )
+    except BaseException as error:
+        if quent_context is not None:
+            assert quent_logger is not None
+            quent_context._emit_query_failed_event(quent_logger, query, error)
+        raise
     ranked: list[tuple[int, pl.DataFrame]] = []
     metadata_collector: list[ChannelMetadata] = []
     for rank, df, md in result:
@@ -208,7 +214,7 @@ def evaluate_pipeline_ray_mode(
     if quent_context is not None:
         quent_logger = config_options.executor.ray_context.quent_logger
         assert quent_logger is not None
-        quent_context._emit_query_exit_events(quent_logger, query)
+        quent_context._emit_query_completed_event(quent_logger, query)
     return pl.concat(dfs), metadata_collector or None
 
 
@@ -301,8 +307,8 @@ class RankActor:
         self._comm: Communicator | None = None
         self._ctx: Context | None = None
         if quent_enabled:
-            self._quent_logger: cudf_polars.quent._logging.QuentLogger | None = (
-                cudf_polars.quent._logging.QuentLogger()
+            self._quent_logger: cudf_polars.quent._runtime.QuentSession | None = (
+                cudf_polars.quent._runtime.QuentSession()
             )
         else:
             self._quent_logger = None
@@ -365,7 +371,12 @@ class RankActor:
         barrier(self._comm)
         # Now we can declare the Quent worker resources, which depends on self._comm
         if self._quent_logger is not None:
-            self._quent_logger.emit(self._quent_worker._init())
+            self._quent_logger.init_worker(
+                self._quent_worker.id,
+                instance_name=self._quent_worker.instance_name,
+                engine=self._quent_worker.engine.id,
+                parent_engine_id=str(self._quent_worker.engine.id),
+            )
             self.worker_resources = WorkerResources.build(
                 instance_suffix=f"RankActor-{self._quent_worker.id.hex[:8]}",
                 engine_id=self._quent_engine.id,
@@ -479,7 +490,7 @@ class RankActor:
             if self.worker_resources is not None:
                 self.worker_resources.finalize(self._quent_logger)
 
-            self._quent_logger.emit(self._quent_worker._exit())
+            self._quent_logger.exit_worker(self._quent_worker.id)
             return self._drain_quent_events()
         return []
 
@@ -866,9 +877,11 @@ class RayEngine(StreamingEngine):
             "quent_context"
         )
         if quent_context is not None:
-            self._quent_logger = cudf_polars.quent._logging.QuentLogger()
+            self._quent_logger = cudf_polars.quent._runtime.QuentSession()
             executor_options.setdefault("quent_context", quent_context)
-            quent_context._emit_engine_init_events(self._quent_logger)
+            quent_context._emit_engine_init_events(
+                self._quent_logger, backend=Backend.RAY
+            )
             engine = quent_context.engine
         else:
             self._quent_logger = None
