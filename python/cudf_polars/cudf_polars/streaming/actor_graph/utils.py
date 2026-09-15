@@ -53,7 +53,11 @@ from cudf_polars.dsl.tracing import Scope
 from cudf_polars.dsl.utils.column_domain import column_domain_bindings
 from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import AllGatherManager
-from cudf_polars.streaming.actor_graph.tracing import ActorTracer, send_chunk
+from cudf_polars.streaming.actor_graph.tracing import (
+    ActorTracer,
+    record_channel_metrics,
+    send_chunk,
+)
 from cudf_polars.streaming.utils import _concat
 from cudf_polars.utils.dtypes import make_empty_column
 
@@ -271,13 +275,29 @@ async def shutdown_channels_on_error(
         raise
 
 
+@dataclass(frozen=True)
+class ActorScope:
+    """Tracing state and explicit execution context for one Actor lifetime."""
+
+    tracer: ActorTracer
+    ir_context: IRExecutionContext | None
+
+    def require_ir_context(self) -> IRExecutionContext:
+        """Return the Actor-bound context required by evaluation code."""
+        assert self.ir_context is not None
+        return self.ir_context
+
+
 @asynccontextmanager
 async def shutdown_on_error(
     context: Context,
-    *channels: Channel[Any],
+    chs_in: Sequence[Channel[Any]] = (),
+    chs_out: Sequence[Channel[Any]] = (),
+    auxiliary_channels: Sequence[Channel[Any]] = (),
+    *,
     trace_ir: IR,
     ir_context: IRExecutionContext | None = None,
-) -> AsyncIterator[ActorTracer | None]:
+) -> AsyncIterator[ActorScope]:
     """
     Actor-level shutdown and tracing for rapidsmpf.
 
@@ -288,8 +308,15 @@ async def shutdown_on_error(
     ----------
     context
         The rapidsmpf context.
-    channels
-        The channels to shutdown on error.
+    chs_in
+        Boundary input channels. Shut down on error, and used to record
+        ``input_bytes`` from ``Channel.metrics().recv_bytes``.
+    chs_out
+        Boundary output channels. Shut down on error, and used to record
+        ``output_bytes`` from ``Channel.metrics().send_bytes``.
+    auxiliary_channels
+        Auxiliary channels. Shut down on error. Statistics from these channels
+        are not included in the actor tracing.
     trace_ir
         Optional IR node to enable tracing for this streaming actor.
         When provided and LOG_TRACES is enabled, an ActorTracer
@@ -304,8 +331,8 @@ async def shutdown_on_error(
     ActorTracer | None
         An actor tracer for collecting stats (if tracing enabled), else None.
     """
+    channels = (*chs_in, *chs_out, *auxiliary_channels)
     # Create tracer only if LOG_TRACES is enabled and IR is provided
-    tracer: ActorTracer | None = None
     contextvars: dict[str, Any] = {}
 
     ir_id = trace_ir.get_stable_id()
@@ -317,15 +344,36 @@ async def shutdown_on_error(
         contextvars["cudf_polars_query_id"] = str(ir_context.query_id)
         ir_context = replace(ir_context, tracer=tracer)
 
+    quent_actor = None
+    if (
+        ir_context is not None
+        and (quent_execution := ir_context.quent_ir_execution_context) is not None
+    ):
+        actor_id = cudf_polars.quent._types.new_quent_id()
+        quent_execution = replace(quent_execution, actor_id=actor_id)
+        ir_context = replace(
+            ir_context,
+            quent_ir_execution_context=quent_execution,
+        )
+        quent_actor = quent_execution.logger.actor(actor_id)
+        quent_actor.started(
+            operator=quent_execution.logger.to_uuid(quent_execution.quent_operator.id),
+            worker=quent_execution.logger.to_uuid(quent_execution.worker.id),
+        )
+        quent_actor.running()
+
+    actor_error: BaseException | None = None
     with cudf_polars.dsl.tracing.bound_contextvars(**contextvars):
         start = time.monotonic_ns()
         try:
-            yield tracer
-        except BaseException:
+            yield ActorScope(tracer=tracer, ir_context=ir_context)
+        except BaseException as caught:
+            actor_error = caught
             await shutdown_channels(context, *channels)
             raise
         finally:
             stop = time.monotonic_ns()
+            record_channel_metrics(tracer, chs_in=chs_in, chs_out=chs_out)
             record: dict[str, Any] = {
                 "scope": Scope.ACTOR.value,
             }
@@ -352,46 +400,22 @@ async def shutdown_on_error(
                 )
                 is not None
             ):
-                custom_attributes = []
-                if tracer is not None and tracer.chunk_count is not None:
-                    custom_attributes.append(
-                        cudf_polars.quent._types.StatisticsAttribute(
-                            key="chunk_count",
-                            value_type="U64",
-                            value=tracer.chunk_count,
-                        )
-                    )
-                if tracer is not None and tracer.duplicated is not None:
-                    custom_attributes.append(
-                        cudf_polars.quent._types.StatisticsAttribute(
-                            key="duplicated",
-                            value_type="U64",
-                            value=1 if tracer.duplicated else 0,
-                        )
-                    )
-                if tracer is not None and tracer.decision is not None:
-                    custom_attributes.append(
-                        cudf_polars.quent._types.StatisticsAttribute(
-                            key="decision",
-                            value_type="String",
-                            value=tracer.decision,
-                        )
-                    )
-                if tracer is None or tracer.row_count is None:
-                    # TODO: See if `output_rows` is nullable.
-                    output_rows = 0
+                values: cudf_polars.quent._types.OperatorStatistics = {
+                    "output_rows": tracer.row_count,
+                    "input_bytes": tracer.input_bytes,
+                    "output_bytes": tracer.output_bytes,
+                    "chunk_count": tracer.chunk_count,
+                    "duplicated": tracer.duplicated,
+                    "decision": tracer.decision,
+                }
+                assert quent_actor is not None
+                if actor_error is None:
+                    quent_actor.completed(values=values)
                 else:
-                    output_rows = tracer.row_count
-                stats = quent_ir_execution_context.quent_operator.statistics(
-                    statistics=cudf_polars.quent._types.Statistics(
-                        output_rows=output_rows,
-                        input_bytes=tracer.input_bytes,
-                        output_bytes=tracer.output_bytes,
-                        custom_attributes=custom_attributes,
-                    )
-                )
-
-                quent_ir_execution_context.logger.emit(stats)
+                    quent_actor.failed(error=str(actor_error), values=values)
+                quent_ir_execution_context.logger.operator(
+                    quent_ir_execution_context.quent_operator.id
+                ).statistics(values=values)
 
 
 def _update_ordering_indices(
@@ -1439,7 +1463,9 @@ async def replay_buffered_channel(
         The IR node to trace. Passed through to shutdown_on_error.
     """
     try:
-        async with shutdown_on_error(context, ch_out, ch_in, trace_ir=trace_ir):
+        async with shutdown_on_error(
+            context, chs_in=(ch_in,), chs_out=(ch_out,), trace_ir=trace_ir
+        ):
             await send_metadata(ch_out, context, metadata)
             for msg in buffered_chunks:
                 await ch_out.send(context, msg)

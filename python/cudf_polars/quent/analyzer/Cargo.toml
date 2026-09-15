@@ -1,0 +1,33 @@
+[package]
+name = "cudf-polars-quent-analyzer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# quent-open's generated viewer pins quent to the sidecar's remote and full
+# commit SHA. Cargo keys git sources on the rev spelling, so an abbreviated rev
+# here would build a second copy of these crates and the two `QuentViewer`
+# traits would not unify.
+[dependencies]
+quent-analyzer = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-events = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab", features = ["serde"] }
+quent-model = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab", features = ["serde"] }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-query-engine-model = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-simulator-ui = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-store = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab", default-features = false, features = ["io-ndjson"] }
+quent-time = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-ui = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde"] }
+
+[build-dependencies]
+quent-store-build = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+quent-yaml = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+
+[dev-dependencies]
+quent-query-engine-server = { git = "https://github.com/rapidsai/quent", rev = "074319821341d83932efff90eb71f075a89618ab" }
+tempfile = "3"
