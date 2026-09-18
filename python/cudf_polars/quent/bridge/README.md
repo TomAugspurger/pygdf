@@ -50,7 +50,7 @@ Quent is pinned by full Git commit SHA in both
 
    ```sh
    python -m maturin develop
-   python -c "import cudf_polars._quent as q; print(q.model_qmi())"
+   python -c "import cudf_polars._quent as q; print(q.ExporterOptions.collector)"
    ```
 
    The build script generates the Rust bridge and a PEP 561 stub under Cargo's

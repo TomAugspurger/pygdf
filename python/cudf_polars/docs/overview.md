@@ -742,12 +742,11 @@ and display names and is provided through `StreamingExecutor.quent_context`.
 `LocalQuentContext` combines them with rank-local generated handles and resource
 UUIDs.
 
-Each rank has a `QuentSession` backed by Quent's generated callback exporter.
-The client engine has a separate session for engine-level events. This keeps
-events in memory until shutdown without routing them through `structlog`.
-
-Upon `StreamingEngine.shutdown`, all events are gathered from the workers and persisted
-on the (now closed) engine at `StreamingEngine._quent_events`.
+Rank 0 hosts a Quent gRPC collector. Each rank and the client engine use
+collector-backed generated contexts, and the collector writes per-context NDJSON
+streams and `model.qmi` provenance under `QuentConfig.collector_output_root`.
+Shutdown closes every client before stopping the collector, so all files are
+flushed before the benchmark packages them into a trace archive.
 
 ### Concepts
 

@@ -110,7 +110,6 @@ impl PyCollector {
                     .await
                     .map_err(|error| error.to_string())
             });
-            drop(runtime);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             loop {
                 let all_released = contexts
@@ -127,6 +126,7 @@ impl PyCollector {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
             contexts.lock().unwrap().clear();
+            drop(runtime);
             result
         });
         Ok(Self {
