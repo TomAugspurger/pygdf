@@ -1811,11 +1811,13 @@ def _write_quent_traces(
     if not (_HAS_STRUCTLOG or collect_traces):
         return None
 
-    quent_logs = list(engine._quent_events)
-
-    logs_dir = Path("logs")
-    output_path = write_quent_export(quent_logs, logs_dir, run_id, quent_archive)
-    print(f"Wrote {len(quent_logs)} Quent trace events to {output_path}")
+    export_root = engine._quent_output_root
+    if export_root is None:
+        return None
+    if export_root.name != str(run_id):
+        raise ValueError(f"Quent output {export_root} does not match run {run_id}")
+    output_path = write_quent_export(export_root, quent_archive)
+    print(f"Wrote Quent trace archive to {output_path}")
     return output_path
 
 

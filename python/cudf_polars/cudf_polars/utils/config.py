@@ -1036,6 +1036,7 @@ class DaskContext:
     client: distributed.Client
     rapidsmpf_id: str
     quent_logger: QuentSession | None
+    quent_root_worker: str | None = None
     owned_client: distributed.Client | None = None
     owned_cluster: Any | None = None
 

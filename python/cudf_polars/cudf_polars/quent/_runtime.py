@@ -5,9 +5,8 @@
 
 from __future__ import annotations
 
-import json
 import threading
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import uuid
@@ -20,31 +19,15 @@ except ImportError:  # pragma: no cover - depends on optional extension
     _quent = None  # type: ignore[assignment]
 
 
-class QuentEvent(TypedDict):
-    """JSON representation emitted by the generated model callback."""
-
-    id: str
-    timestamp: int
-    data: dict[str, Any]
-
-
-class BufferedEvent(TypedDict):
-    """One callback event indexed by its timestamp for cross-rank merging."""
-
-    timestamp: int
-    event: QuentEvent
-
-
 class QuentSession:
-    """Own one generated context, its active FSM handles, and exported events."""
+    """Own one collector-backed generated context and its active FSM handles."""
 
-    def __init__(self) -> None:
+    def __init__(self, collector_address: str) -> None:
         if _quent is None:
             raise ImportError(
                 "Quent tracing requires the cudf-polars Quent extension. "
                 "Build python/cudf_polars/quent/bridge with maturin."
             )
-        self._events: list[BufferedEvent] = []
         self._declarations_lock = threading.Lock()
         self._declared: set[tuple[str, uuid.UUID]] = set()
         self._engines: dict[uuid.UUID, quent_bindings.EngineInitHandle] = {}
@@ -53,7 +36,7 @@ class QuentSession:
         self._evaluations: dict[uuid.UUID, quent_bindings.EvaluateRunningHandle] = {}
         self._actors: dict[uuid.UUID, quent_bindings.ActorRunningHandle] = {}
         self._context = _quent.Context(
-            _quent.ExporterOptions.callback(self._record_event)
+            _quent.ExporterOptions.collector(collector_address)
         )
         self._closed = False
 
@@ -61,10 +44,6 @@ class QuentSession:
     def context(self) -> quent_bindings.Context:
         """Return the generated instrumentation context."""
         return self._context
-
-    def _record_event(self, payload: str) -> None:
-        event: QuentEvent = json.loads(payload)
-        self._events.append({"timestamp": event["timestamp"], "event": event})
 
     def declare_once(self, entity_name: str, identifier: uuid.UUID) -> bool:
         """Claim one declaration for an entity in this session."""
@@ -75,20 +54,17 @@ class QuentSession:
             self._declared.add(key)
             return True
 
-    def drain(self) -> list[BufferedEvent]:
-        """Close the exporter, wait for delivery, and return buffered events."""
-        if not self._closed:
-            self._engines.clear()
-            self._workers.clear()
-            self._queries.clear()
-            self._evaluations.clear()
-            self._actors.clear()
-            self._context.close()
-            self._closed = True
-        # Context.close() waits for every exporter callback before returning.
-        events = sorted(self._events, key=lambda item: item["timestamp"])
-        self._events.clear()
-        return events
+    def close(self) -> None:
+        """Close active handles and wait for collector delivery."""
+        if self._closed:
+            return
+        self._engines.clear()
+        self._workers.clear()
+        self._queries.clear()
+        self._evaluations.clear()
+        self._actors.clear()
+        self._context.close()
+        self._closed = True
 
 
-__all__ = ["BufferedEvent", "QuentEvent", "QuentSession"]
+__all__ = ["QuentSession"]

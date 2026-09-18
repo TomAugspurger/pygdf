@@ -6,14 +6,16 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import uuid
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
 if TYPE_CHECKING:
-    from cudf_polars.quent._runtime import QuentEvent
+    from collections.abc import Iterator
+    from pathlib import Path
 
 quent_bindings = pytest.importorskip("cudf_polars._quent")
 
@@ -29,12 +31,36 @@ from cudf_polars.quent._plan import (  # noqa: E402
 from cudf_polars.quent._runtime import QuentSession  # noqa: E402
 
 
-def _events(session: QuentSession) -> list[QuentEvent]:
-    return [item["event"] for item in session.drain()]
+@pytest.fixture
+def collector(tmp_path: Path) -> Iterator[tuple[Any, Path]]:
+    root = tmp_path / "collector"
+    value = quent_bindings.Collector(root, "127.0.0.1")
+    yield value, root
+    value.close()
 
 
-def test_context_lifecycle_uses_generated_handles(quent_context: QuentConfig) -> None:
-    session = QuentSession()
+def _events(root: Path) -> list[dict[str, Any]]:
+    events = []
+    for path in root.glob("*/*/*.ndjson"):
+        entity_name = path.parent.name
+        for line in path.read_text().splitlines():
+            event = json.loads(line)
+            event["data"] = {entity_name: event["data"]}
+            events.append(event)
+    return sorted(events, key=lambda event: event["timestamp"])
+
+
+def _finish(session: QuentSession, collector: Any, root: Path) -> list[dict[str, Any]]:
+    session.close()
+    collector.close()
+    return _events(root)
+
+
+def test_context_lifecycle_uses_generated_handles(
+    quent_context: QuentConfig, collector: tuple[Any, Path]
+) -> None:
+    server, root = collector
+    session = QuentSession(server.address)
     query_id = uuid.uuid4()
 
     quent_context._emit_engine_init_events(session)
@@ -43,7 +69,7 @@ def test_context_lifecycle_uses_generated_handles(quent_context: QuentConfig) ->
     quent_context._emit_query_completed_event(session, query_id)
     quent_context._emit_engine_exit_events(session)
 
-    events = _events(session)
+    events = _finish(session, server, root)
     assert [next(iter(event["data"])) for event in events] == [
         "Engine",
         "QueryGroup",
@@ -65,16 +91,19 @@ def test_context_lifecycle_uses_generated_handles(quent_context: QuentConfig) ->
 
 
 def test_query_group_is_declared_once_across_derived_configs(
-    quent_context: QuentConfig,
+    quent_context: QuentConfig, collector: tuple[Any, Path]
 ) -> None:
-    session = QuentSession()
+    server, root = collector
+    session = QuentSession(server.address)
     quent_context._emit_query_group_events(session)
     for iteration in range(2):
         dataclasses.replace(
             quent_context, query_name=f"Iteration {iteration}"
         )._emit_query_group_events(session)
 
-    assert [next(iter(event["data"])) for event in _events(session)] == ["QueryGroup"]
+    assert [next(iter(event["data"])) for event in _finish(session, server, root)] == [
+        "QueryGroup"
+    ]
 
 
 def test_fsm_start_handle_is_consumed_after_transition() -> None:
@@ -99,7 +128,9 @@ def test_context_serialization_preserves_configuration(
 
 
 def test_plan_entities_are_deterministic(
-    quent_context: QuentConfig, monkeypatch: pytest.MonkeyPatch
+    quent_context: QuentConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    collector: tuple[Any, Path],
 ) -> None:
     nodes = {
         "0": SimpleNamespace(type="DataFrameScan", children=[], properties={}),
@@ -117,7 +148,8 @@ def test_plan_entities_are_deterministic(
     query_id = uuid.uuid4()
     worker_id = uuid.uuid4()
 
-    first_session = QuentSession()
+    server, root = collector
+    first_session = QuentSession(server.address)
     first = emit_plan(
         first_session,
         object(),  # type: ignore[arg-type]
@@ -126,9 +158,9 @@ def test_plan_entities_are_deterministic(
         plan_id,
         worker_id,
     )
-    events = _events(first_session)
+    first_session.close()
 
-    second_session = QuentSession()
+    second_session = QuentSession(server.address)
     second = emit_plan(
         second_session,
         object(),  # type: ignore[arg-type]
@@ -138,7 +170,9 @@ def test_plan_entities_are_deterministic(
         worker_id,
         emit=False,
     )
-    second_session.drain()
+    second_session.close()
+    server.close()
+    events = _events(root)
 
     assert first == second
     assert events[0]["data"]["Plan"]["Declared"]["edges"][0] == {
@@ -158,8 +192,11 @@ def test_plan_entities_are_deterministic(
     )
 
 
-def test_processor_registry_declares_each_thread_once() -> None:
-    session = QuentSession()
+def test_processor_registry_declares_each_thread_once(
+    collector: tuple[Any, Path],
+) -> None:
+    server, root = collector
+    session = QuentSession(server.address)
     registry = ProcessorRegistry()
     pool_id = uuid.uuid4()
 
@@ -167,13 +204,13 @@ def test_processor_registry_declares_each_thread_once() -> None:
     assert registry.get_or_declare_processor(session, 10, pool_id) == first
     assert registry.get_or_declare_processor(session, 11, pool_id) != first
 
-    events = _events(session)
+    events = _finish(session, server, root)
     assert len(events) == 2
     assert all("Processor" in event["data"] for event in events)
 
 
 def test_inter_rank_channel_targets_remote_memory(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, collector: tuple[Any, Path]
 ) -> None:
     monkeypatch.setattr(
         "cudf_polars.quent._context.get_total_device_memory", lambda: 1024
@@ -181,12 +218,13 @@ def test_inter_rank_channel_targets_remote_memory(
     engine_id = uuid.uuid4()
     rank0 = WorkerResources.build("rank-0", engine_id, uuid.uuid4(), 0, 2)
     rank1 = WorkerResources.build("rank-1", engine_id, uuid.uuid4(), 1, 2)
-    session = QuentSession()
+    server, root = collector
+    session = QuentSession(server.address)
     rank0.declare(session)
 
     channel = next(
         event["data"]["DataChannel"]["Declared"]
-        for event in _events(session)
+        for event in _finish(session, server, root)
         if event["data"].get("DataChannel", {}).get("Declared", {}).get("channel_type")
         == "inter-rank"
     )

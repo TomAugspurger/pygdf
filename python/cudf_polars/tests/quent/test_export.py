@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for custom-schema Quent archive export."""
+"""Tests for packaging collector-produced Quent contexts."""
 
 from __future__ import annotations
 
@@ -13,23 +13,21 @@ from unittest.mock import ANY
 
 import pytest
 
-pytest.importorskip("cudf_polars._quent")
+quent_bindings = pytest.importorskip("cudf_polars._quent")
 
-from cudf_polars.quent._export import (
+from cudf_polars.quent._export import (  # noqa: E402
     SIDECAR_FILE_NAME,
-    to_export_line,
     write_quent_export,
 )
-from cudf_polars.quent._runtime import QuentSession
+from cudf_polars.quent._runtime import QuentSession  # noqa: E402
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from cudf_polars.quent._runtime import QuentEvent
 
-
-def _generated_events() -> list[QuentEvent]:
-    session = QuentSession()
+def _collect_engine_events(root: Path) -> Path:
+    collector = quent_bindings.Collector(root, "127.0.0.1")
+    session = QuentSession(collector.address)
     identifier = uuid.uuid4()
     session._engines[identifier] = (
         session.context.engine_observer()
@@ -45,105 +43,60 @@ def _generated_events() -> list[QuentEvent]:
         )
     )
     session._engines.pop(identifier).exit()
-    return [item["event"] for item in session.drain()]
+    session.close()
+    collector.close()
+    return next(path for path in root.iterdir() if path.is_dir())
 
 
-def test_to_export_line_is_schema_generic() -> None:
-    event = _generated_events()[0]
-    directory, line = to_export_line(event)
-    assert directory == "Engine"
-    assert line["id"] == event["id"]
-    assert "Init" in line["data"]
+def test_collector_writes_sidecar_and_generated_streams(tmp_path: Path) -> None:
+    root = tmp_path / "collector"
+    context = _collect_engine_events(root)
+
+    sidecar = json.loads((context / SIDECAR_FILE_NAME).read_text())
+    assert sidecar["model"]["name"] == "CudfPolars"
+    assert sidecar["model"]["analyzer_package"] == "cudf-polars-quent-analyzer"
+    engine_file = next((context / "Engine").glob("*.ndjson"))
+    assert [
+        json.loads(line)["data"] for line in engine_file.read_text().splitlines()
+    ] == [
+        {"Init": ANY},
+        {"Exit": {"seq": 1}},
+    ]
 
 
-def test_write_quent_export_uses_custom_sidecar(tmp_path: Path) -> None:
-    context_id = uuid.uuid4()
-    archive_path = tmp_path / f"{context_id}.zip"
-    write_quent_export(_generated_events(), tmp_path, context_id, archive_path)
-
-    with zipfile.ZipFile(archive_path) as archive:
-        sidecar = json.loads(archive.read(f"{context_id}/{SIDECAR_FILE_NAME}"))
-        assert sidecar["model"]["name"] == "CudfPolars"
-        assert sidecar["model"]["analyzer_package"] == "cudf-polars-quent-analyzer"
-        assert sidecar["model"]["source"]["version"] == "0.1.0"
-        assert sidecar["model"]["source"]["commit"]
-        assert sidecar["model"]["source"]["remote"]
-        streams = [
-            name
-            for name in archive.namelist()
-            if name.startswith(f"{context_id}/Engine/")
-        ]
-        assert len(streams) == 1
-        lines = [
-            json.loads(line) for line in archive.read(streams[0]).decode().splitlines()
-        ]
-        assert [line["data"] for line in lines] == [
-            {
-                "Init": {
-                    "seq": 0,
-                    "instance_name": "test",
-                    "implementation": {
-                        "name": "cudf-polars",
-                        "version": "test",
-                        "backend": "spmd",
-                        "custom_attributes": [
-                            {"key": "backend", "value": {"String": "spmd"}}
-                        ],
-                    },
-                }
-            },
-            {"Exit": {"seq": 1}},
-        ]
-
-
-def test_export_mirrors_streams_quent_open_indexes(tmp_path: Path) -> None:
-    # quent-open finds engines by scanning snake-case stream names, so a missing
-    # alias shows up as an empty engine list rather than an error.
-    context_id = uuid.uuid4()
-    archive_path = tmp_path / f"{context_id}.zip"
-    write_quent_export(_generated_events(), tmp_path, context_id, archive_path)
+def test_export_packages_context_and_legacy_index_alias(tmp_path: Path) -> None:
+    root = tmp_path / "collector"
+    context = _collect_engine_events(root)
+    archive_path = tmp_path / "trace.zip"
+    write_quent_export(root, archive_path)
 
     with zipfile.ZipFile(archive_path) as archive:
-        streams = {name.split("/")[1] for name in archive.namelist() if "/" in name}
+        names = archive.namelist()
+        assert f"{context.name}/{SIDECAR_FILE_NAME}" in names
+        streams = {name.split("/")[1] for name in names if "/" in name}
         assert {"Engine", "engine"} <= streams
-
-        def payload(stream: str) -> list[dict]:
-            name = next(
-                item
-                for item in archive.namelist()
-                if item.startswith(f"{context_id}/{stream}/")
-            )
-            return [
-                json.loads(line) for line in archive.read(name).decode().splitlines()
-            ]
-
-        generated = payload("Engine")
-        assert [line["data"] for line in generated] == [
-            {"Init": ANY},
-            {"Exit": {"seq": 1}},
+        alias_name = next(name for name in names if "/engine/" in name)
+        alias_events = [
+            json.loads(line) for line in archive.read(alias_name).decode().splitlines()
         ]
-        assert [line["data"] for line in payload("engine")] == [
-            {
-                "Init": {
-                    "instance_name": "test",
-                    "implementation": ANY,
-                }
-            },
+        assert [event["data"] for event in alias_events] == [
+            {"Init": ANY},
             {"Exit": None},
         ]
 
 
-def test_benchmark_writer_archives_generated_events(
+def test_benchmark_writer_packages_collector_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from cudf_polars.streaming.benchmarks import utils as benchmark_utils
 
-    events = _generated_events()
+    run_id = uuid.uuid4()
+    root = tmp_path / str(run_id)
+    _collect_engine_events(root)
 
     class FakeEngine:
-        _quent_events = events
+        _quent_output_root = root
 
-    run_id = uuid.uuid4()
     archive_path = tmp_path / "logs" / f"{run_id}.zip"
     monkeypatch.chdir(tmp_path)
     assert (
@@ -156,4 +109,4 @@ def test_benchmark_writer_archives_generated_events(
         == archive_path
     )
     with zipfile.ZipFile(archive_path) as archive:
-        assert f"{run_id}/{SIDECAR_FILE_NAME}" in archive.namelist()
+        assert any(name.endswith(SIDECAR_FILE_NAME) for name in archive.namelist())

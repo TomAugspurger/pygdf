@@ -51,6 +51,7 @@ from cudf_polars.utils.config import get_total_device_memory
 if TYPE_CHECKING:
     from collections.abc import Callable, MutableMapping
     from concurrent.futures import Executor, ThreadPoolExecutor
+    from pathlib import Path
 
     import rapidsmpf.config
     from cudf_streaming.channel_metadata import ChannelMetadata
@@ -357,9 +358,8 @@ class StreamingEngine(pl.GPUEngine):
 
         check_no_live_default_singleton(self)
         self._nranks = nranks
-        self._quent_events_raw: list[
-            cudf_polars.quent._runtime.BufferedEvent
-        ] = []  # populated on shutdown
+        if not hasattr(self, "_quent_output_root"):
+            self._quent_output_root: Path | None = None
         self._exit_stack: contextlib.ExitStack | None = (
             exit_stack or contextlib.ExitStack()
         )
@@ -574,12 +574,6 @@ class StreamingEngine(pl.GPUEngine):
     def __exit__(self, *_: object) -> None:
         """Exit the context manager, calling :meth:`shutdown`."""
         self.shutdown()
-
-    @property
-    def _quent_events(self) -> list[cudf_polars.quent._runtime.QuentEvent]:
-        """Return all Quent telemetry events collected during the engine's lifecycle."""
-        # Not ready to make this public yet.
-        return [x["event"] for x in self._quent_events_raw]
 
     def _run(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> list[T]:
         """

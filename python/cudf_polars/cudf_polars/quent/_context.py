@@ -9,6 +9,7 @@ import dataclasses
 import json
 import threading
 import uuid
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from cudf_polars import __version__
@@ -69,6 +70,12 @@ class QuentConfig:
     query_name: str | None = None
     implementation_name: str = "cudf-polars"
     implementation_version: str = __version__
+    collector_output_root: str = "logs/quent-events"
+
+    @property
+    def collector_run_root(self) -> Path:
+        """Return this engine's shared collector output directory."""
+        return Path(self.collector_output_root) / str(self.engine_id)
 
     def _serialize(self) -> bytes:
         payload = {
@@ -88,6 +95,7 @@ class QuentConfig:
             query_name=payload["query_name"],
             implementation_name=payload["implementation_name"],
             implementation_version=payload["implementation_version"],
+            collector_output_root=payload["collector_output_root"],
         )
 
     def _emit_engine_init_events(

@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
+import socket
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, cast
@@ -72,6 +73,7 @@ from cudf_polars.utils.config import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     import polars as pl
 
@@ -296,6 +298,22 @@ def synchronize_quent_query_id(
     return uuid.UUID(bytes=all_data[0])
 
 
+def synchronize_quent_collector_address(
+    *,
+    comm: Communicator,
+    context: Context,
+    address: str | None,
+) -> str:
+    """Broadcast rank 0's collector URI to every SPMD rank."""
+    if comm.nranks == 1:
+        assert address is not None
+        return address
+    data = address.encode() if address is not None else b""
+    with reserve_op_id() as op_id:
+        all_data = all_gather_host_data(comm, context.br(), op_id, data)
+    return all_data[0].decode()
+
+
 class SPMDEngine(StreamingEngine):
     """
     Multi-GPU Polars engine for SPMD executions.
@@ -456,10 +474,9 @@ class SPMDEngine(StreamingEngine):
         quent_context: cudf_polars.quent.QuentConfig | None = executor_options.get(
             "quent_context"
         )
-        if quent_context is not None:
-            self._quent_logger = cudf_polars.quent._runtime.QuentSession()
-        else:
-            self._quent_logger = None
+        self._quent_logger = None
+        self._quent_collector: Any | None = None
+        self._quent_output_root: Path | None = None
 
         check_reserved_keys(executor_options, engine_options)
         hw_binding = cast(
@@ -537,7 +554,25 @@ class SPMDEngine(StreamingEngine):
                     quent_config=quent_context,
                 )
                 executor_options["quent_context"] = quent_context
-                assert self._quent_logger is not None
+                self._quent_output_root = quent_context.collector_run_root
+                if comm.rank == 0:
+                    from cudf_polars import _quent
+
+                    self._quent_collector = _quent.Collector(
+                        self._quent_output_root,
+                        socket.gethostbyname(socket.gethostname()),
+                    )
+                    collector_address = self._quent_collector.address
+                else:
+                    collector_address = None
+                collector_address = synchronize_quent_collector_address(
+                    comm=comm,
+                    context=self._ctx,
+                    address=collector_address,
+                )
+                self._quent_logger = cudf_polars.quent._runtime.QuentSession(
+                    collector_address
+                )
                 quent_context._emit_engine_init_events(
                     self._quent_logger, backend="spmd"
                 )
@@ -949,16 +984,20 @@ class SPMDEngine(StreamingEngine):
         ].get("quent_context")
         if quent_context is not None:
             assert self._quent_logger is not None
+            assert self._comm is not None
             quent_context._emit_engine_exit_events(self._quent_logger)
+            self._quent_logger.close()
+            if self._comm.nranks > 1:
+                barrier(self._comm)
+            if self._quent_collector is not None:
+                self._quent_collector.close()
+            if self._comm.nranks > 1:
+                barrier(self._comm)
 
         super().shutdown()
 
         self._comm = None
         self._ctx = None
-        # TODO: Figure out multi-rank handling.
-        if self._quent_logger is not None:
-            self._quent_events_raw.extend(self._quent_logger.drain())
-        self._quent_events_raw.sort(key=lambda x: x["timestamp"])
         self._py_executor = None
 
     def _run(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> list[T]:

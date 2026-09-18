@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -17,10 +18,10 @@ from cudf_polars.dsl.tracing import LOG_TRACES
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
     from cudf_polars.engine.core import StreamingEngine
     from cudf_polars.quent import QuentConfig
-    from cudf_polars.quent._runtime import QuentEvent
 
 
 @pytest.fixture(params=["ray", "dask", "spmd"])
@@ -73,7 +74,18 @@ def engine_with_quent_context(
         engine.shutdown()
 
 
-def _of_type(events: list[QuentEvent], entity: str) -> list[QuentEvent]:
+def _stored_events(root: Path) -> list[dict[str, Any]]:
+    events = []
+    for path in root.glob("*/*/*.ndjson"):
+        entity_name = path.parent.name
+        for line in path.read_text().splitlines():
+            event = json.loads(line)
+            event["data"] = {entity_name: event["data"]}
+            events.append(event)
+    return sorted(events, key=lambda event: event["timestamp"])
+
+
+def _of_type(events: list[dict[str, Any]], entity: str) -> list[dict[str, Any]]:
     return [event for event in events if entity in event["data"]]
 
 
@@ -84,7 +96,8 @@ def test_custom_schema_events(
     with engine_with_quent_context:
         query.collect(engine=engine_with_quent_context)
 
-    events = engine_with_quent_context._quent_events
+    assert engine_with_quent_context._quent_output_root is not None
+    events = _stored_events(engine_with_quent_context._quent_output_root)
     engine_events = _of_type(events, "Engine")
     assert len(engine_events) == 2
     assert engine_events[0]["id"] == str(quent_context.engine_id)
@@ -119,7 +132,8 @@ def test_multiple_collects_get_distinct_queries_and_plans(
         query.collect(engine=engine_with_quent_context)
         query.collect(engine=engine_with_quent_context)
 
-    events = engine_with_quent_context._quent_events
+    assert engine_with_quent_context._quent_output_root is not None
+    events = _stored_events(engine_with_quent_context._quent_output_root)
     initialized_queries = [
         event
         for event in _of_type(events, "Query")
