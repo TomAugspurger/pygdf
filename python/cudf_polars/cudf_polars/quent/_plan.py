@@ -14,6 +14,7 @@ from cudf_polars.dsl.traversal import traversal
 from cudf_polars.streaming.explain import SerializablePlan
 
 if TYPE_CHECKING:
+    from cudf_polars import _quent as quent_bindings
     from cudf_polars.dsl.ir import IR
     from cudf_polars.quent._runtime import QuentSession
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
@@ -21,18 +22,111 @@ if TYPE_CHECKING:
 _JOIN_TYPES = frozenset({"Join", "ConditionalJoin"})
 
 
-def _dynamic_attributes(
-    values: dict[str, Any],
-) -> dict[str, bool | int | float | str | None]:
-    """Convert arbitrary plan metadata to generated dynamic scalar values."""
+def _emit_operator_details(
+    operator: quent_bindings.OperatorHandle,
+    node_type: str,
+    properties: dict[str, Any],
+) -> None:
+    """Emit the schema-defined detail event for one operator."""
+    match node_type:
+        case "Scan":
+            operator.scan_details(
+                values={
+                    "typ": str(properties["typ"]),
+                    "prefix": str(properties["prefix"]),
+                    "predicate": _json_optional(properties["predicate"]),
+                }
+            )
+        case "StreamingScan":
+            operator.streaming_scan_details(
+                values={
+                    "typ": str(properties["typ"]),
+                    "task_count": int(properties["task_count"]),
+                    "prefix": str(properties["prefix"]),
+                    "predicate": _json_optional(properties["predicate"]),
+                }
+            )
+        case "Join":
+            operator.join_details(values=_join_details(properties))
+        case "JoinWithPrefilter":
+            operator.join_with_prefilter_details(
+                values={
+                    **_join_details(properties),
+                    "prefilters": [
+                        {
+                            "type_name": str(prefilter["type"]),
+                            "target_side": str(prefilter["target_side"]),
+                            "target_on": _strings(prefilter["target_on"]),
+                            "domain_on": _strings(prefilter["domain_on"]),
+                            "nulls_equal": bool(prefilter["nulls_equal"]),
+                            "domain": {
+                                "type_name": str(prefilter["domain"]["type"]),
+                                "side": (
+                                    str(prefilter["domain"]["side"])
+                                    if "side" in prefilter["domain"]
+                                    else None
+                                ),
+                            },
+                        }
+                        for prefilter in properties["prefilters"]
+                    ],
+                }
+            )
+        case "PushdownFilterHint":
+            operator.pushdown_filter_hint_details(
+                values={
+                    "target_on": _strings(properties["target_on"]),
+                    "domain_on": _strings(properties["domain_on"]),
+                    "nulls_equal": bool(properties["nulls_equal"]),
+                    "placement": str(properties["placement"]),
+                }
+            )
+        case "GroupBy":
+            operator.group_by_details(values={"keys": _strings(properties["keys"])})
+        case "Shuffle":
+            operator.shuffle_details(values={"keys": _strings(properties["keys"])})
+        case "Sort":
+            operator.sort_details(
+                values={
+                    "by": _strings(properties["by"]),
+                    "order": _strings(properties["order"]),
+                }
+            )
+        case "Filter":
+            operator.filter_details(
+                values={
+                    "predicate": str(properties["predicate"]),
+                    "expression": json.dumps(
+                        {
+                            key: value
+                            for key, value in properties.items()
+                            if key != "predicate"
+                        },
+                        sort_keys=True,
+                        default=str,
+                    ),
+                }
+            )
+        case "Select":
+            operator.select_details(values={"columns": _strings(properties["columns"])})
+        case "HStack":
+            operator.hstack_details(values={"columns": _strings(properties["columns"])})
+
+
+def _join_details(properties: dict[str, Any]) -> dict[str, Any]:
     return {
-        key: (
-            value
-            if value is None or isinstance(value, bool | int | float | str)
-            else json.dumps(value, sort_keys=True, default=str)
-        )
-        for key, value in values.items()
+        "how": str(properties["how"]),
+        "left_on": _strings(properties["left_on"]),
+        "right_on": _strings(properties["right_on"]),
     }
+
+
+def _strings(value: Any) -> list[str]:
+    return [str(item) for item in value]
+
+
+def _json_optional(value: Any) -> str | None:
+    return None if value is None else json.dumps(value, sort_keys=True, default=str)
 
 
 def emit_plan(
@@ -93,14 +187,16 @@ def emit_plan(
     for node_id in sorted(serializable_plan.nodes.keys(), key=int):
         serializable_node = serializable_plan.nodes[node_id]
         operator_id = operator_by_ir_id[node_id]
-        context.operator_observer().handle(operator_id).declared(
+        operator = context.operator_observer().handle(operator_id)
+        operator.declared(
             plan=plan_id,
             parent_operators=parent_ops.get(node_id, []),
             instance_name=f"{serializable_node.type}-{operator_id.hex[:8]}",
             type_name=serializable_node.type,
-            attributes=_dynamic_attributes(
-                {"node_id": node_id, **serializable_node.properties}
-            ),
+            node_id=node_id,
+        )
+        _emit_operator_details(
+            operator, serializable_node.type, serializable_node.properties
         )
         for port_name in port_names_for_node(
             len(serializable_node.children), serializable_node.type

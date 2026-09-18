@@ -117,6 +117,86 @@ class OperatorStatisticsDict(TypedDict):
 
 OperatorStatisticsInput: TypeAlias = OperatorStatisticsDict | Mapping[str, object]
 
+class ScanDetailsDict(TypedDict):
+    typ: str
+    prefix: str
+    predicate: str | None
+
+ScanDetailsInput: TypeAlias = ScanDetailsDict | Mapping[str, object]
+
+class StreamingScanDetailsDict(TypedDict):
+    typ: str
+    task_count: int
+    prefix: str
+    predicate: str | None
+
+StreamingScanDetailsInput: TypeAlias = StreamingScanDetailsDict | Mapping[str, object]
+
+class JoinDetailsDict(TypedDict):
+    how: str
+    left_on: Iterable[str]
+    right_on: Iterable[str]
+
+JoinDetailsInput: TypeAlias = JoinDetailsDict | Mapping[str, object]
+
+class PrefilterDomainDict(TypedDict):
+    type_name: str
+    side: str | None
+
+PrefilterDomainInput: TypeAlias = PrefilterDomainDict | Mapping[str, object]
+
+class PrefilterDetailsDict(TypedDict):
+    type_name: str
+    target_side: str
+    target_on: Iterable[str]
+    domain_on: Iterable[str]
+    nulls_equal: bool
+    domain: PrefilterDomainInput
+
+PrefilterDetailsInput: TypeAlias = PrefilterDetailsDict | Mapping[str, object]
+
+class JoinWithPrefilterDetailsDict(TypedDict):
+    how: str
+    left_on: Iterable[str]
+    right_on: Iterable[str]
+    prefilters: Iterable[PrefilterDetailsInput]
+
+JoinWithPrefilterDetailsInput: TypeAlias = (
+    JoinWithPrefilterDetailsDict | Mapping[str, object]
+)
+
+class PushdownFilterHintDetailsDict(TypedDict):
+    target_on: Iterable[str]
+    domain_on: Iterable[str]
+    nulls_equal: bool
+    placement: str
+
+PushdownFilterHintDetailsInput: TypeAlias = (
+    PushdownFilterHintDetailsDict | Mapping[str, object]
+)
+
+class KeysDetailsDict(TypedDict):
+    keys: Iterable[str]
+
+KeysDetailsInput: TypeAlias = KeysDetailsDict | Mapping[str, object]
+
+class SortDetailsDict(TypedDict):
+    by: Iterable[str]
+    order: Iterable[str]
+
+SortDetailsInput: TypeAlias = SortDetailsDict | Mapping[str, object]
+
+class FilterDetailsDict(TypedDict):
+    predicate: str
+    expression: str
+
+FilterDetailsInput: TypeAlias = FilterDetailsDict | Mapping[str, object]
+
+class ColumnsDetailsDict(TypedDict):
+    columns: Iterable[str]
+
+ColumnsDetailsInput: TypeAlias = ColumnsDetailsDict | Mapping[str, object]
+
 class ProcessorUsageDict(TypedDict):
     pass
 
@@ -250,9 +330,24 @@ class OperatorHandle:
         parent_operators: Iterable[OperatorHandle | _uuid.UUID],
         instance_name: str,
         type_name: str,
-        attributes: DynamicAttributes,
+        node_id: str,
     ) -> None: ...
     def declared_emitted(self) -> bool: ...
+    def scan_details(self, *, values: ScanDetailsInput) -> None: ...
+    def streaming_scan_details(self, *, values: StreamingScanDetailsInput) -> None: ...
+    def join_details(self, *, values: JoinDetailsInput) -> None: ...
+    def join_with_prefilter_details(
+        self, *, values: JoinWithPrefilterDetailsInput
+    ) -> None: ...
+    def pushdown_filter_hint_details(
+        self, *, values: PushdownFilterHintDetailsInput
+    ) -> None: ...
+    def group_by_details(self, *, values: KeysDetailsInput) -> None: ...
+    def shuffle_details(self, *, values: KeysDetailsInput) -> None: ...
+    def sort_details(self, *, values: SortDetailsInput) -> None: ...
+    def filter_details(self, *, values: FilterDetailsInput) -> None: ...
+    def select_details(self, *, values: ColumnsDetailsInput) -> None: ...
+    def hstack_details(self, *, values: ColumnsDetailsInput) -> None: ...
     def statistics(self, *, values: OperatorStatisticsInput) -> None: ...
 
 class PortObserver:

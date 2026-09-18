@@ -531,6 +531,11 @@ class SPMDEngine(StreamingEngine):
             exit_stack.callback(self._cleanup_ctx)
 
             if quent_context is not None:
+                quent_context = synchronize_quent_context(
+                    comm=comm,
+                    context=self._ctx,
+                    quent_config=quent_context,
+                )
                 executor_options["quent_context"] = quent_context
                 assert self._quent_logger is not None
                 quent_context._emit_engine_init_events(

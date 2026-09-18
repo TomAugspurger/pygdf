@@ -27,6 +27,71 @@ records:
       duplicated: bool
       decision: { option: string }
 
+  ScanDetails:
+    fields:
+      typ: string
+      prefix: string
+      predicate: { option: string }
+
+  StreamingScanDetails:
+    fields:
+      typ: string
+      task_count: u64
+      prefix: string
+      predicate: { option: string }
+
+  JoinDetails:
+    fields:
+      how: string
+      left_on: { list: string }
+      right_on: { list: string }
+
+  PrefilterDomain:
+    fields:
+      type_name: string
+      side: { option: string }
+
+  PrefilterDetails:
+    fields:
+      type_name: string
+      target_side: string
+      target_on: { list: string }
+      domain_on: { list: string }
+      nulls_equal: bool
+      domain: PrefilterDomain
+
+  JoinWithPrefilterDetails:
+    fields:
+      how: string
+      left_on: { list: string }
+      right_on: { list: string }
+      prefilters: { list: PrefilterDetails }
+
+  PushdownFilterHintDetails:
+    fields:
+      target_on: { list: string }
+      domain_on: { list: string }
+      nulls_equal: bool
+      placement: string
+
+  KeysDetails:
+    fields:
+      keys: { list: string }
+
+  SortDetails:
+    fields:
+      by: { list: string }
+      order: { list: string }
+
+  FilterDetails:
+    fields:
+      predicate: string
+      expression: string
+
+  ColumnsDetails:
+    fields:
+      columns: { list: string }
+
 entities:
   QueryGroup:
     doc: A user-selected logical group of queries.
@@ -56,7 +121,40 @@ entities:
           parent_operators: { list: { ref: Operator } }
           instance_name: string
           type_name: string
-          attributes: dynamic
+          node_id: string
+      scan_details:
+        attributes:
+          values: ScanDetails
+      streaming_scan_details:
+        attributes:
+          values: StreamingScanDetails
+      join_details:
+        attributes:
+          values: JoinDetails
+      join_with_prefilter_details:
+        attributes:
+          values: JoinWithPrefilterDetails
+      pushdown_filter_hint_details:
+        attributes:
+          values: PushdownFilterHintDetails
+      group_by_details:
+        attributes:
+          values: KeysDetails
+      shuffle_details:
+        attributes:
+          values: KeysDetails
+      sort_details:
+        attributes:
+          values: SortDetails
+      filter_details:
+        attributes:
+          values: FilterDetails
+      select_details:
+        attributes:
+          values: ColumnsDetails
+      hstack_details:
+        attributes:
+          values: ColumnsDetails
       statistics:
         multi: true
         attributes:

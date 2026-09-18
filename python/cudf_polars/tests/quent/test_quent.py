@@ -23,7 +23,7 @@ from cudf_polars.quent._context import (  # noqa: E402
     WorkerResources,
 )
 from cudf_polars.quent._plan import (  # noqa: E402
-    _dynamic_attributes,
+    _emit_operator_details,
     emit_plan,
 )
 from cudf_polars.quent._runtime import QuentSession  # noqa: E402
@@ -102,8 +102,12 @@ def test_plan_entities_are_deterministic(
     quent_context: QuentConfig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     nodes = {
-        "0": SimpleNamespace(type="Scan", children=[], properties={}),
-        "1": SimpleNamespace(type="Filter", children=["0"], properties={}),
+        "0": SimpleNamespace(type="DataFrameScan", children=[], properties={}),
+        "1": SimpleNamespace(
+            type="Sort",
+            children=["0"],
+            properties={"by": ["x"], "order": ["ASCENDING"]},
+        ),
     }
     monkeypatch.setattr(
         "cudf_polars.quent._plan.SerializablePlan.from_ir",
@@ -147,6 +151,11 @@ def test_plan_entities_are_deterministic(
             "data": None,
         },
     }
+    assert any(
+        event["data"].get("Operator", {}).get("SortDetails", {}).get("values")
+        == {"by": ["x"], "order": ["ASCENDING"]}
+        for event in events
+    )
 
 
 def test_processor_registry_declares_each_thread_once() -> None:
@@ -185,7 +194,17 @@ def test_inter_rank_channel_targets_remote_memory(
     assert channel["target"]["target"] == str(rank1.device_memory_id)
 
 
-def test_dynamic_attributes_preserve_scalars_and_encode_structures() -> None:
-    assert _dynamic_attributes(
-        {"name": "scan", "count": 3, "nested": {"column": "x"}}
-    ) == {"name": "scan", "count": 3, "nested": '{"column": "x"}'}
+def test_operator_details_preserve_static_types() -> None:
+    class Operator:
+        values: object = None
+
+        def sort_details(self, *, values: object) -> None:
+            self.values = values
+
+    operator = Operator()
+    _emit_operator_details(
+        operator,  # type: ignore[arg-type]
+        "Sort",
+        {"by": ["x"], "order": ["ASCENDING"]},
+    )
+    assert operator.values == {"by": ["x"], "order": ["ASCENDING"]}

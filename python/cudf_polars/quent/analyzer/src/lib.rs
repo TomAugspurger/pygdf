@@ -145,6 +145,20 @@ fn actor_slot_resource_type() -> ResourceTypeDecl {
     ResourceTypeDecl::unit(ACTOR_SLOT_RESOURCE_TYPE)
 }
 
+fn operator_detail_event(
+    name: &str,
+    values: &impl serde::Serialize,
+) -> query_engine::operator::OperatorEvent {
+    let mut custom_attributes = DynamicAttributes::new();
+    custom_attributes.add(
+        name,
+        serde_json::to_string(values).expect("generated operator details must serialize"),
+    );
+    query_engine::operator::OperatorEvent::Statistics(query_engine::operator::Statistics {
+        custom_attributes,
+    })
+}
+
 fn evaluate_resource_type(name: &str) -> ResourceTypeDecl {
     let mut resource_type = match name {
         PROCESSOR_RESOURCE_TYPE => ResourceTypeDecl::unit(name),
@@ -1295,19 +1309,50 @@ fn to_query_engine_event(
                 parent_operators,
                 instance_name,
                 type_name,
-                attributes,
-            } => query_engine::operator::OperatorEvent::Declaration(
-                query_engine::operator::Declaration {
-                    plan_id: Ref::new(plan.target),
-                    parent_operator_ids: parent_operators
-                        .into_iter()
-                        .map(|operator| Ref::new(operator.target))
-                        .collect(),
-                    instance_name,
-                    type_name,
-                    custom_attributes: attributes,
-                },
-            ),
+                node_id,
+            } => {
+                let mut custom_attributes = DynamicAttributes::new();
+                custom_attributes.add("node_id", node_id);
+                query_engine::operator::OperatorEvent::Declaration(
+                    query_engine::operator::Declaration {
+                        plan_id: Ref::new(plan.target),
+                        parent_operator_ids: parent_operators
+                            .into_iter()
+                            .map(|operator| Ref::new(operator.target))
+                            .collect(),
+                        instance_name,
+                        type_name,
+                        custom_attributes,
+                    },
+                )
+            }
+            OperatorEvent::ScanDetails { values } => operator_detail_event("scan_details", &values),
+            OperatorEvent::StreamingScanDetails { values } => {
+                operator_detail_event("streaming_scan_details", &values)
+            }
+            OperatorEvent::JoinDetails { values } => operator_detail_event("join_details", &values),
+            OperatorEvent::JoinWithPrefilterDetails { values } => {
+                operator_detail_event("join_with_prefilter_details", &values)
+            }
+            OperatorEvent::PushdownFilterHintDetails { values } => {
+                operator_detail_event("pushdown_filter_hint_details", &values)
+            }
+            OperatorEvent::GroupByDetails { values } => {
+                operator_detail_event("group_by_details", &values)
+            }
+            OperatorEvent::ShuffleDetails { values } => {
+                operator_detail_event("shuffle_details", &values)
+            }
+            OperatorEvent::SortDetails { values } => operator_detail_event("sort_details", &values),
+            OperatorEvent::FilterDetails { values } => {
+                operator_detail_event("filter_details", &values)
+            }
+            OperatorEvent::SelectDetails { values } => {
+                operator_detail_event("select_details", &values)
+            }
+            OperatorEvent::HstackDetails { values } => {
+                operator_detail_event("hstack_details", &values)
+            }
             OperatorEvent::Statistics { values } => {
                 let mut custom_attributes = DynamicAttributes::new();
                 custom_attributes.add("input_bytes", values.input_bytes);
@@ -1464,7 +1509,7 @@ mod tests {
                     parent_operators: vec![],
                     instance_name: "scan".to_owned(),
                     type_name: "Scan".to_owned(),
-                    attributes: DynamicAttributes::new(),
+                    node_id: "0".to_owned(),
                 }),
             ),
             Event::new(
