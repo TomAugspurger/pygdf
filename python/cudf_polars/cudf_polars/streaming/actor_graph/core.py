@@ -13,7 +13,6 @@ from rapidsmpf.streaming.core.leaf_actor import pull_from_channel
 
 import cudf_polars.dsl.tracing
 import cudf_polars.quent._context
-import cudf_polars.quent._types
 from cudf_polars.dsl.ir import (
     Join,
     Union,
@@ -81,7 +80,7 @@ def evaluate_logical_plan(
 
         engine = DefaultSingletonEngine.get_or_create()
         if config_options.executor.quent_context is not None:
-            engine_id = config_options.executor.quent_context.engine.id
+            engine_id = config_options.executor.quent_context.engine_id
         else:
             engine_id = uuid.uuid4()
         config_options = dataclasses.replace(
@@ -93,7 +92,7 @@ def evaluate_logical_plan(
                     context=engine.context,
                     py_executor=engine.py_executor,
                     engine_id=engine_id,
-                    worker_id=engine._quent_worker.id,
+                    worker_id=engine._quent_worker_id,
                     quent_logger=engine._quent_logger,
                     worker_resources=engine._worker_resources,
                 ),
@@ -222,7 +221,7 @@ def generate_network(
     ir_context: IRExecutionContext,
     collective_id_map: dict[IR, list[int]],
     metadata_collector: list[ChannelMetadata] | None,
-    quent_operator_map: dict[IR, cudf_polars.quent._types.Operator] | None = None,
+    quent_operator_map: dict[IR, uuid.UUID] | None = None,
     local_quent_context: cudf_polars.quent._context.LocalQuentContext | None = None,
 ) -> tuple[list[Any], DeferredMessages]:
     """

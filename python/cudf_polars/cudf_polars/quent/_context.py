@@ -11,21 +11,9 @@ import threading
 import uuid
 from typing import TYPE_CHECKING
 
-from cudf_polars.quent._plan import build_parent_operators_map, build_plan
-from cudf_polars.quent._runtime import EntityKind, QuentSession
-from cudf_polars.quent._types import (
-    Backend,
-    DataChannel,
-    DataChannelType,
-    DeviceMemory,
-    Engine,
-    Implementation,
-    Processor,
-    Query,
-    QueryGroup,
-    Storage,
-    ThreadPool,
-)
+from cudf_polars import __version__
+from cudf_polars.quent._plan import build_parent_operators_map, emit_plan
+from cudf_polars.quent._runtime import QuentSession
 from cudf_polars.utils.config import get_total_device_memory
 
 if TYPE_CHECKING:
@@ -33,13 +21,12 @@ if TYPE_CHECKING:
 
     from cudf_polars.containers import DataFrame
     from cudf_polars.dsl.ir import IR
-    from cudf_polars.quent._types import Evaluate, Operator, Plan, Port, Worker
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 __all__ = [
     "LocalQuentContext",
     "ProcessorRegistry",
-    "QuentContext",
+    "QuentConfig",
     "QuentIRExecutionContext",
     "QuentSession",
     "WorkerResources",
@@ -50,48 +37,44 @@ class ProcessorRegistry:
     """Map Python executor threads to generated Processor handles."""
 
     def __init__(self) -> None:
-        self._processors: dict[int, Processor] = {}
+        self._processors: dict[int, uuid.UUID] = {}
         self._lock = threading.Lock()
 
     def get_or_declare_processor(
         self, session: QuentSession, thread_ident: int, pool_id: uuid.UUID
-    ) -> Processor:
+    ) -> uuid.UUID:
         """Get or declare the Processor associated with a host thread."""
         with self._lock:
             if thread_ident in self._processors:
                 return self._processors[thread_ident]
-            processor = Processor(thread_pool_id=pool_id)
-            self._processors[thread_ident] = processor
+            from cudf_polars import _quent
 
-        session.processor(processor.id).declared(
-            instance_name=f"Thread {processor.id.hex[:8]}",
+            processor_id = _quent.now_v7()
+            self._processors[thread_ident] = processor_id
+
+        session.context.processor_observer().handle(processor_id).declared(
+            instance_name=f"Thread {processor_id.hex[:8]}",
             thread_pool=pool_id,
         )
-        return processor
+        return processor_id
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class QuentContext:
-    """Serializable identities shared by all ranks of a streaming engine."""
+class QuentConfig:
+    """Serializable Quent configuration shared by all ranks."""
 
-    engine: Engine = dataclasses.field(default_factory=Engine)
-    query_group: QueryGroup = dataclasses.field(default_factory=QueryGroup)
-    query: Query = dataclasses.field(default_factory=Query)
+    engine_id: uuid.UUID = dataclasses.field(default_factory=uuid.uuid4)
+    query_group_id: uuid.UUID = dataclasses.field(default_factory=uuid.uuid4)
+    query_group_name: str | None = None
+    query_name: str | None = None
+    implementation_name: str = "cudf-polars"
+    implementation_version: str = __version__
 
     def _serialize(self) -> bytes:
         payload = {
-            "engine": {
-                "id": int(self.engine.id),
-                "implementation": dataclasses.asdict(self.engine.implementation),
-            },
-            "query_group": {
-                "id": int(self.query_group.id),
-                "instance_name": self.query_group.instance_name,
-            },
-            "query": {
-                "id": int(self.query.id),
-                "instance_name": self.query.instance_name,
-            },
+            **dataclasses.asdict(self),
+            "engine_id": int(self.engine_id),
+            "query_group_id": int(self.query_group_id),
         }
         return json.dumps(payload).encode()
 
@@ -99,104 +82,62 @@ class QuentContext:
     def _deserialize(cls, data: bytes) -> Self:
         payload = json.loads(data)
         return cls(
-            engine=Engine(
-                id=uuid.UUID(int=int(payload["engine"]["id"])),
-                implementation=Implementation(
-                    name=payload["engine"]["implementation"]["name"],
-                    version=payload["engine"]["implementation"]["version"],
-                    backend=Backend(payload["engine"]["implementation"]["backend"]),
-                ),
-            ),
-            query_group=QueryGroup(
-                id=uuid.UUID(int=int(payload["query_group"]["id"])),
-                instance_name=payload["query_group"]["instance_name"],
-            ),
-            query=Query(
-                id=uuid.UUID(int=int(payload["query"]["id"])),
-                instance_name=payload["query"]["instance_name"],
-            ),
+            engine_id=uuid.UUID(int=int(payload["engine_id"])),
+            query_group_id=uuid.UUID(int=int(payload["query_group_id"])),
+            query_group_name=payload["query_group_name"],
+            query_name=payload["query_name"],
+            implementation_name=payload["implementation_name"],
+            implementation_version=payload["implementation_version"],
         )
 
-    def query_for(self, query_id: uuid.UUID) -> Query:
-        """Create a per-collect Query while preserving the configured name."""
-        return Query(id=query_id, instance_name=self.query.instance_name)
-
     def _emit_engine_init_events(
-        self, session: QuentSession, *, backend: Backend | None = None
+        self, session: QuentSession, *, backend: str = "unknown"
     ) -> None:
-        implementation = self.engine.implementation
-        session.init_engine(
-            self.engine.id,
-            instance_name=f"cudf-polars-{str(self.engine.id)[:8]}",
-            implementation={
-                "name": implementation.name,
-                "version": implementation.version,
-                "backend": str(backend or implementation.backend),
-                "custom_attributes": {
-                    "backend": str(backend or implementation.backend)
+        session._engines[self.engine_id] = (
+            session.context.engine_observer()
+            .handle(self.engine_id)
+            .init(
+                instance_name=f"cudf-polars-{str(self.engine_id)[:8]}",
+                implementation={
+                    "name": self.implementation_name,
+                    "version": self.implementation_version,
+                    "backend": backend,
+                    "custom_attributes": {"backend": backend},
                 },
-            },
+            )
         )
 
     def _emit_engine_exit_events(self, session: QuentSession) -> None:
-        session.exit_engine(self.engine.id)
+        session._engines.pop(self.engine_id).exit()
 
     def _emit_query_group_events(self, session: QuentSession) -> None:
-        if not session.declare_once(EntityKind.QUERY_GROUP, self.query_group.id):
+        if not session.declare_once("QueryGroup", self.query_group_id):
             return
-        session.query_group(self.query_group.id).declared(
-            instance_name=self.query_group.instance_name,
-            engine=self.engine.id,
+        session.context.query_group_observer().handle(self.query_group_id).declared(
+            instance_name=self.query_group_name,
+            engine=self.engine_id,
         )
 
-    def _emit_query_events(self, session: QuentSession, query: Query) -> None:
-        session.start_query(
-            query.id,
-            instance_name=query.instance_name or query.id.hex[:8],
-            query_group=self.query_group.id,
+    def _emit_query_events(self, session: QuentSession, query_id: uuid.UUID) -> None:
+        initialized = (
+            session.context.query_observer()
+            .handle(query_id)
+            .initialized(
+                instance_name=self.query_name or query_id.hex[:8],
+                query_group=self.query_group_id,
+            )
         )
+        session._queries[query_id] = initialized.planning().executing()
 
-    def _emit_query_completed_event(self, session: QuentSession, query: Query) -> None:
-        session.complete_query(query.id)
+    def _emit_query_completed_event(
+        self, session: QuentSession, query_id: uuid.UUID
+    ) -> None:
+        session._queries.pop(query_id).completed()
 
     def _emit_query_failed_event(
-        self, session: QuentSession, query: Query, error: BaseException
+        self, session: QuentSession, query_id: uuid.UUID, error: BaseException
     ) -> None:
-        session.fail_query(query.id, error=str(error))
-
-    def _emit_plan_declarations(
-        self,
-        session: QuentSession,
-        plan: Plan,
-        operators: list[Operator],
-        ports: list[Port],
-    ) -> None:
-        session.plan(plan.id).declared(
-            instance_name=plan.instance_name,
-            query=plan.query.id,
-            parent_plan=(plan.parent_plan.id if plan.parent_plan is not None else None),
-            worker=plan.worker.id if plan.worker is not None else None,
-            edges=[
-                {
-                    "source": edge.source.id,
-                    "target": edge.target.id,
-                }
-                for edge in plan.edges
-            ],
-        )
-        for operator in operators:
-            session.operator(operator.id).declared(
-                plan=operator.plan.id,
-                parent_operators=[parent.id for parent in operator.parent_operators],
-                instance_name=f"{operator.type_name}-{operator.id.hex[:8]}",
-                type_name=operator.type_name,
-                attributes=operator.attributes,
-            )
-        for port in ports:
-            session.port(port.id).declared(
-                operator=port.operator.id,
-                instance_name=port.instance_name,
-            )
+        session._queries.pop(query_id).failed(error=str(error))
 
     def _emit_physical_plan_events(
         self,
@@ -204,70 +145,69 @@ class QuentContext:
         ir: IR,
         config_options: ConfigOptions[StreamingExecutor],
         plan_id: uuid.UUID,
-        worker: Worker,
+        query_id: uuid.UUID,
+        worker_id: uuid.UUID,
         *,
-        parent_plan: Plan,
+        parent_plan_id: uuid.UUID,
         node_map: dict[str, list[str]],
-        logical_op_by_id: dict[str, Operator],
-    ) -> dict[str, Operator]:
+        logical_op_by_id: dict[str, uuid.UUID],
+    ) -> dict[str, uuid.UUID]:
         parent_operators = build_parent_operators_map(node_map, logical_op_by_id)
-        plan, operators, ports, operator_by_id = build_plan(
+        return emit_plan(
+            session,
             ir,
             config_options,
-            query=None,
+            query_id=query_id,
             plan_id=plan_id,
-            worker=worker,
+            worker_id=worker_id,
             instance_name="physical",
-            parent_plan=parent_plan,
+            parent_plan_id=parent_plan_id,
             parent_operators_by_node_id=parent_operators,
         )
-        self._emit_plan_declarations(session, plan, operators, ports)
-        return operator_by_id
 
     def _emit_evaluate_begin_events(
         self,
         ir_type: type[IR],
-        evaluate: Evaluate,
+        evaluate_id: uuid.UUID,
+        instance_name: str,
         execution_context: QuentIRExecutionContext,
         input_frames_bytes: int,
     ) -> None:
-        processor = execution_context.get_or_declare_processor(threading.get_ident())
+        processor_id = execution_context.get_or_declare_processor(threading.get_ident())
         assert execution_context.actor_id is not None, (
             "Evaluate events must be emitted from an Actor scope"
         )
-        execution_context.logger.start_evaluate(
-            evaluate.id,
-            instance_name=evaluate.instance_name,
-            actor=execution_context.actor_id,
+        queued = (
+            execution_context.logger.context.evaluate_observer()
+            .handle(evaluate_id)
+            .queued(instance_name=instance_name, actor=execution_context.actor_id)
+        )
+        execution_context.logger._evaluations[evaluate_id] = queued.running(
             io=ir_type.is_io_node,
             input_bytes=input_frames_bytes,
-            processor={
-                "target": processor.id,
-                "data": {},
-            },
-            channel=(
-                {
-                    "target": execution_context.worker_resources.disk_to_device_channel.id,
-                    "data": {"bytes": input_frames_bytes},
-                }
-                if ir_type.is_io_node
-                else None
-            ),
+            processor={"target": processor_id, "data": {}},
+            channel={
+                "target": execution_context.worker_resources.disk_to_device_channel_id,
+                "data": {"bytes": input_frames_bytes},
+            }
+            if ir_type.is_io_node
+            else None,
         )
 
     def _emit_evaluate_end_event(
         self,
-        evaluate: Evaluate,
+        evaluate_id: uuid.UUID,
         execution_context: QuentIRExecutionContext,
         result: DataFrame | None,
         error: BaseException | None,
     ) -> None:
         if error is not None:
-            execution_context.logger.fail_evaluate(evaluate.id, error=str(error))
+            execution_context.logger._evaluations.pop(evaluate_id).failed(
+                error=str(error)
+            )
         else:
             assert result is not None
-            execution_context.logger.complete_evaluate(
-                evaluate.id,
+            execution_context.logger._evaluations.pop(evaluate_id).completed(
                 output_bytes=result._size_bytes,
             )
 
@@ -276,12 +216,17 @@ class QuentContext:
 class WorkerResources:
     """Per-worker resource identities and generated declarations."""
 
-    thread_pool: ThreadPool
+    engine_id: uuid.UUID
+    worker_id: uuid.UUID
+    rank: int
+    instance_suffix: str
+    thread_pool_id: uuid.UUID
     processor_registry: ProcessorRegistry
-    device_memory: DeviceMemory
-    filesystem: Storage
-    disk_to_device_channel: DataChannel
-    link_channels: dict[int, DataChannel]
+    device_memory_id: uuid.UUID
+    device_memory_bytes: int
+    filesystem_id: uuid.UUID
+    disk_to_device_channel_id: uuid.UUID
+    link_channel_ids: dict[int, uuid.UUID]
 
     @classmethod
     def build(
@@ -292,83 +237,74 @@ class WorkerResources:
         rank: int,
         nranks: int,
     ) -> Self:
-        del engine_id
-        device_memory = DeviceMemory(
-            instance_name=f"{instance_suffix} device memory",
-            worker_id=worker_id,
-            capacity_bytes=get_total_device_memory() or 0,
-        )
-        filesystem = Storage(
-            instance_name=f"{instance_suffix} filesystem",
-            worker_id=worker_id,
-        )
-        disk_to_device = DataChannel(
-            instance_name=f"{instance_suffix} disk -> device",
-            channel_type=DataChannelType.DISK_TO_DEVICE,
-            worker_id=worker_id,
-            source=filesystem,
-            target=device_memory,
-        )
-        links = {
-            target_rank: DataChannel(
-                instance_name=f"rank-{rank} -> rank-{target_rank}",
-                channel_type=DataChannelType.INTER_RANK,
-                worker_id=worker_id,
-                source=device_memory,
-                target=device_memory,
-            )
-            for target_rank in range(nranks)
-            if target_rank != rank
-        }
+        namespace = uuid.uuid5(engine_id, f"worker:{rank}")
+
         return cls(
-            thread_pool=ThreadPool(worker_id=worker_id),
+            engine_id=engine_id,
+            worker_id=worker_id,
+            rank=rank,
+            instance_suffix=instance_suffix,
+            thread_pool_id=uuid.uuid5(namespace, "thread-pool"),
             processor_registry=ProcessorRegistry(),
-            device_memory=device_memory,
-            filesystem=filesystem,
-            disk_to_device_channel=disk_to_device,
-            link_channels=links,
+            device_memory_id=uuid.uuid5(namespace, "device-memory"),
+            device_memory_bytes=get_total_device_memory() or 0,
+            filesystem_id=uuid.uuid5(namespace, "filesystem"),
+            disk_to_device_channel_id=uuid.uuid5(namespace, "disk-to-device"),
+            link_channel_ids={
+                target_rank: uuid.uuid5(namespace, f"channel:{target_rank}")
+                for target_rank in range(nranks)
+                if target_rank != rank
+            },
         )
 
     def declare(self, session: QuentSession) -> None:
-        session.device_memory(self.device_memory.id).declared(
-            instance_name=self.device_memory.instance_name,
-            worker=self.device_memory.worker_id,
-            limits={"bytes": self.device_memory.capacity_bytes},
+        context = session.context
+        context.device_memory_observer().handle(self.device_memory_id).declared(
+            instance_name=f"{self.instance_suffix} device memory",
+            worker=self.worker_id,
+            limits={"bytes": self.device_memory_bytes},
         )
-        session.storage(self.filesystem.id).declared(
-            instance_name=self.filesystem.instance_name,
-            worker=self.filesystem.worker_id,
+        context.storage_observer().handle(self.filesystem_id).declared(
+            instance_name=f"{self.instance_suffix} filesystem",
+            worker=self.worker_id,
         )
-        session.thread_pool(self.thread_pool.id).declared(
-            instance_name=f"Thread Pool {self.thread_pool.id.hex[:8]}",
-            worker=self.thread_pool.worker_id,
+        context.thread_pool_observer().handle(self.thread_pool_id).declared(
+            instance_name=f"Thread Pool {self.thread_pool_id.hex[:8]}",
+            worker=self.worker_id,
         )
-        for channel in (self.disk_to_device_channel, *self.link_channels.values()):
-            session.data_channel(channel.id).declared(
-                instance_name=channel.instance_name,
-                channel_type=str(channel.channel_type),
-                worker=channel.worker_id,
-                source=channel.source.id,
-                target=channel.target.id,
+        context.data_channel_observer().handle(self.disk_to_device_channel_id).declared(
+            instance_name=f"{self.instance_suffix} disk -> device",
+            channel_type="disk-to-device",
+            worker=self.worker_id,
+            source=self.filesystem_id,
+            target=self.device_memory_id,
+        )
+        for target_rank, channel_id in self.link_channel_ids.items():
+            context.data_channel_observer().handle(channel_id).declared(
+                instance_name=f"rank-{self.rank} -> rank-{target_rank}",
+                channel_type="inter-rank",
+                worker=self.worker_id,
+                source=self.device_memory_id,
+                target=uuid.uuid5(
+                    uuid.uuid5(self.engine_id, f"worker:{target_rank}"),
+                    "device-memory",
+                ),
             )
-
-    def finalize(self, session: QuentSession) -> None:
-        """Finish worker resources; generated plain resources need no exit event."""
 
 
 @dataclasses.dataclass(kw_only=True)
 class LocalQuentContext:
     """Rank-local generated Quent state."""
 
-    context: QuentContext
-    query: Query
-    worker: Worker
+    context: QuentConfig
+    query_id: uuid.UUID
+    worker_id: uuid.UUID
     logger: QuentSession
     worker_resources: WorkerResources
 
-    def get_or_declare_processor(self, thread_ident: int) -> Processor:
+    def get_or_declare_processor(self, thread_ident: int) -> uuid.UUID:
         return self.worker_resources.processor_registry.get_or_declare_processor(
-            self.logger, thread_ident, self.worker_resources.thread_pool.id
+            self.logger, thread_ident, self.worker_resources.thread_pool_id
         )
 
 
@@ -376,18 +312,18 @@ class LocalQuentContext:
 class QuentIRExecutionContext(LocalQuentContext):
     """Rank-local state bound to an Operator and, while running, an Actor."""
 
-    quent_operator: Operator
+    operator_id: uuid.UUID
     actor_id: uuid.UUID | None = None
 
     @classmethod
     def from_execution_context(
-        cls, execution_context: LocalQuentContext, quent_operator: Operator
+        cls, execution_context: LocalQuentContext, operator_id: uuid.UUID
     ) -> Self:
         return cls(
-            quent_operator=quent_operator,
+            operator_id=operator_id,
             context=execution_context.context,
-            query=execution_context.query,
-            worker=execution_context.worker,
+            query_id=execution_context.query_id,
+            worker_id=execution_context.worker_id,
             logger=execution_context.logger,
             worker_resources=execution_context.worker_resources,
         )

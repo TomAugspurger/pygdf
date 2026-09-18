@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from rapidsmpf.streaming.core.context import Context
 
     from cudf_polars.engine.ray import RankActor
-    from cudf_polars.quent._context import QuentContext, WorkerResources
+    from cudf_polars.quent._context import QuentConfig, WorkerResources
     from cudf_polars.quent._runtime import QuentSession
 
 
@@ -543,8 +543,8 @@ def _bool_converter(v: str) -> bool:
         raise ValueError(f"Invalid boolean value: '{v}'")
 
 
-def _quent_context_converter(v: str) -> QuentContext | None:
-    from cudf_polars.quent._context import QuentContext
+def _quent_context_converter(v: str) -> QuentConfig | None:
+    from cudf_polars.quent._context import QuentConfig
 
     try:
         enabled = _bool_converter(v)
@@ -552,7 +552,7 @@ def _quent_context_converter(v: str) -> QuentContext | None:
         raise ValueError(f"Invalid value for quent_context: '{v}'") from e
     else:
         if enabled:
-            return QuentContext()
+            return QuentConfig()
         else:
             return None
 
@@ -1204,7 +1204,7 @@ class StreamingExecutor:
           (lower precedence)
     quent_context
         Quent tracing context. When ``None`` (default), Quent tracing is disabled.
-        Pass a :class:`~cudf_polars.quent.QuentContext` instance to enable tracing.
+        Pass a :class:`~cudf_polars.quent.QuentConfig` instance to enable tracing.
         Can be set via the ``CUDF_POLARS__EXECUTOR__QUENT_CONTEXT`` environment
         variable (``true`` enables tracing with a default context, ``false``
         disables it).
@@ -1311,7 +1311,7 @@ class StreamingExecutor:
     spmd_context: SPMDContext | None = None
     ray_context: RayContext | None = None
     dask_context: DaskContext | None = None
-    quent_context: QuentContext | None = dataclasses.field(
+    quent_context: QuentConfig | None = dataclasses.field(
         default_factory=_make_default_factory(
             f"{_env_prefix}__QUENT_CONTEXT", _quent_context_converter, default=None
         )
@@ -1460,8 +1460,8 @@ class StreamingExecutor:
         # Hash the quent context UUIDs as ints
         quent_context = d["quent_context"]
         if quent_context is not None:
-            for key in ["engine", "query_group", "query"]:
-                quent_context[key]["id"] = int(quent_context[key]["id"])
+            quent_context["engine_id"] = int(quent_context["engine_id"])
+            quent_context["query_group_id"] = int(quent_context["query_group_id"])
             d["quent_context"] = json.dumps(quent_context)
         return hash(tuple(sorted(d.items())))
 

@@ -5,18 +5,6 @@
 
 from __future__ import annotations
 
-from cudf_polars.quent._context import QuentContext
-from cudf_polars.quent._types import (
-    Engine,
-    Implementation,
-    Query,
-    QueryGroup,
-)
+from cudf_polars.quent._context import QuentConfig
 
-__all__ = [
-    "Engine",
-    "Implementation",
-    "QuentContext",
-    "Query",
-    "QueryGroup",
-]
+__all__ = ["QuentConfig"]

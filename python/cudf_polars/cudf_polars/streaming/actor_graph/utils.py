@@ -356,11 +356,15 @@ async def shutdown_on_error(
             ir_context,
             quent_ir_execution_context=quent_execution,
         )
-        quent_execution.logger.start_actor(
-            actor_id,
-            operator=quent_execution.quent_operator.id,
-            worker=quent_execution.worker.id,
+        started = (
+            quent_execution.logger.context.actor_observer()
+            .handle(actor_id)
+            .started(
+                operator=quent_execution.operator_id,
+                worker=quent_execution.worker_id,
+            )
         )
+        quent_execution.logger._actors[actor_id] = started.running()
 
     actor_error: BaseException | None = None
     with cudf_polars.dsl.tracing.bound_contextvars(**contextvars):
@@ -410,18 +414,20 @@ async def shutdown_on_error(
                 }
                 assert quent_ir_execution_context.actor_id is not None
                 if actor_error is None:
-                    quent_ir_execution_context.logger.complete_actor(
-                        quent_ir_execution_context.actor_id,
+                    quent_ir_execution_context.logger._actors.pop(
+                        quent_ir_execution_context.actor_id
+                    ).completed(
                         values=values,
                     )
                 else:
-                    quent_ir_execution_context.logger.fail_actor(
-                        quent_ir_execution_context.actor_id,
+                    quent_ir_execution_context.logger._actors.pop(
+                        quent_ir_execution_context.actor_id
+                    ).failed(
                         error=str(actor_error),
                         values=values,
                     )
-                quent_ir_execution_context.logger.operator(
-                    quent_ir_execution_context.quent_operator.id
+                quent_ir_execution_context.logger.context.operator_observer().handle(
+                    quent_ir_execution_context.operator_id
                 ).statistics(values=values)
 
 

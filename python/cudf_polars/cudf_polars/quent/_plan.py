@@ -6,132 +6,109 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING
+import json
+import uuid
+from typing import TYPE_CHECKING, Any
 
 from cudf_polars.dsl.traversal import traversal
-from cudf_polars.quent._types import (
-    Edge,
-    Operator,
-    Plan,
-    Port,
-    dynamic_attributes,
-)
 from cudf_polars.streaming.explain import SerializablePlan
 
 if TYPE_CHECKING:
-    import uuid
-
     from cudf_polars.dsl.ir import IR
-    from cudf_polars.quent._types import Query, Worker
+    from cudf_polars.quent._runtime import QuentSession
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
 
 _JOIN_TYPES = frozenset({"Join", "ConditionalJoin"})
 
 
-def build_plan(
+def _dynamic_attributes(
+    values: dict[str, Any],
+) -> dict[str, bool | int | float | str | None]:
+    """Convert arbitrary plan metadata to generated dynamic scalar values."""
+    return {
+        key: (
+            value
+            if value is None or isinstance(value, bool | int | float | str)
+            else json.dumps(value, sort_keys=True, default=str)
+        )
+        for key, value in values.items()
+    }
+
+
+def emit_plan(
+    session: QuentSession,
     ir: IR,
     config_options: ConfigOptions[StreamingExecutor],
-    query: Query | None,
+    query_id: uuid.UUID,
     plan_id: uuid.UUID,
-    worker: Worker,
+    worker_id: uuid.UUID | None,
     *,
     instance_name: str = "logical",
-    parent_plan: Plan | None = None,
-    parent_operators_by_node_id: dict[str, list[Operator]] | None = None,
-) -> tuple[Plan, list[Operator], list[Port], dict[str, Operator]]:
-    """
-    Build a Quent plan, including operators, edges, and ports.
-
-    Parameters
-    ----------
-    ir
-        The cudf-polars IR.
-    config_options
-        The configuration options for the streaming executor.
-    query
-        The Quent query this plan belongs to.
-    plan_id
-        Unique ID for this plan.
-    worker
-        The Quent worker.
-    instance_name
-        Human-readable plan name (e.g. ``"logical"`` or ``"physical"``).
-    parent_plan
-        If this plan was derived from another (e.g. a physical plan derived
-        from a logical plan), the parent plan.
-    parent_operators_by_node_id
-        Optional mapping from node stable ID to the list of parent
-        :class:`Operator` objects from a parent plan.  Used to populate
-        :attr:`Operator.parent_operators` for physical-plan operators
-        that were derived from logical-plan operators during lowering.
-    """
-    from cudf_polars import _quent
-
+    parent_plan_id: uuid.UUID | None = None,
+    parent_operators_by_node_id: dict[str, list[uuid.UUID]] | None = None,
+    emit: bool = True,
+) -> dict[str, uuid.UUID]:
+    """Build and emit one plan using deterministic entity UUIDs."""
     serializable_plan = SerializablePlan.from_ir(ir, config_options=config_options)
     parent_ops = parent_operators_by_node_id or {}
-    operator_by_ir_id: dict[str, Operator] = {}
-    port_lookup: dict[tuple[uuid.UUID, str], Port] = {}
-    operators: list[Operator] = []
-    all_ports: list[Port] = []
-    edges: list[Edge] = []
-    if query is None:
-        if parent_plan is None:
-            raise ValueError("A plan requires either a query or a parent plan.")
-        query = parent_plan.query
-    plan = Plan(
-        id=plan_id,
-        query=query,
-        parent_plan=parent_plan,
-        instance_name=instance_name,
-        edges=edges,
-        worker=worker,
-    )
-
+    operator_by_ir_id: dict[str, uuid.UUID] = {}
+    port_lookup: dict[tuple[uuid.UUID, str], uuid.UUID] = {}
     for node_id in sorted(serializable_plan.nodes.keys(), key=int):
         serializable_node = serializable_plan.nodes[node_id]
-
-        operator_id = _quent.now_v7()
-        attributes = dynamic_attributes(
-            {"node_id": node_id, **serializable_node.properties}
-        )
-        operator = Operator(
-            id=operator_id,
-            plan=plan,
-            parent_operators=parent_ops.get(node_id, []),
-            type_name=serializable_node.type,
-            attributes=attributes,
-        )
-        operator_by_ir_id[node_id] = operator
-        operators.append(operator)
-
+        operator_id = uuid.uuid5(plan_id, f"operator:{node_id}")
+        operator_by_ir_id[node_id] = operator_id
         for port_name in port_names_for_node(
             len(serializable_node.children), serializable_node.type
         ):
-            port = Port(_quent.now_v7(), operator=operator, instance_name=port_name)
-            all_ports.append(port)
-            port_lookup[(operator_id, port_name)] = port
+            port_lookup[(operator_id, port_name)] = uuid.uuid5(
+                operator_id, f"port:{port_name}"
+            )
+    if not emit:
+        return operator_by_ir_id
 
+    edges: list[dict[str, uuid.UUID]] = []
     for node_id in sorted(serializable_plan.nodes.keys(), key=int):
         serializable_node = serializable_plan.nodes[node_id]
-        operator = operator_by_ir_id[node_id]
+        operator_id = operator_by_ir_id[node_id]
         input_port_names = port_names_for_node(
             len(serializable_node.children), serializable_node.type
         )[1:]
-
         for i, child_id in enumerate(serializable_node.children):
-            child_operator = operator_by_ir_id[child_id]
-            source = port_lookup[(child_operator.id, "out")]
-            target = port_lookup[(operator.id, input_port_names[i])]
-            edges.append(Edge(source=source, target=target))
+            child_operator_id = operator_by_ir_id[child_id]
+            edges.append(
+                {
+                    "source": port_lookup[(child_operator_id, "out")],
+                    "target": port_lookup[(operator_id, input_port_names[i])],
+                }
+            )
 
-    op_by_id = dict(
-        zip(
-            sorted(serializable_plan.nodes.keys(), key=int),
-            operators,
-            strict=True,
-        )
+    context = session.context
+    context.plan_observer().handle(plan_id).declared(
+        instance_name=instance_name,
+        query=query_id,
+        parent_plan=parent_plan_id,
+        worker=worker_id,
+        edges=edges,
     )
-    return plan, operators, all_ports, op_by_id
+    for node_id in sorted(serializable_plan.nodes.keys(), key=int):
+        serializable_node = serializable_plan.nodes[node_id]
+        operator_id = operator_by_ir_id[node_id]
+        context.operator_observer().handle(operator_id).declared(
+            plan=plan_id,
+            parent_operators=parent_ops.get(node_id, []),
+            instance_name=f"{serializable_node.type}-{operator_id.hex[:8]}",
+            type_name=serializable_node.type,
+            attributes=_dynamic_attributes(
+                {"node_id": node_id, **serializable_node.properties}
+            ),
+        )
+        for port_name in port_names_for_node(
+            len(serializable_node.children), serializable_node.type
+        ):
+            context.port_observer().handle(
+                port_lookup[(operator_id, port_name)]
+            ).declared(operator=operator_id, instance_name=port_name)
+    return operator_by_ir_id
 
 
 @functools.cache
@@ -156,8 +133,8 @@ def port_names_for_node(n_children: int, node_type: str) -> tuple[str, ...]:
 
 def build_parent_operators_map(
     node_map: dict[str, list[str]],
-    logical_op_by_id: dict[str, Operator],
-) -> dict[str, list[Operator]]:
+    logical_op_by_id: dict[str, uuid.UUID],
+) -> dict[str, list[uuid.UUID]]:
     """
     Map physical node IDs to their logical-plan parent operators.
 
@@ -167,12 +144,12 @@ def build_parent_operators_map(
         Mapping from physical (post-lowering) stable IDs to the
         logical (pre-lowering) stable IDs they were derived from.
     logical_op_by_id
-        Mapping from logical stable ID to its :class:`Operator`.
+        Mapping from logical stable ID to its operator UUID.
 
     Returns
     -------
-    Mapping from physical stable ID to the list of parent :class:`Operator`
-    objects, with an empty list for entries with no parents.
+    Mapping from physical stable ID to parent operator UUIDs, with an empty
+    list for entries with no parents.
     """
     return {
         physical_sid: [
@@ -184,10 +161,10 @@ def build_parent_operators_map(
 
 def build_quent_operator_map(
     ir: IR,
-    physical_op_by_id: dict[str, Operator],
-) -> dict[IR, Operator]:
-    """Build a map from IR nodes to their physical-plan Quent operators."""
-    result: dict[IR, Operator] = {}
+    physical_op_by_id: dict[str, uuid.UUID],
+) -> dict[IR, uuid.UUID]:
+    """Build a map from IR nodes to their physical-plan operator UUIDs."""
+    result: dict[IR, uuid.UUID] = {}
     for node in traversal([ir]):
         stable_id = str(node.get_stable_id())
         if stable_id in physical_op_by_id:

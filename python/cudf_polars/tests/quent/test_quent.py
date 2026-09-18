@@ -7,39 +7,40 @@ from __future__ import annotations
 
 import dataclasses
 import uuid
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
 
+if TYPE_CHECKING:
+    from cudf_polars.quent._runtime import QuentEvent
+
 quent_bindings = pytest.importorskip("cudf_polars._quent")
 
-from cudf_polars.quent._context import ProcessorRegistry, QuentContext  # noqa: E402
-from cudf_polars.quent._runtime import EntityKind, QuentSession  # noqa: E402
-from cudf_polars.quent._types import (  # noqa: E402
-    Edge,
-    Operator,
-    Plan,
-    Port,
-    Query,
-    ThreadPool,
-    Worker,
-    dynamic_attributes,
+from cudf_polars.quent._context import (  # noqa: E402
+    ProcessorRegistry,
+    QuentConfig,
+    WorkerResources,
 )
+from cudf_polars.quent._plan import (  # noqa: E402
+    _dynamic_attributes,
+    emit_plan,
+)
+from cudf_polars.quent._runtime import QuentSession  # noqa: E402
 
 
-def _events(session: QuentSession) -> list[dict]:
+def _events(session: QuentSession) -> list[QuentEvent]:
     return [item["event"] for item in session.drain()]
 
 
-def test_context_lifecycle_uses_generated_handles(
-    quent_context: QuentContext,
-) -> None:
+def test_context_lifecycle_uses_generated_handles(quent_context: QuentConfig) -> None:
     session = QuentSession()
-    query = quent_context.query_for(uuid.uuid4())
+    query_id = uuid.uuid4()
 
     quent_context._emit_engine_init_events(session)
     quent_context._emit_query_group_events(session)
-    quent_context._emit_query_events(session, query)
-    quent_context._emit_query_completed_event(session, query)
+    quent_context._emit_query_events(session, query_id)
+    quent_context._emit_query_completed_event(session, query_id)
     quent_context._emit_engine_exit_events(session)
 
     events = _events(session)
@@ -53,39 +54,32 @@ def test_context_lifecycle_uses_generated_handles(
         "Engine",
     ]
     query_events = [event for event in events if "Query" in event["data"]]
-    assert [
-        (
-            next(iter(event["data"]["Query"]))
-            if isinstance(event["data"]["Query"], dict)
-            else event["data"]["Query"]
-        )
-        for event in query_events
-    ] == ["Initialized", "Planning", "Executing", "Completed"]
-    assert str(quent_context.engine.id) == events[0]["id"]
-    assert str(query.id) == query_events[0]["id"]
+    assert [next(iter(event["data"]["Query"])) for event in query_events] == [
+        "Initialized",
+        "Planning",
+        "Executing",
+        "Completed",
+    ]
+    assert str(quent_context.engine_id) == events[0]["id"]
+    assert str(query_id) == query_events[0]["id"]
 
 
-def test_query_group_is_declared_once_across_derived_contexts(
-    quent_context: QuentContext,
+def test_query_group_is_declared_once_across_derived_configs(
+    quent_context: QuentConfig,
 ) -> None:
-    # Benchmarks re-derive the context per iteration while keeping one session,
-    # so the dedupe has to key off the session rather than the context object.
     session = QuentSession()
     quent_context._emit_query_group_events(session)
     for iteration in range(2):
-        derived = dataclasses.replace(
-            quent_context, query=Query(instance_name=f"Iteration {iteration}")
-        )
-        derived._emit_query_group_events(session)
+        dataclasses.replace(
+            quent_context, query_name=f"Iteration {iteration}"
+        )._emit_query_group_events(session)
 
-    events = _events(session)
-    assert [next(iter(event["data"])) for event in events] == ["QueryGroup"]
+    assert [next(iter(event["data"])) for event in _events(session)] == ["QueryGroup"]
 
 
 def test_fsm_start_handle_is_consumed_after_transition() -> None:
     context = quent_bindings.Context()
-    identifier = uuid.uuid4()
-    handle = context.engine_observer().handle(identifier)
+    handle = context.engine_observer().handle(uuid.uuid4())
     implementation = {
         "name": "cudf-polars",
         "version": "test",
@@ -98,80 +92,100 @@ def test_fsm_start_handle_is_consumed_after_transition() -> None:
     context.close()
 
 
-def test_entity_kinds_match_the_declarative_schema() -> None:
-    assert {kind.name for kind in EntityKind} == {
-        "ENGINE",
-        "QUERY_GROUP",
-        "WORKER",
-        "PLAN",
-        "OPERATOR",
-        "PORT",
-        "THREAD_POOL",
-        "PROCESSOR",
-        "DEVICE_MEMORY",
-        "STORAGE",
-        "DATA_CHANNEL",
-        "QUERY",
-        "EVALUATE",
-        "ACTOR",
+def test_context_serialization_preserves_configuration(
+    quent_context: QuentConfig,
+) -> None:
+    assert QuentConfig._deserialize(quent_context._serialize()) == quent_context
+
+
+def test_plan_entities_are_deterministic(
+    quent_context: QuentConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    nodes = {
+        "0": SimpleNamespace(type="Scan", children=[], properties={}),
+        "1": SimpleNamespace(type="Filter", children=["0"], properties={}),
     }
-
-
-def test_context_serialization_preserves_shared_identities(
-    quent_context: QuentContext,
-) -> None:
-    result = QuentContext._deserialize(quent_context._serialize())
-    assert result.engine == quent_context.engine
-    assert result.query_group == quent_context.query_group
-    assert result.query == quent_context.query
-
-
-def test_plan_declarations_reference_generated_entities(
-    quent_context: QuentContext,
-) -> None:
-    session = QuentSession()
-    worker = Worker(uuid.uuid4(), quent_context.engine, "rank-0")
-    query = quent_context.query_for(uuid.uuid4())
-    plan = Plan(uuid.uuid4(), query, None, "logical", [], worker)
-    operator = Operator(uuid.uuid4(), plan, [], "Scan", {"node_id": "0"})
-    output = Port(uuid.uuid4(), operator, "out")
-    consumer = Operator(uuid.uuid4(), plan, [], "Filter", {"node_id": "1"})
-    input_ = Port(uuid.uuid4(), consumer, "in")
-    plan.edges.append(Edge(output, input_))
-
-    quent_context._emit_plan_declarations(
-        session, plan, [operator, consumer], [output, input_]
+    monkeypatch.setattr(
+        "cudf_polars.quent._plan.SerializablePlan.from_ir",
+        lambda *args, **kwargs: SimpleNamespace(nodes=nodes),
     )
-    events = _events(session)
-    plan_event = events[0]["data"]["Plan"]["Declared"]
-    assert plan_event["query"]["target"] == str(query.id)
-    assert plan_event["edges"] == [
-        {
-            "source": {"target": str(output.id), "data": None},
-            "target": {"target": str(input_.id), "data": None},
-        }
-    ]
-    assert events[1]["data"]["Operator"]["Declared"]["attributes"] == [
-        {"key": "node_id", "value": {"String": "0"}}
-    ]
+    plan_id = uuid.uuid4()
+    query_id = uuid.uuid4()
+    worker_id = uuid.uuid4()
+
+    first_session = QuentSession()
+    first = emit_plan(
+        first_session,
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        query_id,
+        plan_id,
+        worker_id,
+    )
+    events = _events(first_session)
+
+    second_session = QuentSession()
+    second = emit_plan(
+        second_session,
+        object(),  # type: ignore[arg-type]
+        object(),  # type: ignore[arg-type]
+        query_id,
+        plan_id,
+        worker_id,
+        emit=False,
+    )
+    second_session.drain()
+
+    assert first == second
+    assert events[0]["data"]["Plan"]["Declared"]["edges"][0] == {
+        "source": {
+            "target": str(uuid.uuid5(first["0"], "port:out")),
+            "data": None,
+        },
+        "target": {
+            "target": str(uuid.uuid5(first["1"], "port:in")),
+            "data": None,
+        },
+    }
 
 
 def test_processor_registry_declares_each_thread_once() -> None:
     session = QuentSession()
     registry = ProcessorRegistry()
-    pool = ThreadPool(worker_id=uuid.uuid4())
+    pool_id = uuid.uuid4()
 
-    first = registry.get_or_declare_processor(session, 10, pool.id)
-    assert registry.get_or_declare_processor(session, 10, pool.id) is first
-    second = registry.get_or_declare_processor(session, 11, pool.id)
-    assert second != first
+    first = registry.get_or_declare_processor(session, 10, pool_id)
+    assert registry.get_or_declare_processor(session, 10, pool_id) == first
+    assert registry.get_or_declare_processor(session, 11, pool_id) != first
 
     events = _events(session)
     assert len(events) == 2
     assert all("Processor" in event["data"] for event in events)
 
 
+def test_inter_rank_channel_targets_remote_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "cudf_polars.quent._context.get_total_device_memory", lambda: 1024
+    )
+    engine_id = uuid.uuid4()
+    rank0 = WorkerResources.build("rank-0", engine_id, uuid.uuid4(), 0, 2)
+    rank1 = WorkerResources.build("rank-1", engine_id, uuid.uuid4(), 1, 2)
+    session = QuentSession()
+    rank0.declare(session)
+
+    channel = next(
+        event["data"]["DataChannel"]["Declared"]
+        for event in _events(session)
+        if event["data"].get("DataChannel", {}).get("Declared", {}).get("channel_type")
+        == "inter-rank"
+    )
+    assert channel["source"]["target"] == str(rank0.device_memory_id)
+    assert channel["target"]["target"] == str(rank1.device_memory_id)
+
+
 def test_dynamic_attributes_preserve_scalars_and_encode_structures() -> None:
-    assert dynamic_attributes(
+    assert _dynamic_attributes(
         {"name": "scan", "count": 3, "nested": {"column": "x"}}
     ) == {"name": "scan", "count": 3, "nested": '{"column": "x"}'}

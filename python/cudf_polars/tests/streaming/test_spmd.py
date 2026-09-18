@@ -461,21 +461,22 @@ def test_reset_rejects_construction_time_engine_options(
 
 def test_quent_context_user_provided(spmd_engine: SPMDEngine) -> None:
     # Ensure that the user-provided quent context is used if provided
-    quent_context = cudf_polars.quent.QuentContext(
-        engine=cudf_polars.quent.Engine(
-            id=uuid.uuid4(),
-            implementation=cudf_polars.quent.Implementation(
-                name="test_implementation", version="0.0.0"
-            ),
-        ),
-        query_group=cudf_polars.quent.QueryGroup(instance_name="test_query_group"),
-        query=cudf_polars.quent.Query(instance_name="test_query"),
+    quent_context = cudf_polars.quent.QuentConfig(
+        engine_id=uuid.uuid4(),
+        implementation_name="test_implementation",
+        implementation_version="0.0.0",
+        query_group_name="test_query_group",
+        query_name="test_query",
     )
 
     with SPMDEngine(
         comm=spmd_engine.comm, executor_options={"quent_context": quent_context}
     ) as engine:
         assert engine.config["executor_options"]["quent_context"] == quent_context
+        with pytest.raises(ValueError, match="quent_context cannot be changed"):
+            engine._reset(
+                executor_options={"quent_context": cudf_polars.quent.QuentConfig()}
+            )
 
 
 def test_quent_context_default(spmd_engine: SPMDEngine) -> None:

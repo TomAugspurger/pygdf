@@ -90,7 +90,7 @@ except ImportError:
     CUDF_POLARS_AVAILABLE = False
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, MutableMapping
 
     from cudf_polars.engine.options import StreamingOptions
     from cudf_polars.streaming.explain import SerializablePlan
@@ -847,8 +847,8 @@ def get_executor_options(
     executor_options: dict[str, Any] = (
         run_config.streaming_options.to_executor_options()
     )
-    executor_options["quent_context"] = cudf_polars.quent.QuentContext(
-        engine=cudf_polars.quent.Engine(id=run_config.run_id)
+    executor_options["quent_context"] = cudf_polars.quent.QuentConfig(
+        engine_id=run_config.run_id
     )
 
     return executor_options
@@ -1220,9 +1220,7 @@ def run_polars_query(
                     engine.config["executor_options"]["quent_context"] = (
                         dataclasses.replace(
                             quent_context,
-                            query=cudf_polars.quent.Query(
-                                instance_name=f"Iteration {i + 1}",
-                            ),
+                            query_name=f"Iteration {i + 1}",
                         )
                     )
                     engine._run(setup_logging, q_id, i)
@@ -1307,9 +1305,8 @@ def _run_query_loop(
                 engine.config["executor_options"]["quent_context"] = (
                     dataclasses.replace(
                         quent_context,
-                        query_group=cudf_polars.quent.QueryGroup(
-                            instance_name=f"PDSH Query {q_id}",
-                        ),
+                        query_group_id=uuid.uuid4(),
+                        query_group_name=f"PDSH Query {q_id}",
                     )
                 )
 
@@ -1753,19 +1750,17 @@ def setup_logging(query_id: int, iteration: int) -> None:
         # So instead we make a new logger each time we need a new context,
         # i.e. for each query/iteration pair.
 
-        def make_injector(
-            query_id: int, iteration: int
-        ) -> Callable[[logging.Logger, str, dict[str, Any]], dict[str, Any]]:
+        def make_injector(query_id: int, iteration: int) -> structlog.types.Processor:
             def inject(
-                logger: Any, method_name: Any, event_dict: Any
-            ) -> dict[str, Any]:
+                logger: Any, method_name: str, event_dict: MutableMapping[str, Any]
+            ) -> MutableMapping[str, Any]:
                 event_dict["query_id"] = query_id
                 event_dict["iteration"] = iteration
                 return event_dict
 
             return inject
 
-        shared_processors = [
+        shared_processors: list[structlog.types.Processor] = [
             structlog.contextvars.merge_contextvars,
             make_injector(query_id, iteration),
             structlog.processors.add_log_level,

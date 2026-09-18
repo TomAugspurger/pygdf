@@ -10,7 +10,6 @@ import enum
 import functools
 import os
 import time
-import uuid
 from typing import TYPE_CHECKING, Any, Concatenate, Literal, ParamSpec
 
 import nvtx
@@ -176,7 +175,7 @@ def log_do_evaluate(
             *args: P.args,
             **kwargs: P.kwargs,
         ) -> cudf_polars.containers.DataFrame:
-            from cudf_polars.quent._types import Evaluate
+            from cudf_polars import _quent
 
             log = structlog.get_logger()
 
@@ -191,22 +190,21 @@ def log_do_evaluate(
 
             if ir_execution_context.quent_ir_execution_context is not None:
                 quent_context = ir_execution_context.quent_ir_execution_context
-                token = uuid.uuid4()
-                quent_evaluate = Evaluate(
-                    instance_name=(
-                        f"{cls.__name__}-{quent_context.quent_operator.id.hex[:8]}-"
-                        f"{token.hex[:8]}"
-                    ),
+                quent_evaluate_id = _quent.now_v7()
+                instance_name = (
+                    f"{cls.__name__}-{quent_context.operator_id.hex[:8]}-"
+                    f"{quent_evaluate_id.hex[:8]}"
                 )
                 quent_context.context._emit_evaluate_begin_events(
                     cls,
-                    quent_evaluate,
+                    quent_evaluate_id,
+                    instance_name,
                     quent_context,
                     input_frames_bytes=sum(frame._size_bytes for frame in frames),
                 )
 
             else:
-                quent_evaluate = None
+                quent_evaluate_id = None
 
             before_start = time.monotonic_ns()
             before = make_snapshot(
@@ -228,11 +226,11 @@ def log_do_evaluate(
                 raise
             finally:
                 if (
-                    quent_evaluate is not None
+                    quent_evaluate_id is not None
                     and ir_execution_context.quent_ir_execution_context is not None
                 ):
                     ir_execution_context.quent_ir_execution_context.context._emit_evaluate_end_event(
-                        quent_evaluate,
+                        quent_evaluate_id,
                         ir_execution_context.quent_ir_execution_context,
                         result,
                         error,

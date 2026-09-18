@@ -11,8 +11,8 @@ import cudf_polars.quent
 
 
 @pytest.fixture
-def quent_context() -> cudf_polars.quent.QuentContext:
-    return cudf_polars.quent.QuentContext(
-        query_group=cudf_polars.quent.QueryGroup(instance_name="test_query_group"),
-        query=cudf_polars.quent.Query(instance_name="test_query"),
+def quent_context() -> cudf_polars.quent.QuentConfig:
+    return cudf_polars.quent.QuentConfig(
+        query_group_name="test_query_group",
+        query_name="test_query",
     )

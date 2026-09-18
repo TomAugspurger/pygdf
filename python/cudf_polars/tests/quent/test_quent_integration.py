@@ -19,13 +19,14 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from cudf_polars.engine.core import StreamingEngine
-    from cudf_polars.quent import QuentContext
+    from cudf_polars.quent import QuentConfig
+    from cudf_polars.quent._runtime import QuentEvent
 
 
 @pytest.fixture(params=["ray", "dask", "spmd"])
 def engine_with_quent_context(
     request: pytest.FixtureRequest,
-    quent_context: QuentContext,
+    quent_context: QuentConfig,
     ray_num_ranks: int,
     ray_init_options: dict[str, Any],
 ) -> Iterator[StreamingEngine]:
@@ -72,12 +73,12 @@ def engine_with_quent_context(
         engine.shutdown()
 
 
-def _of_type(events: list[dict], entity: str) -> list[dict]:
+def _of_type(events: list[QuentEvent], entity: str) -> list[QuentEvent]:
     return [event for event in events if entity in event["data"]]
 
 
 def test_custom_schema_events(
-    engine_with_quent_context: StreamingEngine, quent_context: QuentContext
+    engine_with_quent_context: StreamingEngine, quent_context: QuentConfig
 ) -> None:
     query = pl.LazyFrame({"x": [1, 2]}).filter(pl.col("x") > 1)
     with engine_with_quent_context:
@@ -86,7 +87,7 @@ def test_custom_schema_events(
     events = engine_with_quent_context._quent_events
     engine_events = _of_type(events, "Engine")
     assert len(engine_events) == 2
-    assert engine_events[0]["id"] == str(quent_context.engine.id)
+    assert engine_events[0]["id"] == str(quent_context.engine_id)
     assert "Init" in engine_events[0]["data"]["Engine"]
     assert "Exit" in engine_events[1]["data"]["Engine"]
 
@@ -100,7 +101,7 @@ def test_custom_schema_events(
     assert len(_of_type(events, "QueryGroup")) == 1
     query_events = _of_type(events, "Query")
     assert len(query_events) == 4
-    assert query_events[0]["id"] != str(quent_context.query.id)
+    assert query_events[0]["id"] != str(quent_context.query_group_id)
     assert _of_type(events, "Plan")
     assert _of_type(events, "Operator")
     assert _of_type(events, "Actor")

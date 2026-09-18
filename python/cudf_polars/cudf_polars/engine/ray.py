@@ -26,7 +26,6 @@ from rapidsmpf.streaming.core.context import Context
 
 import cudf_polars.quent
 import cudf_polars.quent._runtime
-import cudf_polars.quent._types
 from cudf_polars.engine import persisted_result, rank_local_store
 from cudf_polars.engine.core import (
     ClusterInfo,
@@ -52,7 +51,6 @@ from cudf_polars.quent._context import (
     LocalQuentContext,
     WorkerResources,
 )
-from cudf_polars.quent._types import Backend, Worker
 from cudf_polars.unstable import unstable
 from cudf_polars.utils.config import (
     MemoryResourceConfig,
@@ -175,9 +173,8 @@ def evaluate_pipeline_ray_mode(
     if quent_context is not None:
         quent_logger = config_options.executor.ray_context.quent_logger
         assert quent_logger is not None
-        query = quent_context.query_for(query_id)
         quent_context._emit_query_group_events(quent_logger)
-        quent_context._emit_query_events(quent_logger, query)
+        quent_context._emit_query_events(quent_logger, query_id)
 
     # Serialize the IR into the Ray object store so actors fetch by reference
     # instead of receiving N copies.
@@ -185,7 +182,7 @@ def evaluate_pipeline_ray_mode(
     # `result` is in actor order, which is NOT rank order, so each actor
     # reports its rank and the partitions are sorted before concatenation.
     try:
-        result = ray.get(
+        result: list[tuple[int, pl.DataFrame, list[ChannelMetadata] | None]] = ray.get(
             [
                 rank.evaluate_polars_ir.remote(
                     ir_ref,
@@ -200,7 +197,7 @@ def evaluate_pipeline_ray_mode(
     except BaseException as error:
         if quent_context is not None:
             assert quent_logger is not None
-            quent_context._emit_query_failed_event(quent_logger, query, error)
+            quent_context._emit_query_failed_event(quent_logger, query_id, error)
         raise
     ranked: list[tuple[int, pl.DataFrame]] = []
     metadata_collector: list[ChannelMetadata] = []
@@ -214,7 +211,7 @@ def evaluate_pipeline_ray_mode(
     if quent_context is not None:
         quent_logger = config_options.executor.ray_context.quent_logger
         assert quent_logger is not None
-        quent_context._emit_query_completed_event(quent_logger, query)
+        quent_context._emit_query_completed_event(quent_logger, query_id)
     return pl.concat(dfs), metadata_collector or None
 
 
@@ -272,7 +269,7 @@ class RankActor:
         hardware_binding: HardwareBindingPolicy,
         memory_resource_config: MemoryResourceConfig | None,
         worker_id: uuid.UUID,
-        engine: cudf_polars.quent.Engine,
+        engine_id: uuid.UUID,
         quent_enabled: bool,
     ) -> None:
         bind_to_gpu(hardware_binding)
@@ -312,13 +309,8 @@ class RankActor:
             )
         else:
             self._quent_logger = None
-        self._quent_engine = engine
+        self._quent_engine_id = engine_id
         self._worker_id = worker_id
-        self._quent_worker = Worker(
-            id=worker_id,
-            engine=engine,
-            instance_name=f"RankActor-{worker_id.hex[:8]}",
-        )
         # Initialized later in setup_worker once ``comm`` is available.
         self.worker_resources: WorkerResources | None = None
 
@@ -371,15 +363,18 @@ class RankActor:
         barrier(self._comm)
         # Now we can declare the Quent worker resources, which depends on self._comm
         if self._quent_logger is not None:
-            self._quent_logger.init_worker(
-                self._quent_worker.id,
-                instance_name=self._quent_worker.instance_name,
-                engine=self._quent_worker.engine.id,
-                parent_engine_id=str(self._quent_worker.engine.id),
+            self._quent_logger._workers[self._worker_id] = (
+                self._quent_logger.context.worker_observer()
+                .handle(self._worker_id)
+                .init(
+                    instance_name=f"RankActor-{self._worker_id.hex[:8]}",
+                    engine=self._quent_engine_id,
+                    parent_engine_id=str(self._quent_engine_id),
+                )
             )
             self.worker_resources = WorkerResources.build(
-                instance_suffix=f"RankActor-{self._quent_worker.id.hex[:8]}",
-                engine_id=self._quent_engine.id,
+                instance_suffix=f"RankActor-{self._worker_id.hex[:8]}",
+                engine_id=self._quent_engine_id,
                 worker_id=self._worker_id,
                 rank=self._comm.rank,
                 nranks=self._nranks,
@@ -482,15 +477,12 @@ class RankActor:
         self._mr = self._ctx.br().device_mr_adaptor()
         rmm.mr.set_current_device_resource(self._mr)
 
-    def _exit(self) -> list[dict[str, Any]]:
+    def _exit(self) -> list[cudf_polars.quent._runtime.BufferedEvent]:
         # Emit the Exit event on the worker.
         # Maybe generalize this to all application-level things,
         # followed by framework (ray) level things.
-        if self._quent_worker is not None and self._quent_logger is not None:
-            if self.worker_resources is not None:
-                self.worker_resources.finalize(self._quent_logger)
-
-            self._quent_logger.exit_worker(self._quent_worker.id)
+        if self._quent_logger is not None:
+            self._quent_logger._workers.pop(self._worker_id).exit()
             return self._drain_quent_events()
         return []
 
@@ -583,7 +575,7 @@ class RankActor:
         config_options: ConfigOptions[StreamingExecutor],
         *,
         collect_metadata: bool,
-        quent_context: cudf_polars.quent.QuentContext | None,
+        quent_context: cudf_polars.quent.QuentConfig | None,
         query_id: uuid.UUID,
     ) -> tuple[int, pl.DataFrame, list[ChannelMetadata] | None]:
         """
@@ -635,8 +627,8 @@ class RankActor:
             assert self.worker_resources is not None
             local_quent_context = LocalQuentContext(
                 context=quent_context,
-                query=quent_context.query_for(query_id),
-                worker=self._quent_worker,
+                query_id=query_id,
+                worker_id=self._worker_id,
                 logger=self._quent_logger,
                 worker_resources=self.worker_resources,
             )
@@ -714,7 +706,9 @@ class RankActor:
         """Drop this query's partitions from this engine's store (idempotent)."""
         rank_local_store.drop_query(uid, query_id)
 
-    def _drain_quent_events(self) -> list[dict[str, Any]]:
+    def _drain_quent_events(
+        self,
+    ) -> list[cudf_polars.quent._runtime.BufferedEvent]:
         """
         Return and clear all buffered Quent events from this actor.
 
@@ -873,19 +867,17 @@ class RayEngine(StreamingEngine):
 
         check_reserved_keys(executor_options, engine_options)
 
-        quent_context: cudf_polars.quent.QuentContext | None = executor_options.get(
+        quent_context: cudf_polars.quent.QuentConfig | None = executor_options.get(
             "quent_context"
         )
         if quent_context is not None:
             self._quent_logger = cudf_polars.quent._runtime.QuentSession()
             executor_options.setdefault("quent_context", quent_context)
-            quent_context._emit_engine_init_events(
-                self._quent_logger, backend=Backend.RAY
-            )
-            engine = quent_context.engine
+            quent_context._emit_engine_init_events(self._quent_logger, backend="ray")
+            engine_id = quent_context.engine_id
         else:
             self._quent_logger = None
-            engine = cudf_polars.quent.Engine(id=uuid.uuid4())
+            engine_id = uuid.uuid4()
 
         # This engine's store uid, used to key its partitions in each actor's process rank-local store.
         self._store_uid = uuid.uuid4().hex
@@ -953,13 +945,15 @@ class RayEngine(StreamingEngine):
                     hardware_binding=hw_binding,
                     memory_resource_config=mr_config,
                     worker_id=worker_id,
-                    engine=engine,
+                    engine_id=engine_id,
                     quent_enabled=quent_context is not None,
                 )
                 for worker_id in worker_ids
             ]
 
-            root_ucxx_address_as_bytes = ray.get(rank_actors[0].setup_root.remote())
+            root_ucxx_address_as_bytes = cast(
+                "bytes", ray.get(rank_actors[0].setup_root.remote())
+            )
             # Call setup_worker on all actors concurrently, including the root.
             # The root skips communicator creation and proceeds directly to the barrier.
             # Non-root actors create their communicators and then join the barrier.
@@ -995,16 +989,22 @@ class RayEngine(StreamingEngine):
         """Reset the engine; see :meth:`StreamingEngine._reset` for the contract."""
         if self._rank_actors is None:
             raise RuntimeError("Cannot reset a shut-down engine")
+        existing_executor_options = self.config.get("executor_options", {})
+        if not isinstance(existing_executor_options, dict):
+            existing_executor_options = {}
+        existing_quent_context = existing_executor_options.get("quent_context")
+        if (
+            executor_options is not None
+            and "quent_context" in executor_options
+            and executor_options["quent_context"] != existing_quent_context
+        ):
+            raise ValueError("quent_context cannot be changed during reset")
         super()._reset(
             rapidsmpf_options=rapidsmpf_options,
             executor_options=executor_options,
             engine_options=engine_options,
         )
         executor_options = executor_options or {}
-        existing_executor_options = self.config.get("executor_options", {})
-        if not isinstance(existing_executor_options, dict):
-            existing_executor_options = {}
-        existing_quent_context = existing_executor_options.get("quent_context")
         if existing_quent_context is not None:
             executor_options.setdefault("quent_context", existing_quent_context)
         if "kvikio_nthreads" in existing_executor_options:
@@ -1200,7 +1200,7 @@ class RayEngine(StreamingEngine):
         if self._rank_actors is None:
             return  # already shut down; idempotent
         exceptions: list[Exception] = []
-        quent_context: cudf_polars.quent.QuentContext | None = self.config[
+        quent_context: cudf_polars.quent.QuentConfig | None = self.config[
             "executor_options"
         ].get("quent_context")
         try:
@@ -1211,10 +1211,14 @@ class RayEngine(StreamingEngine):
             if not ray.is_initialized():
                 return
 
-            exit_refs = [a._exit.remote() for a in self._rank_actors]
+            exit_refs: list[ObjectRef[Any]] = [
+                a._exit.remote() for a in self._rank_actors
+            ]
             for ref in exit_refs:
                 try:
-                    exit_events = ray.get(ref)
+                    exit_events: list[cudf_polars.quent._runtime.BufferedEvent] = (
+                        ray.get(ref)
+                    )
                 except ray.exceptions.RayActorError:
                     pass  # expected: exit_actor() terminates the process immediately
                 except Exception as e:

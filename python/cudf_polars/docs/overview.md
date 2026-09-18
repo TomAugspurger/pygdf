@@ -707,9 +707,9 @@ import cudf_polars.quent
 # Works with any of the streaming engines, e.g. SPMDEngine
 from cudf_polars.engine.spmd import SPMDEngine
 
-quent_context = cudf_polars.quent.QuentContext(
-    query_group=cudf_polars.quent.QueryGroup(instance_name="test_query_group"),
-    query=cudf_polars.quent.Query(instance_name="test_query"),
+quent_context = cudf_polars.quent.QuentConfig(
+    query_group_name="test_query_group",
+    query_name="test_query",
 )
 
 with SPMDEngine(executor_options={"quent_context": quent_context}) as engine:
@@ -727,7 +727,7 @@ therefore defined in one place rather than assembled as Python dictionaries.
 
 The generated extension is built by the Maturin project under
 `python/cudf_polars/quent/bridge`. Tracing is optional: constructing a
-`QuentContext` does not load the extension, but enabling it on an engine requires
+`QuentConfig` does not load the extension, but enabling it on an engine requires
 the extension to be installed.
 
 Trace archives include build provenance embedded by the generated extension.
@@ -737,10 +737,10 @@ the query-engine viewer entry used by `quent-open`.
 
 Ranks need to coordinate on the creation of some entities. For example, each
 actor in a `RayEngine` needs to use the same `engine_id` so that plans can be
-associated with the engine correctly. We store these types of worker-independent
-entities on a new `QuentContext` class, which is provided to the engine via
-`StreamingExecutor.quent_context`. `LocalQuentContext` combines those shared
-identities with rank-local generated handles and resources.
+associated with the engine correctly. `QuentConfig` carries these shared UUIDs
+and display names and is provided through `StreamingExecutor.quent_context`.
+`LocalQuentContext` combines them with rank-local generated handles and resource
+UUIDs.
 
 Each rank has a `QuentSession` backed by Quent's generated callback exporter.
 The client engine has a separate session for engine-level events. This keeps

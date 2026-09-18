@@ -25,21 +25,26 @@ from cudf_polars.quent._runtime import QuentSession
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from cudf_polars.quent._runtime import QuentEvent
 
-def _generated_events() -> list[dict]:
+
+def _generated_events() -> list[QuentEvent]:
     session = QuentSession()
     identifier = uuid.uuid4()
-    session.init_engine(
-        identifier,
-        instance_name="test",
-        implementation={
-            "name": "cudf-polars",
-            "version": "test",
-            "backend": "spmd",
-            "custom_attributes": {"backend": "spmd"},
-        },
+    session._engines[identifier] = (
+        session.context.engine_observer()
+        .handle(identifier)
+        .init(
+            instance_name="test",
+            implementation={
+                "name": "cudf-polars",
+                "version": "test",
+                "backend": "spmd",
+                "custom_attributes": {"backend": "spmd"},
+            },
+        )
     )
-    session.exit_engine(identifier)
+    session._engines.pop(identifier).exit()
     return [item["event"] for item in session.drain()]
 
 

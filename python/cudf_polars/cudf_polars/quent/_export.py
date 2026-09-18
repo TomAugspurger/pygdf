@@ -11,7 +11,10 @@ import zipfile
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
+
+    from cudf_polars.quent._runtime import QuentEvent
 
 SIDECAR_FILE_NAME = "model.qmi"
 EXTENSION = "ndjson"
@@ -55,7 +58,7 @@ def _model_qmi() -> dict[str, Any]:
     return json.loads(_quent.model_qmi())
 
 
-def to_export_line(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def to_export_line(event: QuentEvent) -> tuple[str, dict[str, Any]]:
     """Remove the umbrella entity wrapper used by generated callback events."""
     data = event["data"]
     if len(data) != 1:
@@ -69,7 +72,7 @@ def to_export_line(event: dict[str, Any]) -> tuple[str, dict[str, Any]]:
 
 
 def write_quent_export(
-    events: list[dict[str, Any]],
+    events: Sequence[QuentEvent],
     export_root: Path,
     context_id: uuid.UUID,
     quent_archive: Path,
