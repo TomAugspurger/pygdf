@@ -1,0 +1,30 @@
+[package]
+name = "cudf-polars-quent-analyzer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# quent-open's generated viewer pins quent to the sidecar's remote and full
+# commit SHA. Cargo keys git sources on the rev spelling, so an abbreviated rev
+# here would build a second copy of these crates and the two `QuentViewer`
+# traits would not unify.
+[dependencies]
+quent-analyzer = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2" }
+quent-events = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2", features = ["serde"] }
+quent-io = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2", default-features = false }
+quent-query-engine-analyzer = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2" }
+quent-query-engine-ui = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2" }
+quent-store = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2", default-features = false, features = ["io-ndjson"] }
+quent-time = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2" }
+quent-ui = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde"] }
+
+[build-dependencies]
+quent-store-build = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2" }
+quent-yaml = { git = "https://github.com/rapidsai/quent", rev = "7aab75e18b862bee9ed82910ef9da33581c8cca2" }
+
+[dev-dependencies]
+tempfile = "3"
