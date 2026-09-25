@@ -30,5 +30,4 @@ set -u
 
 rapids-print-env
 
-rapids-logger "Check cudf-polars Quent bridge"
 exec ./ci/run_cudf_polars_quent_tests.sh
