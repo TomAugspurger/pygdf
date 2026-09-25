@@ -123,6 +123,29 @@ def test_custom_schema_events(
     if LOG_TRACES:
         assert _of_type(events, "Evaluate")
 
+    received = [
+        event
+        for event in _of_type(events, "DataChannel")
+        if "Received" in event["data"]["DataChannel"]
+    ]
+    if engine_with_quent_context.nranks > 1:
+        declarations = {
+            event["id"]: event["data"]["DataChannel"]["Declared"]
+            for event in _of_type(events, "DataChannel")
+            if "Declared" in event["data"]["DataChannel"]
+        }
+        assert received
+        for event in received:
+            values = event["data"]["DataChannel"]["Received"]
+            declaration = declarations[event["id"]]
+            assert declaration["channel_type"] == "inter-rank"
+            assert values["source_rank"] == declaration["source_rank"]
+            assert values["target_rank"] == declaration["target_rank"]
+            assert values["metadata_bytes"] + values["payload_bytes"] > 0
+            assert values["completion_timestamp_ns"] > 0
+    else:
+        assert not received
+
 
 def test_multiple_collects_get_distinct_queries_and_plans(
     engine_with_quent_context: StreamingEngine,

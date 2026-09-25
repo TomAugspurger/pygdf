@@ -462,6 +462,7 @@ def _setup_worker(
             )
         )
         worker_resources.declare(quent_session)
+        comm.progress_thread.enable_transfer_events()
     else:
         quent_session = None
         worker_resources = None
@@ -488,6 +489,13 @@ def _close_quent_worker(
     assert dask_worker is not None
     mp_ctx: _WorkerContext = getattr(dask_worker, f"_cudf_polars_mp_context_{uid}")
     if mp_ctx.quent_session is not None:
+        assert mp_ctx.comm is not None
+        assert mp_ctx.worker_resources is not None
+        progress_thread = mp_ctx.comm.progress_thread
+        progress_thread.disable_transfer_events()
+        mp_ctx.worker_resources.emit_transfer_events(
+            mp_ctx.quent_session, progress_thread.drain_transfer_events()
+        )
         mp_ctx.quent_session._workers.pop(mp_ctx.quent_worker_id).exit()
         mp_ctx.quent_session.close()
         mp_ctx.quent_session = None

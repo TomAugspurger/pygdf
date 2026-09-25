@@ -22,6 +22,7 @@ from cudf_polars.quent._context import (  # noqa: E402
     ProcessorRegistry,
     QuentContext,
     WorkerResources,
+    rank_pair_channel_id,
 )
 from cudf_polars.quent._plan import (  # noqa: E402
     _emit_operator_details,
@@ -219,6 +220,53 @@ def test_inter_rank_channel_targets_remote_memory(
     )
     assert channel["source"]["target"] == str(rank0.device_memory_id)
     assert channel["target"]["target"] == str(rank1.device_memory_id)
+    assert channel["source_rank"] == 0
+    assert channel["target_rank"] == 1
+    assert rank0.link_channel_ids[1] == rank_pair_channel_id(engine_id, 0, 1)
+
+
+def test_received_transfer_uses_sender_channel(
+    monkeypatch: pytest.MonkeyPatch, output_root: Path
+) -> None:
+    from rapidsmpf.memory.buffer import MemoryType
+    from rapidsmpf.progress_thread import CollectiveKind, TransferEvent
+
+    monkeypatch.setattr(
+        "cudf_polars.quent._context.get_total_device_memory", lambda: 1024
+    )
+    engine_id = uuid.uuid4()
+    receiver = WorkerResources.build("rank-1", engine_id, uuid.uuid4(), 1, 2)
+    session = QuentSession(output_root)
+    receiver.emit_transfer_events(
+        session,
+        [
+            TransferEvent(
+                op_id=17,
+                collective_kind=CollectiveKind.ALLGATHER,
+                source_rank=0,
+                destination_rank=1,
+                message_id=23,
+                metadata_bytes=29,
+                payload_bytes=31,
+                destination_memory_type=MemoryType.PINNED_HOST,
+                completion_timestamp_ns=37,
+            )
+        ],
+    )
+
+    [event] = _finish(session, output_root)
+    assert event["id"] == str(rank_pair_channel_id(engine_id, 0, 1))
+    assert event["data"]["DataChannel"]["Received"] == {
+        "collective_id": 17,
+        "collective_kind": "ALLGATHER",
+        "source_rank": 0,
+        "target_rank": 1,
+        "message_id": 23,
+        "metadata_bytes": 29,
+        "payload_bytes": 31,
+        "destination_memory_type": "PINNED_HOST",
+        "completion_timestamp_ns": 37,
+    }
 
 
 def test_operator_details_preserve_static_types() -> None:

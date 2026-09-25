@@ -850,7 +850,7 @@ def allgather_stats(
     return StatsCollector.deserialize(json.loads(all_data[0]), ir)
 
 
-def evaluate_on_rank(
+def _evaluate_on_rank_impl(
     ctx: Context,
     comm: Communicator,
     py_executor: ThreadPoolExecutor,
@@ -981,6 +981,34 @@ def evaluate_on_rank(
             quent_operator_map=quent_operator_map,
             local_quent_context=local_quent_context,
         )
+
+
+def evaluate_on_rank(
+    ctx: Context,
+    comm: Communicator,
+    py_executor: ThreadPoolExecutor,
+    ir: IR,
+    config_options: ConfigOptions[StreamingExecutor],
+    *,
+    collect_metadata: bool = False,
+    local_quent_context: LocalQuentContext | None = None,
+    query_id: uuid.UUID,
+) -> tuple[DataFrame, list[ChannelMetadata]]:
+    """Evaluate a Polars IR plan and flush inter-rank telemetry afterward."""
+    try:
+        return _evaluate_on_rank_impl(
+            ctx,
+            comm,
+            py_executor,
+            ir,
+            config_options,
+            collect_metadata=collect_metadata,
+            local_quent_context=local_quent_context,
+            query_id=query_id,
+        )
+    finally:
+        if local_quent_context is not None:
+            local_quent_context.drain_transfer_events(comm.progress_thread)
 
 
 def is_duplicated_output(metadata: list[ChannelMetadata] | None) -> bool:

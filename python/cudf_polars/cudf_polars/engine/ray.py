@@ -394,11 +394,19 @@ class RankActor:
             nranks=self._nranks,
         )
         self.worker_resources.declare(self._quent_session)
+        self._comm.progress_thread.enable_transfer_events()
 
     def close_quent(self) -> None:
         """Close this rank's filesystem exporter after its Worker exit."""
         if self._quent_session is None:
             return
+        assert self._comm is not None
+        assert self.worker_resources is not None
+        progress_thread = self._comm.progress_thread
+        progress_thread.disable_transfer_events()
+        self.worker_resources.emit_transfer_events(
+            self._quent_session, progress_thread.drain_transfer_events()
+        )
         self._quent_session._workers.pop(self._worker_id).exit()
         self._quent_session.close()
 

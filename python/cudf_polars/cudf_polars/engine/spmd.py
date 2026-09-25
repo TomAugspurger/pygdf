@@ -566,6 +566,7 @@ class SPMDEngine(StreamingEngine):
                     nranks=comm.nranks,
                 )
                 worker_resources.declare(self._quent_session)
+                comm.progress_thread.enable_transfer_events()
 
             self._worker_resources = worker_resources
 
@@ -940,6 +941,13 @@ class SPMDEngine(StreamingEngine):
         # Clear the references only after shutdown completes.
 
         if self._quent_session is not None:
+            assert self._comm is not None
+            assert self._worker_resources is not None
+            progress_thread = self._comm.progress_thread
+            progress_thread.disable_transfer_events()
+            self._worker_resources.emit_transfer_events(
+                self._quent_session, progress_thread.drain_transfer_events()
+            )
             self._quent_session._workers.pop(self._quent_worker_id).exit()
 
         quent_context: cudf_polars.quent.QuentContext | None = self.config[

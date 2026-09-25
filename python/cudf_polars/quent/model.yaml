@@ -220,9 +220,23 @@ entities:
           instance_name: string
           channel_type: string
           worker: { scope-ref: Worker }
+          source_rank: u64
+          target_rank: u64
           # Channels may connect either storage or device-memory endpoints.
           source: ref
           target: ref
+      received:
+        multi: true
+        attributes:
+          collective_id: u64
+          collective_kind: string
+          source_rank: u64
+          target_rank: u64
+          message_id: u64
+          metadata_bytes: u64
+          payload_bytes: u64
+          destination_memory_type: string
+          completion_timestamp_ns: u64
 
 fsms:
   Engine:

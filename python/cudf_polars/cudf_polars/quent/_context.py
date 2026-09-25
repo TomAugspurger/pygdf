@@ -23,6 +23,8 @@ from cudf_polars.utils.config import (
 if TYPE_CHECKING:
     from typing import Self
 
+    from rapidsmpf.progress_thread import ProgressThread, TransferEvent
+
     from cudf_polars.containers import DataFrame
     from cudf_polars.dsl.ir import IR
     from cudf_polars.utils.config import ConfigOptions, StreamingExecutor
@@ -34,7 +36,22 @@ __all__ = [
     "QuentIRExecutionContext",
     "QuentSession",
     "WorkerResources",
+    "rank_pair_channel_id",
 ]
+
+
+def _worker_namespace(engine_id: uuid.UUID, rank: int) -> uuid.UUID:
+    """Return the deterministic namespace for a worker rank."""
+    return uuid.uuid5(engine_id, f"worker:{rank}")
+
+
+def rank_pair_channel_id(
+    engine_id: uuid.UUID, source_rank: int, target_rank: int
+) -> uuid.UUID:
+    """Return the directed inter-rank channel ID for a rank pair."""
+    return uuid.uuid5(
+        _worker_namespace(engine_id, source_rank), f"channel:{target_rank}"
+    )
 
 
 class ProcessorRegistry:
@@ -259,7 +276,7 @@ class WorkerResources:
         rank: int,
         nranks: int,
     ) -> Self:
-        namespace = uuid.uuid5(engine_id, f"worker:{rank}")
+        namespace = _worker_namespace(engine_id, rank)
 
         return cls(
             engine_id=engine_id,
@@ -273,7 +290,7 @@ class WorkerResources:
             filesystem_id=uuid.uuid5(namespace, "filesystem"),
             disk_to_device_channel_id=uuid.uuid5(namespace, "disk-to-device"),
             link_channel_ids={
-                target_rank: uuid.uuid5(namespace, f"channel:{target_rank}")
+                target_rank: rank_pair_channel_id(engine_id, rank, target_rank)
                 for target_rank in range(nranks)
                 if target_rank != rank
             },
@@ -298,6 +315,8 @@ class WorkerResources:
             instance_name=f"{self.instance_suffix} disk -> device",
             channel_type="disk-to-device",
             worker=self.worker_id,
+            source_rank=self.rank,
+            target_rank=self.rank,
             source=self.filesystem_id,
             target=self.device_memory_id,
         )
@@ -306,11 +325,34 @@ class WorkerResources:
                 instance_name=f"rank-{self.rank} -> rank-{target_rank}",
                 channel_type="inter-rank",
                 worker=self.worker_id,
+                source_rank=self.rank,
+                target_rank=target_rank,
                 source=self.device_memory_id,
                 target=uuid.uuid5(
-                    uuid.uuid5(self.engine_id, f"worker:{target_rank}"),
+                    _worker_namespace(self.engine_id, target_rank),
                     "device-memory",
                 ),
+            )
+
+    def emit_transfer_events(
+        self, session: QuentSession, transfer_events: list[TransferEvent]
+    ) -> None:
+        """Emit drained RapidsMPF receive-completion records."""
+        for event in transfer_events:
+            source_rank = int(event.source_rank)
+            target_rank = int(event.destination_rank)
+            session.context.data_channel_observer().handle(
+                rank_pair_channel_id(self.engine_id, source_rank, target_rank)
+            ).received(
+                collective_id=int(event.op_id),
+                collective_kind=event.collective_kind.name,
+                source_rank=source_rank,
+                target_rank=target_rank,
+                message_id=int(event.message_id),
+                metadata_bytes=int(event.metadata_bytes),
+                payload_bytes=int(event.payload_bytes),
+                destination_memory_type=event.destination_memory_type.name,
+                completion_timestamp_ns=int(event.completion_timestamp_ns),
             )
 
 
@@ -327,6 +369,13 @@ class LocalQuentContext:
     def get_or_declare_processor(self, thread_ident: int) -> uuid.UUID:
         return self.worker_resources.processor_registry.get_or_declare_processor(
             self.session, thread_ident, self.worker_resources.thread_pool_id
+        )
+
+    def drain_transfer_events(self, progress_thread: ProgressThread) -> None:
+        """Drain and emit this worker's completed collective receives."""
+        self.worker_resources.emit_transfer_events(
+            self.session,
+            progress_thread.drain_transfer_events(),
         )
 
 
