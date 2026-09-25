@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import functools
 import io
 import math
@@ -203,7 +202,9 @@ async def dataframescan_node(
         chs_out=(ch_out,),
         trace_ir=ir,
         ir_context=ir_context,
-    ) as tracer:
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         # Find local partition count.
         nrows = ir.df.shape()[0]
         global_count = math.ceil(nrows / rows_per_partition) if nrows > 0 else 0
@@ -310,14 +311,13 @@ async def dataframescan_node(
                 )
             await ch_out.drain(context)
 
-        async with (
-            shutdown_on_error(
-                context,
-                chs_aux=lineariser.input_channels,
-                trace_ir=ir,
-                ir_context=ir_context,
-            ),
-        ):
+        async with shutdown_on_error(
+            context,
+            chs_aux=lineariser.input_channels,
+            trace_ir=ir,
+            ir_context=ir_context,
+        ) as inner_actor_scope:
+            ir_context = inner_actor_scope.require_ir_context()
             await gather_in_task_group(
                 lineariser.drain(),
                 *(_producer(i) for i in range(num_producers)),
@@ -459,7 +459,9 @@ async def python_scan_node(
         chs_out=(ch_out,),
         trace_ir=ir,
         ir_context=ir_context,
-    ) as tracer:
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         rank_aware_source = _find_rank_aware_source(ir.options[0])
         if rank_aware_source is None and comm.nranks > 1 and comm.rank != 0:
             # A plain (rank-unaware) source runs on rank 0 only; other ranks
@@ -658,9 +660,10 @@ async def scan_node(
         chs_out=(ch_out,),
         trace_ir=ir,
         ir_context=ir_context,
-    ) as tracer:
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         # Send basic metadata
-        ir_context = dataclasses.replace(ir_context, tracer=tracer)
         await send_metadata(
             ch_out,
             context,
@@ -714,14 +717,13 @@ async def scan_node(
                 )
             await ch_out.drain(context)
 
-        async with (
-            shutdown_on_error(
-                context,
-                chs_aux=lineariser.input_channels,
-                trace_ir=ir,
-                ir_context=ir_context,
-            ),
-        ):
+        async with shutdown_on_error(
+            context,
+            chs_aux=lineariser.input_channels,
+            trace_ir=ir,
+            ir_context=ir_context,
+        ) as inner_actor_scope:
+            ir_context = inner_actor_scope.require_ir_context()
             await gather_in_task_group(
                 lineariser.drain(),
                 *(_producer(i) for i in range(num_producers)),
@@ -809,7 +811,8 @@ async def sink_node(
         chs_out=(ch_out,),
         ir_context=ir_context,
         trace_ir=ir,
-    ):
+    ) as actor_scope:
+        ir_context = actor_scope.require_ir_context()
         metadata = await recv_metadata(ch_in, context)
         await send_metadata(
             ch_out, context, ChannelMetadata(local_count=1, duplicated=True)
