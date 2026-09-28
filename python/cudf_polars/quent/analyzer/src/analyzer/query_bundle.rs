@@ -85,7 +85,10 @@ impl CudfPolarsUiAnalyzer {
                         kind: CapacityKind::Rate,
                         quantity: "bytes".to_owned(),
                     }],
-                    used_by: vec![EVALUATE_ENTITY_TYPE.to_owned()],
+                    // Data channels are used both by Evaluate spans for local
+                    // I/O and by standalone inter-rank receive events. Leaving
+                    // this unfiltered makes the UI request their aggregate.
+                    used_by: vec![],
                 },
             ),
         ]

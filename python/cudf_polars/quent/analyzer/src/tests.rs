@@ -17,11 +17,11 @@ use uuid::Uuid;
 use crate::{
     CudfPolarsUiAnalyzer, Viewer,
     generated::{
-        ActorEvent, CudfPolars, CudfPolarsEvent, EngineEvent, EvaluateEvent, Implementation,
-        OperatorEvent, OperatorStatistics, PlanEvent, ProcessorEvent, QueryEvent, QueryGroupEvent,
-        ThreadPoolEvent, WorkerEvent,
+        ActorEvent, CudfPolars, CudfPolarsEvent, DataChannelEvent, EngineEvent, EvaluateEvent,
+        Implementation, OperatorEvent, OperatorStatistics, PlanEvent, ProcessorEvent, QueryEvent,
+        QueryGroupEvent, ThreadPoolEvent, WorkerEvent,
     },
-    resource::{EVALUATE_ENTITY_TYPE, PROCESSOR_RESOURCE_TYPE},
+    resource::{DATA_CHANNEL_RESOURCE_TYPE, EVALUATE_ENTITY_TYPE, PROCESSOR_RESOURCE_TYPE},
 };
 
 #[test]
@@ -35,6 +35,7 @@ fn builds_query_bundle_from_generated_events() {
     let actor_id = Uuid::now_v7();
     let thread_pool_id = Uuid::now_v7();
     let processor_id = Uuid::now_v7();
+    let channel_id = Uuid::now_v7();
     let evaluate_id = Uuid::now_v7();
     let events = vec![
         Event::new(
@@ -126,6 +127,19 @@ fn builds_query_bundle_from_generated_events() {
             }),
         ),
         Event::new(
+            channel_id,
+            8,
+            CudfPolarsEvent::DataChannel(DataChannelEvent::Declared {
+                instance_name: "rank-0 -> rank-1".to_owned(),
+                channel_type: "inter-rank".to_owned(),
+                worker: EntityRef::new(worker_id, ()),
+                source_rank: 0,
+                target_rank: 1,
+                source: EntityRef::new(worker_id, ()),
+                target: EntityRef::new(worker_id, ()),
+            }),
+        ),
+        Event::new(
             actor_id,
             9,
             CudfPolarsEvent::Actor(ActorEvent::Started {
@@ -165,6 +179,21 @@ fn builds_query_bundle_from_generated_events() {
             CudfPolarsEvent::Evaluate(EvaluateEvent::Completed {
                 seq: 2,
                 output_bytes: 20,
+            }),
+        ),
+        Event::new(
+            channel_id,
+            19,
+            CudfPolarsEvent::DataChannel(DataChannelEvent::Received {
+                collective_id: 17,
+                collective_kind: "ALLGATHER".to_owned(),
+                source_rank: 0,
+                target_rank: 1,
+                message_id: 23,
+                metadata_bytes: 29,
+                payload_bytes: 31,
+                destination_memory_type: "PINNED_HOST".to_owned(),
+                completion_timestamp_ns: 15,
             }),
         ),
         Event::new(
@@ -217,6 +246,7 @@ fn builds_query_bundle_from_generated_events() {
             .is_some()
     );
     assert!(bundle.entities.resources.contains_key(&processor_id));
+    assert!(bundle.entities.resources.contains_key(&channel_id));
     assert!(
         bundle
             .entities
@@ -228,6 +258,17 @@ fn builds_query_bundle_from_generated_events() {
             .entities
             .resource_types
             .contains_key(PROCESSOR_RESOURCE_TYPE)
+    );
+    assert!(
+        bundle
+            .entities
+            .resource_types
+            .contains_key(DATA_CHANNEL_RESOURCE_TYPE)
+    );
+    assert!(
+        bundle.entities.resource_types[DATA_CHANNEL_RESOURCE_TYPE]
+            .used_by
+            .is_empty()
     );
     assert!(bundle.entities.fsm_types.contains_key(EVALUATE_ENTITY_TYPE));
 
@@ -275,6 +316,39 @@ fn builds_query_bundle_from_generated_events() {
     assert_eq!(timeline.long_fsms.len(), 1);
     assert_eq!(timeline.long_fsms[0].id, evaluate_id);
     assert_eq!(timeline.long_fsms[0].instance_name, "Scan-evaluate");
+
+    let response = analyzer
+        .bulk_resource_timeline(BulkTimelineRequest {
+            entries: [(
+                "channel:transfer".to_owned(),
+                TimelineRequest::Resource(quent_ui::timeline::request::ResourceTimelineRequest {
+                    resource_id: channel_id,
+                    long_entities_threshold_s: None,
+                    entity_filter: quent_ui::timeline::request::EntityFilter {
+                        entity_type_name: None,
+                    },
+                    application: OperatorFilter {
+                        operator_ids: vec![],
+                    },
+                    config: quent_ui::timeline::request::TimelineConfig {
+                        num_bins: 4,
+                        start: 0.0,
+                        end: 20e-9,
+                    },
+                }),
+            )]
+            .into_iter()
+            .collect(),
+            app_params: QueryFilter { query_id },
+        })
+        .unwrap();
+    let BulkTimelinesResponseEntry::Ok { data, .. } = &response.entries["channel:transfer"] else {
+        panic!("transfer timeline entry failed")
+    };
+    let UiResourceTimeline::Binned(timeline) = data else {
+        panic!("expected an aggregate transfer timeline")
+    };
+    assert_eq!(timeline.capacities_values["bytes"], [0.0, 0.0, 12.0, 0.0]);
 
     let entities = analyzer
         .list_entities(EntityListRequest {

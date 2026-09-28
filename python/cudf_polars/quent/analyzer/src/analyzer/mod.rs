@@ -30,6 +30,7 @@ use crate::{
     generated::CudfPolarsEvent,
     model::CudfPolarsModel,
     resource::{DeclaredResource, DeclaredResourceGroup},
+    transfer::TransferUsage,
 };
 
 /// Query-engine UI adapter for the schema-generated cudf-polars event model.
@@ -37,6 +38,7 @@ pub struct CudfPolarsUiAnalyzer {
     pub(super) model: CudfPolarsModel,
     pub(super) actors: Vec<ActorSpan>,
     pub(super) evaluates: Vec<EvaluateSpan>,
+    pub(super) transfers: Vec<TransferUsage>,
     pub(super) resources: HashMap<Uuid, DeclaredResource>,
     pub(super) resource_groups: HashMap<Uuid, DeclaredResourceGroup>,
 }

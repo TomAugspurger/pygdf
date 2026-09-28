@@ -234,6 +234,8 @@ def test_received_transfer_uses_sender_channel(
     monkeypatch.setattr(
         "cudf_polars.quent._context.get_total_device_memory", lambda: 1024
     )
+    monkeypatch.setattr("cudf_polars.quent._context.time.time_ns", lambda: 2000)
+    monkeypatch.setattr("cudf_polars.quent._context.time.monotonic_ns", lambda: 1000)
     engine_id = uuid.uuid4()
     receiver = WorkerResources.build("rank-1", engine_id, uuid.uuid4(), 1, 2)
     session = QuentSession(output_root)
@@ -265,7 +267,7 @@ def test_received_transfer_uses_sender_channel(
         "metadata_bytes": 29,
         "payload_bytes": 31,
         "destination_memory_type": "PINNED_HOST",
-        "completion_timestamp_ns": 37,
+        "completion_timestamp_ns": 1037,
     }
 
 

@@ -18,6 +18,7 @@ use crate::{
         DATA_CHANNEL_RESOURCE_TYPE, DeclaredResource, DeclaredResourceGroup,
         PROCESSOR_RESOURCE_TYPE,
     },
+    transfer::TransferUsage,
 };
 
 impl CudfPolarsUiAnalyzer {
@@ -28,6 +29,7 @@ impl CudfPolarsUiAnalyzer {
         let mut builder = CudfPolarsModelBuilder::try_new(engine_id)?;
         let mut actor_builders = HashMap::<Uuid, ActorBuilder>::new();
         let mut evaluate_builders = HashMap::<Uuid, EvaluateBuilder>::new();
+        let mut transfers = Vec::new();
         let mut resources = HashMap::new();
         let mut resource_groups = HashMap::new();
         for event in events {
@@ -87,6 +89,20 @@ impl CudfPolarsUiAnalyzer {
                         },
                     );
                 }
+                CudfPolarsEvent::DataChannel(DataChannelEvent::Received {
+                    metadata_bytes,
+                    payload_bytes,
+                    completion_timestamp_ns,
+                    ..
+                }) => {
+                    transfers.push(TransferUsage::new(
+                        event.id,
+                        event.timestamp,
+                        *completion_timestamp_ns,
+                        *metadata_bytes,
+                        *payload_bytes,
+                    ));
+                }
                 _ => {}
             }
             builder.try_push(event)?;
@@ -115,6 +131,7 @@ impl CudfPolarsUiAnalyzer {
             model,
             actors,
             evaluates,
+            transfers,
             resources,
             resource_groups,
         })

@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -338,6 +339,7 @@ class WorkerResources:
         self, session: QuentSession, transfer_events: list[TransferEvent]
     ) -> None:
         """Emit drained RapidsMPF receive-completion records."""
+        steady_to_unix_ns = time.time_ns() - time.monotonic_ns()
         for event in transfer_events:
             source_rank = int(event.source_rank)
             target_rank = int(event.destination_rank)
@@ -352,7 +354,9 @@ class WorkerResources:
                 metadata_bytes=int(event.metadata_bytes),
                 payload_bytes=int(event.payload_bytes),
                 destination_memory_type=event.destination_memory_type.name,
-                completion_timestamp_ns=int(event.completion_timestamp_ns),
+                completion_timestamp_ns=(
+                    steady_to_unix_ns + int(event.completion_timestamp_ns)
+                ),
             )
 
 

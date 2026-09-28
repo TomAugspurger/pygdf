@@ -6,6 +6,7 @@ mod analyzer;
 mod evaluate;
 mod model;
 mod resource;
+mod transfer;
 mod viewer;
 
 mod generated {

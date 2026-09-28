@@ -201,6 +201,15 @@ impl CudfPolarsUiAnalyzer {
                     })?;
                 }
             }
+            if resource_type_name == DATA_CHANNEL_RESOURCE_TYPE {
+                for transfer in self
+                    .transfers
+                    .iter()
+                    .filter(|transfer| selected_resource_ids.contains(&transfer.channel_id))
+                {
+                    builder.try_push(&transfer)?;
+                }
+            }
             let result = builder.build();
             let long_fsms = result
                 .long_entities
