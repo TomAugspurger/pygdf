@@ -777,7 +777,12 @@ class RunConfig:
             "records": {
                 k: [dataclasses.asdict(r) for r in v] for k, v in self.records.items()
             },
-            "plans": {},
+            "plans": {
+                k: dataclasses.asdict(v)
+                if dataclasses.is_dataclass(v) and not isinstance(v, type)
+                else v
+                for k, v in self.plans.items()
+            },
             "versions": dataclasses.asdict(self.versions),
             "hardware": dataclasses.asdict(self.hardware),
             "validation_method": dataclasses.asdict(self.validation_method)
@@ -1412,9 +1417,26 @@ def _finalize_benchmark_run(
     serializable_engine_config["startup_duration_ms"] = startup_duration_ms
     serializable_engine_config["shutdown_duration_ms"] = shutdown_duration_ms
 
-    args.output.write(json.dumps(serializable_engine_config))
-    args.output.write("\n")
+    _write_benchmark_output(args, serializable_engine_config)
     sys.exit(benchmark_exit_code(query_failures, validation_failures))
+
+
+def _write_benchmark_output(
+    args: argparse.Namespace, serialized_run: dict[str, Any]
+) -> None:
+    """Write a benchmark run in the selected reporting format."""
+    if args.output_format == "legacy":
+        report = serialized_run
+    else:
+        from cudf_polars.streaming.benchmarks.reporting import build_report
+
+        report = build_report(
+            serialized_run,
+            output_path=Path(args.output.name),
+            artifact_directory=args.artifact_directory,
+        )
+    args.output.write(json.dumps(report))
+    args.output.write("\n")
 
 
 def run_polars_cpu(
@@ -2091,8 +2113,7 @@ def run_duckdb(duckdb_queries_cls: Any, args: argparse.Namespace) -> None:
     if args.summarize:
         run_config.summarize()
 
-    args.output.write(json.dumps(run_config.serialize(engine=None, quent_archive=None)))
-    args.output.write("\n")
+    _write_benchmark_output(args, run_config.serialize(engine=None, quent_archive=None))
 
 
 def check_input_data_type(
@@ -2296,6 +2317,24 @@ def build_parser(num_queries: int = 22) -> argparse.ArgumentParser:
         type=argparse.FileType("at"),
         default="pdsh_results.jsonl",
         help="Output file path.",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=["v2", "legacy"],
+        default="v2",
+        help=(
+            "Benchmark reporting format. 'v2' writes an API-shaped record and "
+            "artifact sidecars (default); 'legacy' preserves the old records format."
+        ),
+    )
+    parser.add_argument(
+        "--artifact-directory",
+        type=Path,
+        default=None,
+        help=(
+            "Directory for v2 trace, plan, and raw JSON artifacts. Defaults to "
+            "'<output stem>.assets' beside the output file."
+        ),
     )
     parser.add_argument(
         "--summarize",

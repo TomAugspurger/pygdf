@@ -218,3 +218,41 @@ def test_no_io_skips_the_io_section(report: Callable[..., str]) -> None:
     out = report(_run(_record(io_summaries={"0": _summary()})), args=("--no-io",))
     assert "Timings" in out
     assert "I/O per rank" not in out
+
+
+def test_prints_schema_v2_runs(report: Callable[..., str]) -> None:
+    """The results viewer accepts the API-shaped reporting format."""
+    run = {
+        "schema_version": 2,
+        "run_id": "v2",
+        "run_at": "2026-01-01T00:00:00+00:00",
+        "query_engine": {"engine_name": "cudf-polars"},
+        "gpu_count": 2,
+        "extra_info": {
+            "frontend": "ray",
+            "dataset_path": "/data",
+            "scale_factor": 10,
+            "iterations": 1,
+        },
+        "query_logs": [
+            {
+                "query_name": "1",
+                "execution_order": 0,
+                "runtime_ms": 250,
+                "status": "success",
+                "extra_info": {
+                    "iteration": 0,
+                    "io_summaries": {"0": _summary()},
+                },
+                "validation_result": {
+                    "status": "passed",
+                    "message": None,
+                    "details": None,
+                },
+            }
+        ],
+    }
+    out = report(run)
+    assert "v2" in out
+    assert "0.2500s" in out
+    assert "POSIX" in out

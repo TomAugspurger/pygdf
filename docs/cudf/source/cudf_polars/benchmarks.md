@@ -95,26 +95,62 @@ python -m cudf_polars.streaming.benchmarks.pdsh all \
 ### Results
 
 Results are written to `pdsh_results.jsonl` in the current directory by default (override with `-o`).
-Each run appends one JSON line containing metadata and a `records` field with per-query,
-per-iteration timings:
+Each run appends one schema-v2 JSON line shaped like a benchmark API submission:
 
 ```json
 {
-  "engine_name": "cudf-polars",
-  "frontend": "spmd",
-  "dataset_path": "data/tables/scale-1000.0",
-  "scale_factor": 1000,
-  "records": {
-    "1": [
-      {"query": 1, "iteration": 0, "duration": 0.79, "status": "success"},
-      {"query": 1, "iteration": 1, "duration": 0.55, "status": "success"}
-    ]
-  }
+  "schema_version": 2,
+  "run_id": "b148d570-5f70-4f1f-b588-e0b9fe63aed8",
+  "cache_state": "warm",
+  "query_engine": {
+    "engine_name": "cudf-polars",
+    "version": "26.12.0",
+    "commit_hash": "..."
+  },
+  "run_at": "2026-09-29T12:00:00+00:00",
+  "gpu_count": 4,
+  "query_logs": [
+    {
+      "query_name": "1",
+      "execution_order": 0,
+      "runtime_ms": 790.0,
+      "status": "success",
+      "extra_info": {"iteration": 0}
+    }
+  ],
+  "artifacts": []
 }
 ```
 
-`duration` is in seconds. Running multiple frontends with the same `-o` file appends each as a
-separate line, making it easy to compare CPU and GPU results in one file.
+Runtimes are in milliseconds. General benchmark metadata that is not part of a
+submission, including the frontend, dataset, scale factor, package versions, and
+hardware details, is retained in `extra_info`.
+
+When tracing or plans are collected, upload-ready Parquet files and a raw JSON
+file are written to `<output stem>.assets/`. The `artifacts` manifest records
+their paths relative to the JSONL file together with upload names, media types,
+titles, and descriptions. Quent and nsys files supplied by the run are included
+in the same manifest.
+
+Deployment-specific fields are optional for local runs. Automated jobs can
+supply them through `--extra-info`, for example:
+
+```bash
+--extra-info '{
+  "sku_name": "h100",
+  "storage_configuration_name": "local-nvme",
+  "benchmark_definition_name": "pdsh-1000",
+  "node_count": 1,
+  "container_image": "registry/image:tag",
+  "identifier_hash": "environment-hash",
+  "cache_state": "warm"
+}'
+```
+
+Use `--artifact-directory` to choose another sidecar location. During the
+format transition, `--output-format legacy` writes the former `records` format;
+the result-file printer reads both formats. Running multiple frontends with the
+same `-o` file still appends each run as a separate line.
 
 ### Tuning
 

@@ -59,6 +59,49 @@ def load_runs(path: Path) -> list[dict[str, Any]]:
     return runs
 
 
+def normalize_run(run: dict[str, Any]) -> dict[str, Any]:
+    """Return a legacy-shaped view of either reporting schema version."""
+    if "records" in run:
+        return run
+    records: dict[str, list[dict[str, Any]]] = {}
+    for log in run["query_logs"]:
+        query = log["query_name"]
+        extra = log.get("extra_info") or {}
+        record: dict[str, Any] = {
+            "query": int(query),
+            "iteration": extra.get("iteration", 0),
+            "status": log.get("status", "success"),
+        }
+        runtime_ms = log.get("runtime_ms")
+        if runtime_ms is None:
+            runtime_ms = (log.get("metrics") or {}).get("runtime")
+        if runtime_ms is not None:
+            record["duration"] = runtime_ms / 1000
+        if validation := log.get("validation_result"):
+            record["validation_result"] = {
+                **validation,
+                "status": validation["status"].title(),
+            }
+        for key in ("statistics", "io_summaries", "traceback"):
+            if key in extra:
+                record[key] = extra[key]
+        records.setdefault(query, []).append(record)
+
+    engine = run.get("query_engine") or {}
+    extra = run.get("extra_info") or {}
+    return {
+        **run,
+        "timestamp": run.get("run_at"),
+        "engine_name": engine.get("engine_name"),
+        "frontend": extra.get("frontend"),
+        "dataset_path": extra.get("dataset_path"),
+        "scale_factor": extra.get("scale_factor"),
+        "n_workers": run.get("gpu_count"),
+        "iterations": extra.get("iterations"),
+        "records": records,
+    }
+
+
 def iter_records(run: dict[str, Any]) -> Iterator[SuccessRecord | FailedRecord]:
     """
     Yield every per-iteration record of a run, ordered by query then iteration.
@@ -72,6 +115,7 @@ def iter_records(run: dict[str, Any]) -> Iterator[SuccessRecord | FailedRecord]:
     ------
     The run's per-iteration records.
     """
+    run = normalize_run(run)
     for _, records in sorted(run["records"].items(), key=lambda kv: int(kv[0])):
         yield from map(record_from_dict, records)
 
@@ -85,6 +129,7 @@ def print_header(run: dict[str, Any]) -> None:
     run
         A single run, as returned by :func:`load_runs`.
     """
+    run = normalize_run(run)
     print(f"run       : {run.get('run_id')}  ({run.get('timestamp')})")
     print(f"engine    : {run.get('engine_name')}  frontend={run.get('frontend')}")
     print(f"dataset   : {run.get('dataset_path')}  scale={run.get('scale_factor')}")
@@ -100,6 +145,7 @@ def print_timings(run: dict[str, Any]) -> None:
     run
         A single run, as returned by :func:`load_runs`.
     """
+    run = normalize_run(run)
     print("\nTimings")
     print(f"  {'query':>6}  {'iters':>5}  {'min':>9}  {'max':>9}  {'mean':>9}")
     total = 0.0
