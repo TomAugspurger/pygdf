@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypeAlias, assert_never
 
 from cudf_streaming import CardinalityEstimator
@@ -32,10 +32,7 @@ from cudf_polars.dsl.utils.naming import names_to_indices
 from cudf_polars.streaming.actor_graph.collectives.allgather import (
     AllGatherManager,
 )
-from cudf_polars.streaming.actor_graph.collectives.ordering import (
-    _partition_range,
-    adjust_ordering,
-)
+from cudf_polars.streaming.actor_graph.collectives.ordering import adjust_ordering
 from cudf_polars.streaming.actor_graph.collectives.shuffle import (
     _global_shuffle,
     _key_column_indices,
@@ -83,7 +80,7 @@ from cudf_polars.streaming.filter_hint import (
     JoinWithPrefilter,
 )
 from cudf_polars.streaming.repartition import Repartition
-from cudf_polars.streaming.utils import _concat
+from cudf_polars.streaming.utils import _concat, partition_range
 
 if TYPE_CHECKING:
     from collections.abc import MutableMapping
@@ -265,8 +262,9 @@ async def broadcast_join_actor(
         chs_out=(ch_out,),
         trace_ir=ir,
         ir_context=ir_context,
-    ) as tracer:
-        ir_context = replace(ir_context, tracer=tracer)
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         await broadcast_join(
             context,
             comm,
@@ -978,7 +976,8 @@ async def _shuffle_join(
         chs_aux=(ch_left_shuffle, ch_right_shuffle),
         trace_ir=ir,
         ir_context=ir_context,
-    ):
+    ) as actor_scope:
+        ir_context = actor_scope.require_ir_context()
         actor_tasks = [
             _global_shuffle(
                 context,
@@ -1018,7 +1017,7 @@ async def _shuffle_join(
 def _local_count_for_ordering(comm: Communicator, ordering: Ordering) -> int:
     """Return this rank's local partition count for a contiguous Ordering."""
     npartitions = ordering.num_boundaries + 1
-    start, stop = _partition_range(comm.rank, comm.nranks, npartitions)
+    start, stop = partition_range(comm.rank, comm.nranks, npartitions)
     return stop - start
 
 
@@ -1139,7 +1138,8 @@ async def _ordered_join(
         chs_aux=(ch_left_adjusted, ch_right_adjusted),
         trace_ir=ir,
         ir_context=ir_context,
-    ):
+    ) as actor_scope:
+        ir_context = actor_scope.require_ir_context()
         await gather_in_task_group(
             _adjust_ordered_join_side(
                 context,
@@ -1726,8 +1726,9 @@ async def join_actor(
         chs_aux=ch_prefilter_domains,
         trace_ir=ir,
         ir_context=ir_context,
-    ) as tracer:
-        ir_context = replace(ir_context, tracer=tracer)
+    ) as actor_scope:
+        tracer = actor_scope.tracer
+        ir_context = actor_scope.require_ir_context()
         (
             left_metadata,
             right_metadata,
@@ -1790,7 +1791,8 @@ async def join_actor(
             chs_aux=(ch_left_replay, ch_right_replay, *prefilter_execution.channels),
             trace_ir=ir,
             ir_context=ir_context,
-        ):
+        ) as inner_actor_scope:
+            ir_context = inner_actor_scope.require_ir_context()
             actor_tasks = [
                 replay_buffered_channel(
                     context,

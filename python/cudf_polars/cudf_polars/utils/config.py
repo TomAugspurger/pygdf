@@ -27,6 +27,7 @@ import functools
 import importlib.util
 import json
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Generic, Literal, TypeVar
 
 import kvikio
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.engine.ray import RankActor
     from cudf_polars.quent._context import QuentContext, WorkerResources
-    from cudf_polars.quent._logging import QuentLogger
+    from cudf_polars.quent._runtime import QuentSession
 
 
 __all__ = [
@@ -68,6 +69,7 @@ __all__ = [
     "StreamingExecutor",
     "StreamingFallbackMode",
     "Unspecified",
+    "resolve_quent_output_root",
 ]
 
 
@@ -557,6 +559,22 @@ def _quent_context_converter(v: str) -> QuentContext | None:
             return None
 
 
+def resolve_quent_output_root(output_root: str | os.PathLike[str] | None = None) -> str:
+    """
+    Resolve the controller-local staging root for collected Quent events.
+
+    An explicit value takes precedence over
+    ``CUDF_POLARS__EXECUTOR__QUENT_OUTPUT_ROOT``, which in turn defaults to
+    ``logs/.quent-events``. Relative paths are resolved in the process creating
+    the Quent configuration before its Collector is started.
+    """
+    if output_root is None:
+        output_root = os.environ.get(
+            "CUDF_POLARS__EXECUTOR__QUENT_OUTPUT_ROOT", "logs/.quent-events"
+        )
+    return str(Path(output_root).resolve())
+
+
 @dataclasses.dataclass(frozen=True)
 class ParquetOptions:
     """
@@ -723,10 +741,10 @@ def default_broadcast_limit(min_device_size: int | None) -> int:
 @dataclasses.dataclass(frozen=True)
 class DynamicPlanningOptions:
     """
-    Configuration for dynamic shuffle planning.
+    Configuration for runtime planning decisions.
 
-    When enabled, shuffle decisions for GroupBy/Join/Unique operations
-    are made at runtime by sampling real chunks.
+    When enabled, the streaming executor may make selected planning decisions
+    at runtime using metadata or sampled chunks.
 
     To enable dynamic planning, pass a ``DynamicPlanningOptions`` instance
     to ``StreamingExecutor(dynamic_planning=...)``. To disable it, pass
@@ -740,6 +758,12 @@ class DynamicPlanningOptions:
     sample_chunk_count
         The maximum number of chunks to sample before making
         dynamic-planning decisions. Default is 2.
+    infer_ordering
+        Whether to infer scan ordering from input metadata. Parquet scans use
+        footer min/max statistics. For floating-point columns, this assumes row
+        groups containing NaN values lack usable min/max statistics. Disable
+        this to skip footer decoding and collective communication, or to isolate
+        ordering inference in tests and benchmarks. Default is True.
     """
 
     _env_prefix = "CUDF_POLARS__EXECUTOR__DYNAMIC_PLANNING"
@@ -749,12 +773,19 @@ class DynamicPlanningOptions:
             f"{_env_prefix}__SAMPLE_CHUNK_COUNT", int, default=2
         )
     )
+    infer_ordering: bool = dataclasses.field(
+        default_factory=_make_default_factory(
+            f"{_env_prefix}__INFER_ORDERING", _bool_converter, default=True
+        )
+    )
 
     def __post_init__(self) -> None:  # noqa: D105
         if not isinstance(self.sample_chunk_count, int):
             raise TypeError("sample_chunk_count must be an int")
         if self.sample_chunk_count < 1:
             raise ValueError("sample_chunk_count must be at least 1")
+        if not isinstance(self.infer_ordering, bool):
+            raise TypeError("infer_ordering must be a bool")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -981,7 +1012,7 @@ class SPMDContext:
     py_executor: ThreadPoolExecutor
     engine_id: uuid.UUID
     worker_id: uuid.UUID
-    quent_logger: QuentLogger | None
+    quent_session: QuentSession | None
     worker_resources: WorkerResources | None = None
 
 
@@ -1005,7 +1036,7 @@ class RayContext:
     """
 
     rank_actors: list[ActorHandle[RankActor]]
-    quent_logger: QuentLogger | None
+    quent_session: QuentSession | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1035,7 +1066,7 @@ class DaskContext:
 
     client: distributed.Client
     rapidsmpf_id: str
-    quent_logger: QuentLogger | None
+    quent_session: QuentSession | None
     owned_client: distributed.Client | None = None
     owned_cluster: Any | None = None
 
@@ -1207,7 +1238,9 @@ class StreamingExecutor:
         Pass a :class:`~cudf_polars.quent.QuentContext` instance to enable tracing.
         Can be set via the ``CUDF_POLARS__EXECUTOR__QUENT_CONTEXT`` environment
         variable (``true`` enables tracing with a default context, ``false``
-        disables it).
+        disables it). The controller-local Collector staging path can be set
+        with ``CUDF_POLARS__EXECUTOR__QUENT_OUTPUT_ROOT``; workers do not access
+        this path.
 
     Notes
     -----
@@ -1460,8 +1493,8 @@ class StreamingExecutor:
         # Hash the quent context UUIDs as ints
         quent_context = d["quent_context"]
         if quent_context is not None:
-            for key in ["engine", "query_group", "query"]:
-                quent_context[key]["id"] = int(quent_context[key]["id"])
+            quent_context["engine_id"] = int(quent_context["engine_id"])
+            quent_context["query_group_id"] = int(quent_context["query_group_id"])
             d["quent_context"] = json.dumps(quent_context)
         return hash(tuple(sorted(d.items())))
 
