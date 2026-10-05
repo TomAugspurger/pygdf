@@ -56,7 +56,9 @@ the `bridge` and `analyzer`. To update Quent:
    checkers can use the generated API from the installed distribution.
 
 
-4. Run the checks at `ci/run_cudf_polars_quent_tests.sh`.
+4. Run the CPU build and checks with `ci/build_cudf_polars_quent.sh`. The CI
+   integration job installs that wheel and runs the Python tests through
+   `ci/run_cudf_polars_quent_tests.sh` on a GPU runner.
 5. Commit and push the analyzer changes to the Git remote recorded in the
    bridge's build provenance. Rebuild the bridge after committing, then
    regenerate traces. `quent-open` checks out the analyzer package at the exact

@@ -7,24 +7,11 @@ set -euo pipefail
 # Support invoking this script outside the repository root.
 cd "$(dirname "$(realpath "${BASH_SOURCE[0]}")")"/../
 
-rapids-logger "Create cudf-polars Quent test environment"
-. /opt/conda/etc/profile.d/conda.sh
+source ./ci/test_python_common.sh test_python_other
 
-ENV_YAML_DIR="$(mktemp -d)"
+rapids-logger "Install cudf-polars Quent wheel"
+QUENT_WHEELHOUSE=$(rapids-download-from-github "cudf_polars_quent_wheel")
+python -m pip install --no-deps "${QUENT_WHEELHOUSE}"/cudf_polars_quent-*.whl
 
-rapids-dependency-file-generator \
-  --output conda \
-  --file-key build_cudf_polars_quent \
-  --matrix "cuda=${RAPIDS_CUDA_VERSION%.*};arch=$(arch);py=${RAPIDS_PY_VERSION}" | tee "${ENV_YAML_DIR}/env.yaml"
-
-rapids-mamba-retry env create --yes -f "${ENV_YAML_DIR}/env.yaml" -n cudf_polars_quent
-
-# Temporarily allow unbound variables for conda activation.
-set +u
-conda activate cudf_polars_quent
-set -u
-
-rapids-print-env
-
-rapids-logger "Check cudf-polars Quent bridge"
+rapids-logger "Test cudf-polars Quent integration"
 exec ./ci/run_cudf_polars_quent_tests.sh
