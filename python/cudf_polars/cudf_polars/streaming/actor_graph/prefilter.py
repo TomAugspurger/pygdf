@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import pylibcudf as plc
@@ -14,9 +14,12 @@ from cudf_streaming.channel_metadata import ChannelMetadata
 from cudf_streaming.table_chunk import TableChunk
 from pylibcudf.hashing import LIBCUDF_DEFAULT_HASH_SEED
 from rapidsmpf.memory.memory_reservation import opaque_memory_usage
-from rapidsmpf.streaming.core.memory_reserve_or_wait import reserve_memory
 from rapidsmpf.streaming.core.message import Message
 
+from cudf_polars.streaming.actor_graph.memory import (
+    MemoryReservationPurpose,
+    reserve_memory_traced,
+)
 from cudf_polars.streaming.actor_graph.utils import (
     ChunkStore,
     recv_metadata,
@@ -37,8 +40,13 @@ if TYPE_CHECKING:
 
     from cudf_polars.containers import DataType
     from cudf_polars.dsl.expr import NamedExpr
+    from cudf_polars.dsl.ir import IRExecutionContext
     from cudf_polars.streaming.actor_graph.utils import TableSizeStats
-    from cudf_polars.streaming.filter_hint import JoinSide, Prefilter
+    from cudf_polars.streaming.filter_hint import (
+        JoinSide,
+        Prefilter,
+        PushdownFilterHint,
+    )
 
 
 def estimate_bytes(dtypes: Sequence[DataType], row_count: int) -> int | None:
@@ -77,26 +85,83 @@ class PrefilterDecision:
     bloom_bytes: int | None = None
     exact_bytes: int | None = None
 
-    def trace(self, prefilter: Prefilter) -> dict[str, str | int | None]:
-        """Return serializable actor-trace information."""
-        result = asdict(self)
-        result["target_side"] = prefilter.target_side
-        if isinstance(prefilter.domain, JoinInputDomain):
-            result["domain_side"] = prefilter.domain.side
-        else:
-            assert isinstance(prefilter.domain, ExternalDomain)
-            result["domain"] = "external"
-        return result
+
+@dataclass(slots=True)
+class RuntimePrefilterStatistics:
+    """Runtime decision and observed effect for one optional prefilter."""
+
+    placement: str
+    decision: PrefilterDecision
+    target_side: str | None
+    domain_side: str | None
+    domain: str | None
+    target_on: tuple[str, ...]
+    domain_on: tuple[str, ...]
+    input_rows: int | None = None
+    output_rows: int | None = None
+
+    @classmethod
+    def from_decision_prefilter(
+        cls,
+        decision: PrefilterDecision,
+        prefilter: Prefilter,
+    ) -> RuntimePrefilterStatistics:
+        """Create statistics for a join prefilter decision."""
+        domain_side: str | None
+        domain: str | None
+        match prefilter.domain:
+            case JoinInputDomain(side=domain_side):
+                domain = None
+            case ExternalDomain():
+                domain_side = None
+                domain = "external"
+        return cls(
+            placement="join",
+            decision=decision,
+            target_side=prefilter.target_side,
+            domain_side=domain_side,
+            domain=domain,
+            target_on=tuple(key.name for key in prefilter.target_on),
+            domain_on=tuple(key.name for key in prefilter.domain_on),
+        )
+
+    @classmethod
+    def from_decision_pushdown_filter_hint(
+        cls,
+        decision: PrefilterDecision,
+        prefilter: PushdownFilterHint,
+    ) -> RuntimePrefilterStatistics:
+        """Create statistics for a standalone pushdown-filter decision."""
+        return cls(
+            placement="standalone",
+            decision=decision,
+            target_side=None,
+            domain_side=None,
+            domain=None,
+            target_on=tuple(key.name for key in prefilter.target_on),
+            domain_on=tuple(key.name for key in prefilter.domain_on),
+        )
 
 
 async def project_key_chunk(
-    context: Context, chunk: TableChunk, indices: Iterable[int]
+    context: Context,
+    chunk: TableChunk,
+    indices: Iterable[int],
+    ir_context: IRExecutionContext,
+    sequence_number: int,
 ) -> TableChunk:
     """Copy selected columns into an owning key chunk."""
     columns = tuple(chunk.table_view().columns()[index] for index in indices)
     bytes = sum(column.device_buffer_size() for column in columns)
     with opaque_memory_usage(
-        await reserve_memory(context, size=bytes, net_memory_delta=0)
+        await reserve_memory_traced(
+            context,
+            size=bytes,
+            net_memory_delta=0,
+            ir_context=ir_context,
+            purpose=MemoryReservationPurpose.PREFILTER_PROJECT_KEYS,
+            sequence_number=sequence_number,
+        )
     ):
         table = plc.Table(columns).copy(stream=chunk.stream, mr=context.br().device_mr)
     return TableChunk.from_pylibcudf_table(
@@ -113,6 +178,7 @@ async def buffer_and_project_keys(
     ch_keys: Channel[TableChunk],
     ch_replay: Channel[TableChunk],
     indices: Iterable[int],
+    ir_context: IRExecutionContext,
 ) -> None:
     """
     Project owning key chunks while spill-buffering an input for replay.
@@ -137,7 +203,13 @@ async def buffer_and_project_keys(
                 chunk = await TableChunk.from_message(
                     msg, br=context.br()
                 ).make_available_or_wait(context, net_memory_delta=0)
-                key_chunk = await project_key_chunk(context, chunk, indices)
+                key_chunk = await project_key_chunk(
+                    context,
+                    chunk,
+                    indices,
+                    ir_context,
+                    sequence_number,
+                )
                 chunks.insert(Message(sequence_number, chunk))
                 await ch_keys.send(context, Message(sequence_number, key_chunk))
 
@@ -153,8 +225,8 @@ async def count_rows_passthrough(
     context: Context,
     ch_in: Channel[TableChunk],
     ch_out: Channel[TableChunk],
-    trace_stats: dict[str, Any],
-    row_count_key: str,
+    statistics: RuntimePrefilterStatistics,
+    row_count_key: Literal["input_rows", "output_rows"],
 ) -> None:
     """Forward a table-chunk channel while recording its row count."""
     async with shutdown_channels_on_error(context, ch_in, ch_out):
@@ -165,7 +237,10 @@ async def count_rows_passthrough(
             chunk = TableChunk.from_message(msg, br=context.br())
             row_count += chunk.shape[0]
             await ch_out.send(context, Message(msg.sequence_number, chunk))
-        trace_stats[row_count_key] = row_count
+        if row_count_key == "input_rows":
+            statistics.input_rows = row_count
+        else:
+            statistics.output_rows = row_count
         await ch_out.drain(context)
 
 
@@ -194,8 +269,10 @@ class JoinPrefilterExecution(PrefilterExecution):
         context: Context,
         ch_left: Channel[TableChunk],
         ch_right: Channel[TableChunk],
+        ir_context: IRExecutionContext,
     ) -> None:
         super().__init__(context)
+        self.ir_context = ir_context
         self.source_inputs = {"left": ch_left, "right": ch_right}
         self.join_inputs = dict(self.source_inputs)
         self.buffered_domains: set[JoinSide] = set()
@@ -218,6 +295,7 @@ class JoinPrefilterExecution(PrefilterExecution):
                 ch_keys,
                 ch_replay,
                 indices,
+                self.ir_context,
             )
         )
         self.channels.extend((ch_keys, ch_replay))
@@ -255,7 +333,7 @@ def add_bloom_prefilter(
     ch_target: Channel[TableChunk],
     ch_filtered: Channel[TableChunk],
     collective_id: int,
-    trace_stats: dict[str, Any] | None,
+    statistics: RuntimePrefilterStatistics | None,
 ) -> None:
     """Add the channels and actors for an approximate Bloom prefilter."""
     bloom = BloomFilter(
@@ -276,7 +354,7 @@ def add_bloom_prefilter(
     )
     ch_apply_input = ch_target
     ch_apply_output = ch_filtered
-    if trace_stats is not None:
+    if statistics is not None:
         ch_counted_input: Channel[TableChunk] = context.create_channel()
         ch_raw_output: Channel[TableChunk] = context.create_channel()
         execution.add_channel(ch_counted_input)
@@ -286,7 +364,7 @@ def add_bloom_prefilter(
                 context,
                 ch_target,
                 ch_counted_input,
-                trace_stats,
+                statistics,
                 "input_rows",
             )
         )
@@ -295,7 +373,7 @@ def add_bloom_prefilter(
                 context,
                 ch_raw_output,
                 ch_filtered,
-                trace_stats,
+                statistics,
                 "output_rows",
             )
         )
