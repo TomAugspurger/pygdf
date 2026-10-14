@@ -76,6 +76,7 @@ NEXT_SHORT_TAG=${NEXT_MAJOR}.${NEXT_MINOR}
 NEXT_UCXX_TAG="$(curl -s https://version.gpuci.io/rapids/"${NEXT_SHORT_TAG}")"
 
 # Need to distutils-normalize the versions for some use cases
+NEXT_FULL_TAG_PEP440=$(python -c "from packaging.version import Version; print(Version('${NEXT_FULL_TAG}'))")
 NEXT_SHORT_TAG_PEP440=$(python -c "from packaging.version import Version; print(Version('${NEXT_SHORT_TAG}'))")
 PATCH_PEP440=$(python -c "from packaging.version import Version; print(Version('${NEXT_PATCH}'))")
 NEXT_UCXX_SHORT_TAG_PEP440=$(python -c "from packaging.version import Version; print(Version('${NEXT_UCXX_TAG}'))")
@@ -143,6 +144,15 @@ echo "${NEXT_FULL_TAG}" > VERSION
 # The cudf version file must be a copy, see https://github.com/NVIDIA/cudf/pull/18198
 echo "${NEXT_FULL_TAG}" > python/cudf/cudf/VERSION
 echo "${RAPIDS_BRANCH_NAME}" > RAPIDS_BRANCH
+
+# cudf-polars-quent uses the release CalVer in both its Cargo and Python
+# manifests. Nightly wheel suffixes are injected only in CI.
+QUENT_BRIDGE_DIR="python/cudf_polars/quent/bridge"
+sed_runner "s/^version = \".*\"/version = \"${NEXT_FULL_TAG_PEP440}\"/" "${QUENT_BRIDGE_DIR}/Cargo.toml"
+sed_runner "s/^version = \".*\"/version = \"${NEXT_FULL_TAG_PEP440}\"/" "${QUENT_BRIDGE_DIR}/pyproject.toml"
+cargo update \
+  --manifest-path "${QUENT_BRIDGE_DIR}/Cargo.toml" \
+  --package cudf-polars-quent
 
 DEPENDENCIES=(
   cudf
