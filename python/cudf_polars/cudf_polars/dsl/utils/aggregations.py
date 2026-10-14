@@ -372,7 +372,12 @@ def decompose_single_agg(
                     expr.Agg(
                         agg.dtype,
                         "first_non_null",
-                        None,
+                        # ``selected`` masks every non-matching row to null, so
+                        # each group has at most one non-null value. The result
+                        # is therefore independent of input row order, which
+                        # lets the streaming executor tree-reduce it across
+                        # partitions. ``options=True`` records that guarantee.
+                        True,  # noqa: FBT003
                         context,
                         selected,
                     ),

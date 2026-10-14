@@ -360,6 +360,20 @@ def decompose(
     if isinstance(expr, SortedAgg):
         return _decompose_sorted_agg(name, expr, names=names)
     if isinstance(expr, Agg):
+        if expr.name == "first_non_null" and not expr.options:
+            # A genuine ``first(ignore_nulls=True)`` depends on the input row
+            # order: it must return the first non-null value in the group.
+            # The multi-partition tree reduction combines per-partition
+            # results without preserving the original cross-partition order,
+            # so it can pick a non-null value from the wrong partition. Only
+            # the order-independent variant (``options=True``, produced by the
+            # ``item`` decomposition, where each group has at most one non-null
+            # value) is safe to tree-reduce. Raise so the GroupBy lowering
+            # falls back to a single partition.
+            raise NotImplementedError(
+                "Streaming group_by does not support order-dependent "
+                "first_non_null across multiple partitions."
+            )
         if (aggfunc := _GB_AGG_REDUCTIONS.get(expr.name)) is not None:
             if expr.name == "count":
                 intermediate_dtype = DataType(pl.Int64())
