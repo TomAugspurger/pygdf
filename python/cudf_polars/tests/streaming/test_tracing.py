@@ -19,6 +19,9 @@ from rapidsmpf.streaming.chunks.arbitrary import ArbitraryChunk
 from rapidsmpf.streaming.core.message import Message
 
 from cudf_polars.containers import DataFrame
+from cudf_polars.engine.options import StreamingOptions
+from cudf_polars.engine.spmd import SPMDEngine
+from cudf_polars.quent import QuentConfig
 from cudf_polars.streaming.actor_graph.io import Lineariser
 from cudf_polars.streaming.actor_graph.tracing import (
     ActorTracer,
@@ -29,8 +32,6 @@ from cudf_polars.utils.versions import POLARS_VERSION_LT_138
 
 if TYPE_CHECKING:
     import pathlib
-
-    from cudf_polars.engine.spmd import SPMDEngine
 
 
 @pytest.fixture
@@ -140,6 +141,96 @@ def test_lineariser_backpressures_each_producer(spmd_engine: SPMDEngine) -> None
 
     assert produced_before_gap == [[0, 2], []]
     assert output == list(range(6))
+
+
+def test_memory_reservations_gate_io_evaluations(
+    tmp_path: pathlib.Path, timeout_seconds: int
+) -> None:
+    pytest.importorskip("cudf_polars_quent")
+
+    source = tmp_path / "data.parquet"
+    output_root = tmp_path / "quent-admission"
+    pl.DataFrame({"x": range(5_000)}).write_parquet(
+        source,
+        compression="uncompressed",
+        row_group_size=2_500,
+    )
+
+    q = pl.scan_parquet("{source}").select(pl.col("x").sum())
+    options = StreamingOptions(
+        allow_overbooking_by_default=False,
+        max_concurrent_io_tasks=2,
+        memory_reserve_timeout="10s",
+        spill_device_limit="65000",
+        target_partition_size=21_000,
+        quent_context=QuentConfig(output_root=str(output_root)),
+    )
+    with SPMDEngine.from_options(options) as engine:
+        q.collect(engine=engine)
+
+    evaluations: dict[str, list[tuple[int, str, dict]]] = {}
+    for path in output_root.glob("*/*/Evaluate/*.ndjson"):
+        for line in path.read_text().splitlines():
+            event = json.loads(line)
+            state, attributes = next(iter(event["data"].items()))
+            evaluations.setdefault(event["id"], []).append(
+                (event["timestamp"], state, attributes)
+            )
+
+    evaluations = {
+        evaluate_id: lifecycle
+        for evaluate_id, lifecycle in evaluations.items()
+        if lifecycle[0][1] == "Queued"
+        and lifecycle[0][2]["task"] is not None
+        and lifecycle[0][2]["task"]["node_type"] == "ParquetScanTask"
+    }
+    assert len(evaluations) == 2
+    assert all(
+        [state for _, state, _ in lifecycle] == ["Queued", "Running", "Completed"]
+        for lifecycle in evaluations.values()
+    )
+
+    reservations: dict[str, list[tuple[int, str, dict]]] = {}
+    for path in output_root.glob("*/*/MemoryReservation/*.ndjson"):
+        for line in path.read_text().splitlines():
+            event = json.loads(line)
+            state, attributes = next(iter(event["data"].items()))
+            reservations.setdefault(event["id"], []).append(
+                (event["timestamp"], state, attributes)
+            )
+    reservations = {
+        reservation_id: lifecycle
+        for reservation_id, lifecycle in reservations.items()
+        if lifecycle[0][1] == "Requested"
+        and lifecycle[0][2]["request"]["purpose"] == "scan"
+    }
+    assert len(reservations) == 2
+    assert all(
+        [state for _, state, _ in lifecycle] == ["Requested", "Granted"]
+        for lifecycle in reservations.values()
+    )
+
+    evaluations_by_sequence = {
+        lifecycle[1][2]["input"]["sequence_number"]: lifecycle
+        for lifecycle in evaluations.values()
+    }
+    reservations_by_sequence = {
+        lifecycle[0][2]["request"]["sequence_number"]: lifecycle
+        for lifecycle in reservations.values()
+    }
+    assert evaluations_by_sequence.keys() == reservations_by_sequence.keys()
+    for sequence_number, reservation in reservations_by_sequence.items():
+        evaluation = evaluations_by_sequence[sequence_number]
+        assert (
+            reservation[0][2]["request"]["size_bytes"]
+            == 2 * evaluation[1][2]["channel"]["data"]["bytes"]
+        )
+        assert reservation[0][0] <= reservation[1][0] <= evaluation[0][0]
+        assert evaluation[0][0] <= evaluation[1][0] <= evaluation[2][0]
+
+    first = evaluations_by_sequence[0]
+    second_reservation = reservations_by_sequence[1]
+    assert second_reservation[1][0] >= first[2][0]
 
 
 @pytest.mark.skipif(

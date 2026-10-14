@@ -669,7 +669,10 @@ with `quent-open` and might be helpful for users and developers of cudf-polars.
 Set `CUDF_POLARS__EXECUTOR__QUENT_CONTEXT=1` to export plans, actor lifetimes,
 aggregate actor statistics, runtime decisions, and per-node `Evaluate`
 lifecycles. Asynchronous scan work uses the same lifecycle with task metadata,
-disk-to-device transfer usage, failures, and actual output bytes.
+disk-to-device transfer usage, failures, and actual output bytes. Calls into
+memory-admission control are exported separately as `MemoryReservation`
+lifecycles with their purpose, memory tier, requested bytes, net memory delta,
+overbooking policy, chunk sequence number, wait duration, and outcome.
 
 ### Schema
 
