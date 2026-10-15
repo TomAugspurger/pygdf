@@ -21,7 +21,6 @@ import ucxx._lib.libucxx as ucx_api
 import polars as pl
 
 import pylibcudf as plc
-import rmm.mr
 from cudf_streaming.partition_utils import (
     packed_data_from_cudf_packed_columns,
     unpack_and_concat,
@@ -53,7 +52,6 @@ from cudf_polars.engine.core import (
     check_reserved_keys,
     evaluate_on_rank,
     make_kvikio_monitor,
-    reset_kvikio_monitor,
     reset_statistics_from_options,
     resolve_rapidsmpf_options,
     take_io_summary,
@@ -87,6 +85,7 @@ from cudf_polars.utils.config import (
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    import rmm.mr
     from cudf_streaming.channel_metadata import ChannelMetadata
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.config import Options
@@ -418,6 +417,173 @@ def synchronize_quent_query_id(
     return uuid.UUID(bytes=all_data[0])
 
 
+class SPMDCluster:
+    """
+    Physical SPMD cluster resources: communicator, rapidsmpf Context, memory, executor.
+
+    Long-lived and expensive to create. Create once and reuse across many
+    :class:`SPMDEngine` instances via :meth:`make_engine`.
+
+    Parameters
+    ----------
+    comm
+        An already-bootstrapped communicator. When provided, the bootstrap step
+        is skipped and the caller retains ownership; the communicator is **not**
+        closed on shutdown. When ``None`` (default) a new communicator is
+        bootstrapped automatically.
+    rapidsmpf_options
+        RapidsMPF-specific options passed to :class:`~rapidsmpf.streaming.core.context.Context`.
+    executor_options
+        Options dict from which cluster-level kvikio settings and
+        ``num_py_executors`` are extracted. All other keys are ignored.
+    engine_options
+        Options dict from which ``hardware_binding`` and
+        ``memory_resource_config`` are extracted. All other keys are ignored.
+    """
+
+    def __init__(
+        self,
+        *,
+        comm: Communicator | None = None,
+        rapidsmpf_options: Options | None = None,
+        executor_options: dict[str, Any] | None = None,
+        engine_options: dict[str, Any] | None = None,
+    ) -> None:
+        _check_engine_gpu_is_first()
+        executor_options = resolve_kvikio_executor_options(executor_options or {})
+        engine_options = engine_options or {}
+
+        hw_binding = cast(
+            "HardwareBindingPolicy",
+            engine_options.get("hardware_binding", HardwareBindingPolicy()),
+        )
+        bind_to_gpu(hw_binding)
+
+        configure_kvikio(
+            executor_options["kvikio_nthreads"],
+            remote_io_backend=executor_options["kvikio_remote_io_backend"],
+            task_size=executor_options["kvikio_task_size"],
+            bounce_buffer_bytes=executor_options["kvikio_bounce_buffer_bytes"],
+            reactor_count=executor_options["kvikio_reactor_count"],
+            reactor_dispatch=executor_options["kvikio_reactor_dispatch"],
+            request_ceiling=executor_options["kvikio_request_ceiling"],
+        )
+
+        self.rapidsmpf_options = resolve_rapidsmpf_options(rapidsmpf_options)
+        mr_config: MemoryResourceConfig = engine_options.get(
+            "memory_resource_config", MemoryResourceConfig.default()
+        )
+        self._base_mr: rmm.mr.DeviceMemoryResource = mr_config.create_memory_resource()
+
+        if comm is None:
+            statistics = Statistics.from_options(self.rapidsmpf_options)
+            if bootstrap.is_running_with_rrun():
+                comm = bootstrap.create_ucxx_comm(
+                    progress_thread=ProgressThread(statistics),
+                    type=bootstrap.BackendType.AUTO,
+                    options=self.rapidsmpf_options,
+                )
+            else:
+                comm = single_communicator(
+                    progress_thread=ProgressThread(statistics),
+                    options=self.rapidsmpf_options,
+                )
+        else:
+            statistics = reset_statistics_from_options(
+                comm.progress_thread.statistics, self.rapidsmpf_options
+            )
+
+        self._comm: Communicator | None = comm
+        self._ctx: Context | None = None
+        self._mr: RmmResourceAdaptor
+        self._py_executor: ThreadPoolExecutor | None = None
+        self._exit_stack: contextlib.ExitStack | None = contextlib.ExitStack()
+
+        try:
+            # `set_memory_resource` is registered first so it runs LAST (LIFO),
+            # restoring the pre-cluster device resource after all other teardown.
+            self._ctx = Context.from_options(
+                comm.logger, self._base_mr, self.rapidsmpf_options, statistics
+            )
+            self._mr = self._ctx.br().device_mr_adaptor()
+            self._exit_stack.enter_context(set_memory_resource(self._mr))
+            # `_cleanup_ctx` runs after py_executor shuts down (registered next).
+            self._exit_stack.callback(self._cleanup_ctx)
+            # py_executor must shut down before the Context (LIFO: registered last, runs first).
+            self._py_executor = ThreadPoolExecutor(
+                max_workers=cast("int", executor_options.get("num_py_executors", 8)),
+                thread_name_prefix="spmd-executor",
+            )
+            self._exit_stack.callback(
+                self._py_executor.shutdown, wait=True, cancel_futures=True
+            )
+        except Exception:
+            self._exit_stack.close()
+            self._exit_stack = None
+            raise
+
+    def _cleanup_ctx(self) -> None:
+        """Shut down the rapidsmpf Context; called from the cluster exit-stack."""
+        if self._ctx is not None:
+            self._ctx.shutdown()
+            self._ctx = None
+
+    def make_engine(
+        self,
+        *,
+        executor_options: dict[str, Any] | None = None,
+        engine_options: dict[str, Any] | None = None,
+    ) -> SPMDEngine:
+        """
+        Create a logical engine backed by this cluster.
+
+        Fast — no UCX or rapidsmpf bootstrap is performed. Multiple engines
+        may be created from a single cluster and used concurrently.
+
+        Parameters
+        ----------
+        executor_options
+            Executor-specific options (e.g. ``max_rows_per_partition``,
+            ``quent_context``).
+        engine_options
+            Engine-specific keyword arguments (e.g. ``raise_on_fail``,
+            ``parquet_options``). ``hardware_binding`` and
+            ``memory_resource_config`` are ignored; those are fixed at cluster
+            creation time.
+
+        Returns
+        -------
+        A new :class:`SPMDEngine` backed by this cluster.
+        """
+        if self._exit_stack is None:
+            raise RuntimeError("Cannot create an engine from a shut-down cluster")
+        return SPMDEngine.from_cluster(
+            self,
+            executor_options=executor_options,
+            engine_options=engine_options,
+        )
+
+    def shutdown(self) -> None:
+        """Shut down the cluster and release all physical resources. Idempotent."""
+        if self._exit_stack is None:
+            return
+        try:
+            self._exit_stack.close()
+        finally:
+            self._exit_stack = None
+            self._comm = None
+            self._ctx = None
+            self._py_executor = None
+
+    def __enter__(self) -> SPMDCluster:
+        """Enter the context manager, returning ``self``."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Exit the context manager, calling :meth:`shutdown`."""
+        self.shutdown()
+
+
 class SPMDEngine(StreamingEngine):
     """
     Multi-GPU Polars engine for SPMD executions.
@@ -572,7 +738,68 @@ class SPMDEngine(StreamingEngine):
         executor_options: dict[str, Any] | None = None,
         engine_options: dict[str, Any] | None = None,
     ) -> None:
-        _check_engine_gpu_is_first()
+        cluster = SPMDCluster(
+            comm=comm,
+            rapidsmpf_options=rapidsmpf_options,
+            executor_options=executor_options,
+            engine_options=engine_options,
+        )
+        self._owns_cluster = True
+        self._cluster: SPMDCluster | None = None
+        self._init_from_cluster(
+            cluster,
+            executor_options=executor_options,
+            engine_options=engine_options,
+        )
+
+    @classmethod
+    def from_cluster(
+        cls,
+        cluster: SPMDCluster,
+        *,
+        executor_options: dict[str, Any] | None = None,
+        engine_options: dict[str, Any] | None = None,
+    ) -> SPMDEngine:
+        """
+        Create a logical engine backed by an existing :class:`SPMDCluster`.
+
+        Fast — no UCX or rapidsmpf bootstrap is performed. The cluster's
+        communicator, :class:`~rapidsmpf.streaming.core.context.Context`, and
+        thread-pool are reused. Quent tracing is configured per-engine.
+
+        Parameters
+        ----------
+        cluster
+            The cluster supplying physical resources.
+        executor_options
+            Executor-specific options (e.g. ``max_rows_per_partition``,
+            ``quent_context``).
+        engine_options
+            Engine-specific keyword arguments. ``hardware_binding`` and
+            ``memory_resource_config`` are ignored (fixed at cluster creation).
+
+        Returns
+        -------
+        A new :class:`SPMDEngine` backed by ``cluster``.
+        """
+        engine: SPMDEngine = cls.__new__(cls)
+        engine._owns_cluster = False
+        engine._cluster = None
+        engine._init_from_cluster(
+            cluster,
+            executor_options=executor_options,
+            engine_options=engine_options,
+        )
+        return engine
+
+    def _init_from_cluster(
+        self,
+        cluster: SPMDCluster,
+        *,
+        executor_options: dict[str, Any] | None = None,
+        engine_options: dict[str, Any] | None = None,
+    ) -> None:
+        """Set up the logical engine layer on top of an existing cluster."""
         executor_options = resolve_kvikio_executor_options(executor_options or {})
         engine_options = engine_options or {}
 
@@ -582,51 +809,8 @@ class SPMDEngine(StreamingEngine):
         self._quent_worker_runtime = None
 
         check_reserved_keys(executor_options, engine_options)
-        hw_binding = cast(
-            "HardwareBindingPolicy",
-            engine_options.get("hardware_binding", HardwareBindingPolicy()),
-        )
-        bind_to_gpu(hw_binding)
 
-        configure_kvikio(
-            executor_options["kvikio_nthreads"],
-            remote_io_backend=executor_options["kvikio_remote_io_backend"],
-            task_size=executor_options["kvikio_task_size"],
-            bounce_buffer_bytes=executor_options["kvikio_bounce_buffer_bytes"],
-            reactor_count=executor_options["kvikio_reactor_count"],
-            reactor_dispatch=executor_options["kvikio_reactor_dispatch"],
-            request_ceiling=executor_options["kvikio_request_ceiling"],
-        )
-
-        self.rapidsmpf_options = resolve_rapidsmpf_options(rapidsmpf_options)
-        mr_config: MemoryResourceConfig = engine_options.get(
-            "memory_resource_config", MemoryResourceConfig.default()
-        )
-        base_mr = mr_config.create_memory_resource()
-        if comm is None:
-            statistics = Statistics.from_options(self.rapidsmpf_options)
-            if bootstrap.is_running_with_rrun():
-                comm = bootstrap.create_ucxx_comm(
-                    progress_thread=ProgressThread(statistics),
-                    type=bootstrap.BackendType.AUTO,
-                    options=self.rapidsmpf_options,
-                )
-            else:
-                comm = single_communicator(
-                    progress_thread=ProgressThread(statistics),
-                    options=self.rapidsmpf_options,
-                )
-        else:
-            statistics = reset_statistics_from_options(
-                comm.progress_thread.statistics, self.rapidsmpf_options
-            )
-        # else: caller-provided comm; the caller retains ownership
-
-        self._base_mr: rmm.mr.DeviceMemoryResource = base_mr
-        self._mr: RmmResourceAdaptor  # set after `Context` is built (below).
-        self._comm: Communicator | None = comm
-        self._ctx: Context | None = None
-        self._py_executor: ThreadPoolExecutor | None = None
+        self._cluster = cluster
         self._store_uid = uuid.uuid4().hex
         exit_stack = contextlib.ExitStack()
         self._kvikio_monitor = make_kvikio_monitor(
@@ -634,22 +818,15 @@ class SPMDEngine(StreamingEngine):
         )
         exit_stack.callback(self._stop_kvikio_monitor)
 
+        assert cluster._comm is not None, "cluster is shut down"
+        assert cluster._ctx is not None, "cluster is shut down"
+        assert cluster._py_executor is not None, "cluster is shut down"
+        comm = cluster._comm
+        ctx = cluster._ctx
+
         # TODO: there's no reason our API needs a plain dict[str, Any] rather than
         # a typed config object here.
         try:
-            # Register `_cleanup_ctx`, which shuts down whatever `self._ctx` points
-            # to at engine shutdown time, i.e. the `Context` from the latest reset.
-            self._ctx = Context.from_options(
-                comm.logger, base_mr, self.rapidsmpf_options, statistics
-            )
-            # `Context` wraps `base_mr` in its `BufferResource`'s internal
-            # tracking `RmmResourceAdaptor`. Capture it as `self._mr` and
-            # install it as the current device resource so libcudf temporary
-            # allocations share the same resource and are tracked.
-            self._mr = self._ctx.br().device_mr_adaptor()
-            exit_stack.enter_context(set_memory_resource(self._mr))
-            exit_stack.callback(self._cleanup_ctx)
-
             if quent_context is not None:
                 collector_cleanup: contextlib.ExitStack | None = None
                 if comm.rank == 0:
@@ -665,7 +842,7 @@ class SPMDEngine(StreamingEngine):
                     collector_address = ""
                 quent_context, collector_address = synchronize_quent_configuration(
                     comm=comm,
-                    context=self._ctx,
+                    context=ctx,
                     quent_config=quent_context,
                     collector_address=collector_address,
                 )
@@ -696,19 +873,6 @@ class SPMDEngine(StreamingEngine):
                 engine_id = uuid.uuid4()
                 self._quent_worker_id = uuid.uuid4()
 
-            # Register after `_cleanup_ctx` so on teardown (LIFO) the
-            # executor shuts down first. `wait=True` is safe because
-            # rapidsmpf's `run_actor_network` awaits its only submitted
-            # future so by the time we reach shutdown the executor has no
-            # in-flight work and wait returns immediately.
-            self._py_executor = ThreadPoolExecutor(
-                max_workers=cast("int", executor_options.get("num_py_executors", 8)),
-                thread_name_prefix="spmd-executor",
-            )
-            exit_stack.callback(
-                self._py_executor.shutdown, wait=True, cancel_futures=True
-            )
-
             super().__init__(
                 nranks=comm.nranks,
                 executor_options={
@@ -720,13 +884,13 @@ class SPMDEngine(StreamingEngine):
                         worker_id=self._quent_worker_id,
                         quent_controller_runtime=self._quent_runtime,
                         quent_worker_runtime=self._quent_worker_runtime,
-                        context=self._ctx,
-                        py_executor=self._py_executor,
+                        context=ctx,
+                        py_executor=cluster._py_executor,
                     ),
                 },
                 engine_options={
                     **engine_options,
-                    "memory_resource": self._ctx.br().device_mr,
+                    "memory_resource": ctx.br().device_mr,
                 },
                 exit_stack=exit_stack,
             )
@@ -740,17 +904,6 @@ class SPMDEngine(StreamingEngine):
         if self._kvikio_monitor is not None:
             self._kvikio_monitor.stop()
             self._kvikio_monitor = None
-
-    def _cleanup_ctx(self) -> None:
-        """
-        Shut down the current ``self._ctx`` if any; called from exit-stack.
-
-        ``Context.shutdown()`` is idempotent on the rapidsmpf C++ side, so this is
-        safe even if a prior ``_reset`` already shut down a now-replaced Context.
-        """
-        if self._ctx is not None:
-            self._ctx.shutdown()
-            self._ctx = None
 
     def _close_quent_worker(self) -> None:
         """Close and clear this rank's Quent worker runtime."""
@@ -772,8 +925,10 @@ class SPMDEngine(StreamingEngine):
         """Run collective cleanup before local resources unwind."""
         steps: list[Callable[[], object]] = [self._drop_persisted]
         if self._quent_worker_runtime is not None:
-            assert self._comm is not None
-            comm = self._comm
+            cluster = self._cluster
+            assert cluster is not None
+            assert cluster._comm is not None
+            comm = cluster._comm
             steps.append(self._close_quent_worker)
             if comm.nranks > 1:
                 steps.append(lambda: barrier(comm))
@@ -964,115 +1119,6 @@ class SPMDEngine(StreamingEngine):
             engine_options=engine_options,
         )
 
-    def _reset(
-        self,
-        *,
-        rapidsmpf_options: Options | None = None,
-        executor_options: dict[str, Any] | None = None,
-        engine_options: dict[str, Any] | None = None,
-    ) -> None:
-        """
-        Reset the engine; see :meth:`StreamingEngine._reset` for the contract.
-
-        Must be called collectively on all ranks. A barrier ensures no
-        rank tears down its Context while peers may still be using it.
-        """
-        if self._ctx is None:
-            raise RuntimeError("Cannot reset a shut-down engine")
-        assert self._comm is not None
-        existing_executor_options = self.config.get("executor_options", {})
-        if not isinstance(existing_executor_options, dict):
-            existing_executor_options = {}
-        existing_quent_context = existing_executor_options.get("quent_context")
-        super()._reset(
-            rapidsmpf_options=rapidsmpf_options,
-            executor_options=executor_options,
-            engine_options=engine_options,
-        )
-        executor_options = executor_options or {}
-        if "quent_context" in existing_executor_options:
-            executor_options.setdefault("quent_context", existing_quent_context)
-        if "kvikio_nthreads" in existing_executor_options:
-            executor_options.setdefault(
-                "kvikio_nthreads", existing_executor_options["kvikio_nthreads"]
-            )
-        executor_options = resolve_kvikio_executor_options(executor_options)
-        configure_kvikio(
-            executor_options["kvikio_nthreads"],
-            remote_io_backend=executor_options["kvikio_remote_io_backend"],
-            task_size=executor_options["kvikio_task_size"],
-            bounce_buffer_bytes=executor_options["kvikio_bounce_buffer_bytes"],
-            reactor_count=executor_options["kvikio_reactor_count"],
-            reactor_dispatch=executor_options["kvikio_reactor_dispatch"],
-            request_ceiling=executor_options["kvikio_request_ceiling"],
-        )
-        engine_options = engine_options or {}
-        quent_context: cudf_polars.quent.QuentConfig | None = executor_options.get(
-            "quent_context"
-        )
-        rapidsmpf_options = resolve_rapidsmpf_options(rapidsmpf_options)
-        self.rapidsmpf_options = rapidsmpf_options
-
-        # Collective: synchronize all ranks before tearing down the Context.
-        if self._comm.nranks > 1:
-            barrier(self._comm)
-        # Free persisted partitions before the Context is torn down.
-        self._drop_persisted()
-        # Same-thread shutdown, _reset runs on the thread that built the
-        # Context (the test driver's main thread). The per-engine RMM
-        # resource is kept alive across resets, see :meth:`_cleanup_ctx`.
-        self._ctx.shutdown()
-
-        statistics = reset_statistics_from_options(
-            self._comm.progress_thread.statistics, rapidsmpf_options
-        )
-        statistics.clear()
-        self._kvikio_monitor = reset_kvikio_monitor(
-            self._kvikio_monitor, enabled=executor_options["kvikio_statistics"]
-        )
-
-        self._ctx = Context.from_options(
-            self._comm.logger, self._base_mr, rapidsmpf_options, statistics
-        )
-        # Refresh `self._mr` and the current device resource to the new
-        # Context's tracking adaptor (the original adaptor was tied to the
-        # now-defunct Context). The original ``set_memory_resource`` exit
-        # callback still restores the pre-engine MR at engine shutdown.
-        self._mr = self._ctx.br().device_mr_adaptor()
-        rmm.mr.set_current_device_resource(self._mr)
-
-        engine_id = (
-            quent_context.engine_id if quent_context is not None else uuid.uuid4()
-        )
-
-        # Re-run ``StreamingEngine.__init__`` on the existing instance to
-        # reconfigure the polars ``GPUEngine`` layer (``self.config``,
-        # ``self.device``, etc.) with the new options. Pass the existing
-        # ``self._exit_stack`` so any registered callbacks (notably
-        # ``_cleanup_ctx`` and ``set_memory_resource``) survive.
-        StreamingEngine.__init__(
-            self,
-            nranks=self._comm.nranks,
-            executor_options={
-                **executor_options,
-                "cluster": "spmd",
-                "spmd_context": SPMDContext(
-                    comm=self._comm,
-                    context=self._ctx,
-                    py_executor=self.py_executor,
-                    engine_id=engine_id,
-                    worker_id=self._quent_worker_id,
-                    quent_controller_runtime=self._quent_runtime,
-                    quent_worker_runtime=self._quent_worker_runtime,
-                ),
-            },
-            engine_options={
-                **engine_options,
-                "memory_resource": self._ctx.br().device_mr,
-            },
-            exit_stack=self._exit_stack,
-        )
-
     @property
     def rank(self) -> int:
         """
@@ -1090,6 +1136,35 @@ class SPMDEngine(StreamingEngine):
         return self.comm.rank
 
     @property
+    def cluster(self) -> SPMDCluster:
+        """
+        The backing :class:`SPMDCluster`.
+
+        Returns
+        -------
+        The cluster supplying physical resources for this engine.
+
+        Raises
+        ------
+        RuntimeError
+            If called after :meth:`shutdown`.
+        """
+        if self._cluster is None:
+            raise RuntimeError("cluster is not available after shutdown")
+        return self._cluster
+
+    @property
+    def rapidsmpf_options(self) -> Options:
+        """RapidsMPF options; delegated to the cluster."""
+        return self.cluster.rapidsmpf_options
+
+    @rapidsmpf_options.setter
+    def rapidsmpf_options(self, value: Options) -> None:
+        """Setting rapidsmpf_options updates the cluster's copy."""
+        if self._cluster is not None:
+            self._cluster.rapidsmpf_options = value
+
+    @property
     def comm(self) -> Communicator:
         """
         The active RapidsMPF communicator.
@@ -1103,9 +1178,10 @@ class SPMDEngine(StreamingEngine):
         RuntimeError
             If called after :meth:`shutdown`.
         """
-        if self._comm is None:
+        cluster = self._cluster
+        if cluster is None or cluster._comm is None:
             raise RuntimeError("comm is not available after shutdown")
-        return self._comm
+        return cluster._comm
 
     @property
     def context(self) -> Context:
@@ -1121,9 +1197,10 @@ class SPMDEngine(StreamingEngine):
         RuntimeError
             If called after :meth:`shutdown`.
         """
-        if self._ctx is None:
+        cluster = self._cluster
+        if cluster is None or cluster._ctx is None:
             raise RuntimeError("context is not available after shutdown")
-        return self._ctx
+        return cluster._ctx
 
     @property
     def py_executor(self) -> ThreadPoolExecutor:
@@ -1139,9 +1216,10 @@ class SPMDEngine(StreamingEngine):
         RuntimeError
             If called after :meth:`shutdown`.
         """
-        if self._py_executor is None:
+        cluster = self._cluster
+        if cluster is None or cluster._py_executor is None:
             raise RuntimeError("py_executor is not available after shutdown")
-        return self._py_executor
+        return cluster._py_executor
 
     def gather_cluster_info(self) -> list[ClusterInfo]:
         """
@@ -1214,20 +1292,28 @@ class SPMDEngine(StreamingEngine):
         """
         Shut down the engine and release all owned resources.
 
+        If the engine was constructed via :meth:`__init__` (not
+        :meth:`from_cluster`), the backing :class:`SPMDCluster` is shut down
+        as well. Engines created via :meth:`from_cluster` leave the cluster
+        alive.
+
         Idempotent: safe to call more than once. Must be called on the same
         thread that created the engine.
         """
-        if self._ctx is None:
+        if self._exit_stack is None:
             return  # already shut down
 
-        # The exit stack runs collective/persisted cleanup first, then the
-        # executor, Context, memory resource, and monitor callbacks.
+        cluster = self._cluster
+        owns_cluster = self._owns_cluster
+        # The exit stack runs collective/persisted cleanup and Quent teardown
+        # first, then the kvikio monitor callback. Cluster resources (py_executor,
+        # Context, RMM) are released afterwards via the cluster's own shutdown.
         try:
             super().shutdown()
         finally:
-            self._comm = None
-            self._ctx = None
-            self._py_executor = None
+            self._cluster = None
+            if owns_cluster and cluster is not None:
+                cluster.shutdown()
 
     def _run(self, func: Callable[..., T], *args: Any, **kwargs: Any) -> list[T]:
         data = json.dumps(func(*args, **kwargs)).encode()

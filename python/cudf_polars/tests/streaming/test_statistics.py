@@ -106,7 +106,7 @@ def test_io_summary_is_independent_of_rapidsmpf_statistics(
     streaming_engine_factory: Callable[..., StreamingEngine],
     scan_query: pl.LazyFrame,
 ) -> None:
-    """``kvikio_statistics`` gates I/O counting on its own, and survives a reset."""
+    """``kvikio_statistics`` gates I/O counting on its own; the two are independent."""
     # RapidsMPF statistics on, kvikio off. One does not imply the other.
     engine = streaming_engine_factory(
         StreamingOptions(
@@ -119,15 +119,13 @@ def test_io_summary_is_independent_of_rapidsmpf_statistics(
     # a zeroed summary meaning "this rank did no I/O".
     assert engine.gather_io_summary() == {}
 
-    # The factory resets the one shared engine, so this exercises the monitor
-    # being created on an engine that was running without one.
+    # A separate engine with kvikio stats on and rapidsmpf stats off.
     reset = streaming_engine_factory(
         StreamingOptions(
             statistics=False, kvikio_statistics=True, max_rows_per_partition=10
         )
     )
-    assert reset is engine
-    scan_query.collect(engine=engine)
-    summaries = engine.gather_io_summary()
-    assert sorted(summaries) == list(range(engine.nranks))
+    scan_query.collect(engine=reset)
+    summaries = reset.gather_io_summary()
+    assert sorted(summaries) == list(range(reset.nranks))
     assert sum(s.num_ops for s in summaries.values()) > 0

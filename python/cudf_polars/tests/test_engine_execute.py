@@ -272,20 +272,26 @@ def test_spmd_execute_self_join_raises(spmd_engine):
         reused.join(reused, on="a", how="inner").collect(engine=spmd_engine)
 
 
-def test_spmd_execute_reset_invalidates_result(spmd_engine):
-    """_reset() frees a live result's partition before teardown; reuse raises."""
+def test_spmd_engine_shutdown_drops_partitions(spmd_cluster):
+    """Shutting down an engine drops its persisted partitions."""
+    engine = spmd_cluster.make_engine()
     lf = _source_lf()
-    result = spmd_engine.execute(lf)
-    spmd_engine._reset()
-    with pytest.RaisesGroup(
-        pytest.RaisesExc(RuntimeError, match="store no longer exists"),
-        allow_unwrapped=True,
-        flatten_subgroups=True,
-    ):
-        result.lazy().collect(engine=spmd_engine)
-    # The engine is still usable after reset.
-    again = spmd_engine.execute(lf).lazy().collect(engine=spmd_engine)
-    assert_frame_equal(again, lf.collect())
+    result = engine.execute(lf)
+    engine.shutdown()  # drops persisted partitions
+    # A new engine from the same cluster cannot see the dropped partitions.
+    new_engine = spmd_cluster.make_engine()
+    try:
+        with pytest.RaisesGroup(
+            pytest.RaisesExc(RuntimeError, match="store no longer exists"),
+            allow_unwrapped=True,
+            flatten_subgroups=True,
+        ):
+            result.lazy().collect(engine=new_engine)
+        # The cluster is still fully functional.
+        again = new_engine.execute(lf).lazy().collect(engine=new_engine)
+        assert_frame_equal(again, lf.collect())
+    finally:
+        new_engine.shutdown()
 
 
 def test_execute_default_engine_collect_raises(streaming_engine):
@@ -365,15 +371,14 @@ def test_dask_backend_eager_drop_swallows_failure():
     backend.drop_persisted(uuid.uuid4())  # must not raise; no cluster needed
 
 
-def test_dask_execute_reset_drops_partitions(dask_engine):
-    """_reset() drops this engine's persisted partitions before teardown."""
-    result = dask_engine.execute(_source_lf())
+def test_dask_engine_shutdown_drops_partitions(dask_cluster):
+    """Shutting down a Dask engine drops its persisted partitions."""
+    engine = dask_cluster.make_engine()
+    result = engine.execute(_source_lf())
     query_id = result._query_id
-    client = dask_engine._dask_ctx.client
-    assert sum(client.run(_stored_count, query_id).values()) == dask_engine._nranks
-
-    dask_engine._reset()
-
+    client = dask_cluster._client
+    assert sum(client.run(_stored_count, query_id).values()) == engine._nranks
+    engine.shutdown()  # drops partitions
     assert sum(client.run(_stored_count, query_id).values()) == 0
 
 

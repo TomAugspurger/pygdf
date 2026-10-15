@@ -405,7 +405,7 @@ def resolve_kvikio_executor_options(executor_options: dict[str, Any]) -> dict[st
     """
     Resolve every ``kvikio_*`` executor option in place, via ``setdefault``.
 
-    Existing keys (already resolved, e.g. carried over across a ``_reset``) are
+    Existing keys (already resolved) are
     left untouched. ``kvikio_remote_io_backend`` is resolved first since
     ``kvikio_nthreads`` and ``kvikio_task_size`` default differently depending
     on it; the shared, single source of truth for that ordering lives here so

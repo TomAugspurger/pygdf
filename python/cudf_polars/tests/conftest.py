@@ -15,7 +15,6 @@ from cudf_polars.testing.engine_utils import (
     ALL_ENGINE_FIXTURE_PARAMS,
     STREAMING_ENGINE_FIXTURE_PARAMS,
     EngineFixtureParam,
-    configure_streaming_engine,
     create_streaming_options,
     merge_streaming_options,
 )
@@ -39,10 +38,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
     from cudf_polars.engine.core import StreamingEngine
-    from cudf_polars.engine.dask import DaskEngine
+    from cudf_polars.engine.dask import DaskCluster, DaskEngine
     from cudf_polars.engine.options import StreamingOptions
-    from cudf_polars.engine.ray import RayEngine
-    from cudf_polars.engine.spmd import SPMDEngine
+    from cudf_polars.engine.ray import RayCluster, RayEngine
+    from cudf_polars.engine.spmd import SPMDCluster, SPMDEngine
 
 
 @pytest.fixture(scope="session")
@@ -119,215 +118,364 @@ def _engine_param(request: pytest.FixtureRequest) -> EngineFixtureParam:
 
 
 @pytest.fixture(scope="session")
-def _unconfigured_engine(
-    _engine_param: EngineFixtureParam,
+def spmd_cluster() -> Generator[SPMDCluster, None, None]:
+    """
+    Session-scoped :class:`~cudf_polars.engine.spmd.SPMDCluster`.
+
+    Bootstraps the UCX communicator and rapidsmpf resources once per test
+    session. Individual tests obtain :class:`SPMDEngine` instances from this
+    cluster via :meth:`~cudf_polars.engine.spmd.SPMDCluster.make_engine`,
+    which is fast because the expensive physical setup is already done.
+    """
+    from cudf_polars.engine.spmd import SPMDCluster
+
+    with SPMDCluster() as cluster:
+        yield cluster
+
+
+@pytest.fixture(scope="session")
+def dask_cluster() -> Generator[DaskCluster, None, None]:
+    """
+    Session-scoped :class:`~cudf_polars.engine.dask.DaskCluster`.
+
+    Bootstraps the Dask client and UCX communicators once per test session.
+    Individual tests obtain :class:`DaskEngine` instances via
+    :meth:`~cudf_polars.engine.dask.DaskCluster.make_engine`.
+    """
+    pytest.importorskip("distributed")
+    from cudf_polars.engine.dask import DaskCluster
+
+    with DaskCluster(engine_options={"allow_gpu_sharing": True}) as cluster:
+        yield cluster
+
+
+@pytest.fixture(scope="session")
+def ray_cluster(
     ray_num_ranks: int,
     ray_init_options: dict[str, Any],
-) -> Generator[tuple[pl.GPUEngine, StreamingOptions | None], None, None]:
+) -> Generator[RayCluster, None, None]:
     """
-    Fixture generating an engine resource and options to apply before use.
+    Session-scoped :class:`~cudf_polars.engine.ray.RayCluster`.
 
-    Parameters
-    ----------
-    _engine_param
-        The parameterisation of the engine
+    Bootstraps Ray and UCX communicators once per test session.
+    Individual tests obtain :class:`RayEngine` instances via
+    :meth:`~cudf_polars.engine.ray.RayCluster.make_engine`.
+    """
+    pytest.importorskip("ray")
+    from cudf_polars.engine.ray import RayCluster
 
-    Returns
-    -------
-    tuple
-        Of an engine and options to apply to the engine to configure it (or
-        None if no configuration is needed).
+    with RayCluster(
+        num_ranks=ray_num_ranks,
+        engine_options={"allow_gpu_sharing": True},
+        ray_init_options=ray_init_options,
+    ) as cluster:
+        yield cluster
 
-    Notes
-    -----
-    This session-scoped fixture keeps the heavy state of an engine alive
-    for the lifetime of its use, shutting it down once the particular
-    engine is not required any more. Tests should not use this fixture
-    directly, but rather one of the parameterised "public" engine fixtures.
-    Those take care of applying the configuration to the base engine each
-    time it is used in a test.
+
+@pytest.fixture(scope="session")
+def _unconfigured_engine(
+    _engine_param: EngineFixtureParam,
+    spmd_cluster: SPMDCluster,
+    request: pytest.FixtureRequest,
+) -> Generator[
+    tuple[
+        pl.GPUEngine | SPMDCluster | DaskCluster | RayCluster, StreamingOptions | None
+    ],
+    None,
+    None,
+]:
+    """
+    Fixture generating a cluster/engine and baseline options for each test.
+
+    For all streaming backends this now yields the session-scoped cluster so
+    per-test fixtures can call :meth:`make_engine` cheaply without paying the
+    bootstrap cost again.  The in-memory backend still yields a plain engine.
+
+    Dask and Ray clusters are resolved lazily via ``request.getfixturevalue``
+    so that SPMD-only tests are not skipped when those packages are absent.
+
+    Tests should not use this fixture directly; use the public fixtures.
     """
     if _engine_param.engine_name == "in-memory":
         yield pl.GPUEngine(executor="in-memory", raise_on_fail=True), None
     else:
-        engine: StreamingEngine
         if _engine_param.engine_name in ("dask", "ray") and is_running_with_rrun():
             pytest.skip(
                 f"{_engine_param.engine_name} engine cannot be constructed "
                 "inside an rrun cluster"
             )
         match _engine_param.engine_name:
-            case "spmd":
-                from cudf_polars.engine.spmd import SPMDEngine
-
-                engine = SPMDEngine()
+            case "spmd" | "spmd-small":
+                yield (
+                    spmd_cluster,
+                    create_streaming_options(_engine_param.blocksize_mode),
+                )
             case "dask":  # pragma: no cover
-                from cudf_polars.engine.dask import DaskEngine
-
-                engine = DaskEngine(engine_options={"allow_gpu_sharing": True})
+                yield (
+                    request.getfixturevalue("dask_cluster"),
+                    create_streaming_options(_engine_param.blocksize_mode),
+                )
             case "ray":  # pragma: no cover
-                from cudf_polars.engine.ray import RayEngine
-
-                # Always specify num_ranks so the engine has a fixed size
-                # regardless of how many GPUs the host happens to have;
-                # otherwise ``RayEngine`` defaults to
-                # ``get_num_gpus_in_ray_cluster()``
-                engine = RayEngine(
-                    num_ranks=ray_num_ranks,
-                    engine_options={"allow_gpu_sharing": True},
-                    ray_init_options=ray_init_options,
+                yield (
+                    request.getfixturevalue("ray_cluster"),
+                    create_streaming_options(_engine_param.blocksize_mode),
                 )
             case _:  # pragma: no cover
                 raise ValueError(
                     f"Unknown streaming engine: {_engine_param.engine_name!r}"
                 )
-        with engine:
-            yield engine, create_streaming_options(_engine_param.blocksize_mode)
+
+
+def _engine_from_unconfigured(
+    thing: pl.GPUEngine | SPMDCluster | DaskCluster | RayCluster,
+    options: StreamingOptions,
+) -> StreamingEngine:
+    """
+    Produce a configured engine from the ``_unconfigured_engine`` fixture value.
+
+    For :class:`~cudf_polars.engine.spmd.SPMDCluster`,
+    :class:`~cudf_polars.engine.dask.DaskCluster`, and
+    :class:`~cudf_polars.engine.ray.RayCluster` this calls
+    :meth:`make_engine` with the resolved options. For SPMD, if rapidsmpf
+    options (e.g. ``statistics=True``) differ from the cluster's defaults, a
+    fresh :class:`~cudf_polars.engine.spmd.SPMDEngine` with its own cluster
+    is created so the requested ``Context`` settings take effect.
+    """
+    from cudf_polars.engine.spmd import SPMDCluster as _SPMDCluster
+
+    if isinstance(thing, _SPMDCluster):
+        # If the options request non-default rapidsmpf settings the cluster
+        # must be rebuilt with them, since they affect the rapidsmpf Context.
+        from cudf_polars.engine.options import StreamingOptions as _StreamingOptions
+        from cudf_polars.engine.spmd import SPMDEngine
+
+        default_rmpf = _StreamingOptions().to_rapidsmpf_options()
+        requested_rmpf = options.to_rapidsmpf_options()
+        if str(requested_rmpf) != str(default_rmpf):
+            # Rapidsmpf options differ → need a dedicated cluster.
+            return SPMDEngine.from_options(options)
+        return thing.make_engine(
+            executor_options=options.to_executor_options(),
+            engine_options=options.to_engine_options(),
+        )
+    # Dask / Ray cluster: import lazily so missing optional packages don't
+    # break SPMD-only tests.
+    from cudf_polars.engine.options import StreamingOptions as _StreamingOptions
+
+    default_rmpf = _StreamingOptions().to_rapidsmpf_options()
+    requested_rmpf = options.to_rapidsmpf_options()
+    rmpf_differ = str(requested_rmpf) != str(default_rmpf)
+
+    try:
+        from cudf_polars.engine.dask import DaskCluster as _DaskCluster, DaskEngine
+
+        if isinstance(thing, _DaskCluster):
+            if rmpf_differ:
+                return DaskEngine.from_options(options)
+            return thing.make_engine(
+                executor_options=options.to_executor_options(),
+                engine_options=options.to_engine_options(),
+            )
+    except ImportError:
+        pass
+    try:
+        from cudf_polars.engine.ray import RayCluster as _RayCluster, RayEngine
+
+        if isinstance(thing, _RayCluster):
+            if rmpf_differ:
+                return RayEngine.from_options(options)
+            return thing.make_engine(
+                executor_options=options.to_executor_options(),
+                engine_options=options.to_engine_options(),
+            )
+    except ImportError:
+        pass
+    raise RuntimeError(f"Unexpected unconfigured engine type: {type(thing)}")
 
 
 @pytest.fixture
 def spmd_engine(
-    _unconfigured_engine: tuple[SPMDEngine, StreamingOptions],
-) -> SPMDEngine:
-    """Return the shared configured :class:`SPMDEngine`."""
-    engine, options = _unconfigured_engine
-    return configure_streaming_engine(engine, options)
+    _unconfigured_engine: tuple[SPMDCluster, StreamingOptions],
+) -> Generator[SPMDEngine, None, None]:
+    """Yield a per-test :class:`SPMDEngine` from the shared cluster."""
+    from cudf_polars.engine.spmd import SPMDEngine as _SPMDEngine
+
+    thing, options = _unconfigured_engine
+    engine = _engine_from_unconfigured(thing, options)
+    assert isinstance(engine, _SPMDEngine)
+    try:
+        yield engine
+    finally:
+        engine.shutdown()
 
 
 @pytest.fixture
 def spmd_engine_factory(
-    _unconfigured_engine: tuple[SPMDEngine, StreamingOptions],
-) -> Callable[[StreamingOptions], SPMDEngine]:
+    _unconfigured_engine: tuple[SPMDCluster, StreamingOptions],
+) -> Generator[Callable[[StreamingOptions], SPMDEngine], None, None]:
     """
-    Return a function that, when called, produces a :class:`SPMDEngine`.
+    Yield a function that, when called, produces a :class:`SPMDEngine`.
 
-    Parameters
-    ----------
-    _unconfigured_engine
-        Session-scoped engine selected by pytest parametrization.
-
-    Returns
-    -------
-    Factory function that returns the shared :class:`SPMDEngine` when
-    provided with :class:`StreamingOptions`.
-
-    Notes
-    -----
     Use this in place of :func:`streaming_engine_factory` for tests that
     must run on SPMD only.
     """
-    engine, base = _unconfigured_engine
+    thing, base = _unconfigured_engine
+    owned: list[SPMDEngine] = []
 
     def factory(options: StreamingOptions) -> SPMDEngine:
-        return configure_streaming_engine(
-            engine,
-            merge_streaming_options(base, options),
-        )
+        from cudf_polars.engine.spmd import SPMDEngine as _SPMDEngine
 
-    return factory
+        engine = _engine_from_unconfigured(
+            thing, merge_streaming_options(base, options)
+        )
+        assert isinstance(engine, _SPMDEngine)
+        if engine._owns_cluster:
+            owned.append(engine)
+        return engine
+
+    try:
+        yield factory
+    finally:
+        for eng in owned:
+            eng.shutdown()
 
 
 @pytest.fixture
 def ray_engine(
-    _unconfigured_engine: tuple[RayEngine, StreamingOptions],
-) -> RayEngine:
-    """Return the shared configured :class:`RayEngine`."""
-    engine, options = _unconfigured_engine
-    return configure_streaming_engine(engine, options)
+    _unconfigured_engine: tuple[RayCluster, StreamingOptions],
+) -> Generator[RayEngine, None, None]:
+    """Yield a per-test :class:`RayEngine` from the shared cluster."""
+    from cudf_polars.engine.ray import RayEngine as _RayEngine
+
+    thing, options = _unconfigured_engine
+    engine = _engine_from_unconfigured(thing, options)
+    assert isinstance(engine, _RayEngine)
+    try:
+        yield engine
+    finally:
+        engine.shutdown()
 
 
 @pytest.fixture
 def dask_engine(
-    _unconfigured_engine: tuple[DaskEngine, StreamingOptions],
-) -> DaskEngine:
-    """Return the shared configured :class:`DaskEngine`."""
-    engine, options = _unconfigured_engine
-    return configure_streaming_engine(engine, options)
+    _unconfigured_engine: tuple[DaskCluster, StreamingOptions],
+) -> Generator[DaskEngine, None, None]:
+    """Yield a per-test :class:`DaskEngine` from the shared cluster."""
+    from cudf_polars.engine.dask import DaskEngine as _DaskEngine
+
+    thing, options = _unconfigured_engine
+    engine = _engine_from_unconfigured(thing, options)
+    assert isinstance(engine, _DaskEngine)
+    try:
+        yield engine
+    finally:
+        engine.shutdown()
 
 
 @pytest.fixture
 def streaming_engine_factory(
-    _unconfigured_engine: tuple[StreamingEngine, StreamingOptions],
-) -> Callable[[StreamingOptions], StreamingEngine]:
+    _unconfigured_engine: tuple[
+        StreamingEngine | SPMDCluster | DaskCluster | RayCluster, StreamingOptions
+    ],
+) -> Generator[Callable[[StreamingOptions], StreamingEngine], None, None]:
     """
-    Return a function that, when called, produces a :class:`StreamingEngine`.
+    Yield a function that, when called, produces a :class:`StreamingEngine`.
 
-    Parameters
-    ----------
-    _unconfigured_engine
-        Session-scoped engine selected by pytest parametrization.
-
-    Returns
-    -------
-    Factory function that returns the shared :class:`StreamingEngine` when
-    provided with :class:`StreamingOptions`.
+    Engines that own their own cluster (created when rapidsmpf options differ
+    from the session cluster) are tracked and shut down after the test.
     """
-    engine, base = _unconfigured_engine
+    thing, base = _unconfigured_engine
+    owned: list[StreamingEngine] = []
 
     def factory(options: StreamingOptions) -> StreamingEngine:
-        return configure_streaming_engine(
-            engine,
-            merge_streaming_options(base, options),
+        engine = _engine_from_unconfigured(
+            thing, merge_streaming_options(base, options)
         )
+        if getattr(engine, "_owns_cluster", False):
+            owned.append(engine)
+        return engine
 
-    return factory
+    try:
+        yield factory
+    finally:
+        for eng in owned:
+            eng.shutdown()
 
 
 @pytest.fixture
 def streaming_engine(
-    _unconfigured_engine: tuple[StreamingEngine, StreamingOptions],
-) -> StreamingEngine:
+    _unconfigured_engine: tuple[
+        StreamingEngine | SPMDCluster | DaskCluster | RayCluster, StreamingOptions
+    ],
+) -> Generator[StreamingEngine, None, None]:
     """
-    Return the shared configured :class:`StreamingEngine`.
+    Yield a per-test :class:`StreamingEngine`.
 
-    Inherits the parametrization of ``_unconfigured_engine``, so
-    tests using this fixture run once per ``(backend, blocksize_mode)``
-    combination.
-
-    Parameters
-    ----------
-    _unconfigured_engine
-        Session-scoped engine selected by pytest parametrization.
-
-    Returns
-    -------
-    A streaming engine configured with the parametrized baseline.
+    Inherits the parametrization of ``_unconfigured_engine``, so tests using
+    this fixture run once per ``(backend, blocksize_mode)`` combination.
     """
-    engine, options = _unconfigured_engine
-    return configure_streaming_engine(engine, options)
+    thing, options = _unconfigured_engine
+    engine = _engine_from_unconfigured(thing, options)
+    from cudf_polars.engine.spmd import SPMDCluster as _SPMDCluster
+
+    is_cluster_engine = isinstance(thing, _SPMDCluster)
+    if not is_cluster_engine:
+        try:
+            from cudf_polars.engine.dask import DaskCluster as _DaskCluster
+            from cudf_polars.engine.ray import RayCluster as _RayCluster
+
+            is_cluster_engine = isinstance(thing, (_DaskCluster, _RayCluster))
+        except ImportError:
+            pass
+    if is_cluster_engine:
+        try:
+            yield engine
+        finally:
+            engine.shutdown()
+    else:
+        yield engine
 
 
 @pytest.fixture
 def engine(
-    _unconfigured_engine: tuple[pl.GPUEngine, StreamingOptions | None],
-) -> pl.GPUEngine:
+    _unconfigured_engine: tuple[
+        pl.GPUEngine | SPMDCluster | DaskCluster | RayCluster, StreamingOptions | None
+    ],
+) -> Generator[pl.GPUEngine, None, None]:
     """
-    Return a :class:`polars.GPUEngine` for each engine variant under test.
+    Yield a :class:`polars.GPUEngine` for each engine variant under test.
 
     Every variant is configured with ``raise_on_fail=True``, so an unsupported
     GPU path raises instead of silently falling back to the CPU engine.
-
-    Parameters
-    ----------
-    _unconfigured_engine
-        Session-scoped engine selected by pytest parametrization.
-
-    Returns
-    -------
-    Engine instance matching the parametrized variant.
 
     Notes
     -----
     For tests that require a :class:`StreamingEngine` only, use the
     :func:`streaming_engine` fixture instead.
     """
-    engine, options = _unconfigured_engine
+    thing, options = _unconfigured_engine
     if options is None:
-        return engine
-    from cudf_polars.engine.core import StreamingEngine
+        yield thing  # type: ignore[misc]
+        return
+    eng = _engine_from_unconfigured(thing, options)
+    from cudf_polars.engine.spmd import SPMDCluster as _SPMDCluster
 
-    assert isinstance(engine, StreamingEngine)
-    return configure_streaming_engine(engine, options)
+    is_cluster_engine = isinstance(thing, _SPMDCluster)
+    if not is_cluster_engine:
+        try:
+            from cudf_polars.engine.dask import DaskCluster as _DaskCluster
+            from cudf_polars.engine.ray import RayCluster as _RayCluster
+
+            is_cluster_engine = isinstance(thing, (_DaskCluster, _RayCluster))
+        except ImportError:
+            pass
+    if is_cluster_engine:
+        try:
+            yield eng
+        finally:
+            eng.shutdown()
+    else:
+        yield eng
 
 
 @pytest.fixture

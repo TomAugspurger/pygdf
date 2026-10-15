@@ -23,7 +23,6 @@ from rapidsmpf.bootstrap import is_running_with_rrun
 from rapidsmpf.rmm_resource_adaptor import RmmResourceAdaptor
 
 from cudf_polars.engine.core import _find_memory_error, all_gather_host_data
-from cudf_polars.engine.hardware_binding import HardwareBindingPolicy
 from cudf_polars.engine.options import StreamingOptions
 from cudf_polars.engine.spmd import (
     SPMDEngine,
@@ -43,12 +42,7 @@ pytestmark = pytest.mark.spmd
 
 @pytest.fixture
 def comm(spmd_engine: SPMDEngine) -> Communicator:
-    """Communicator from the shared :class:`SPMDEngine` for local construction.
-
-    Most tests in this module need to construct their own
-    :class:`SPMDEngine` to exercise lifecycle, construction-time
-    options, MR-state semantics, or :meth:`SPMDEngine._reset`.
-    """
+    """Communicator from the shared :class:`SPMDEngine` for local construction."""
     return spmd_engine.comm
 
 
@@ -382,82 +376,53 @@ def test_execute_duplicated_result_chained_into_distributed_agg(
     assert total["total"].to_list() == [3.0]
 
 
-def test_reset_keeps_comm_alive(comm: Communicator) -> None:
-    """``_reset`` must not rebuild the communicator."""
-    with SPMDEngine(
-        comm=comm, executor_options={"max_rows_per_partition": 10}
-    ) as engine:
-        comm_before = engine.comm
-        engine._reset(executor_options={"max_rows_per_partition": 7})
-        # Same Communicator instance — caller-provided comm is preserved.
-        assert engine.comm is comm_before
-        # Engine still drives a real query.
-        result = pl.LazyFrame({"a": [1, 2, 3]}).collect(engine=engine)
+def test_make_engine_reuses_cluster(spmd_engine: SPMDEngine) -> None:
+    """Two engines from the same cluster share the underlying communicator."""
+    cluster = spmd_engine.cluster
+    e2 = cluster.make_engine(executor_options={"max_rows_per_partition": 7})
+    try:
+        assert e2.comm is spmd_engine.comm
+        result = pl.LazyFrame({"a": [1, 2, 3]}).collect(engine=e2)
         assert sorted(result["a"].to_list()) == [1, 2, 3]
+    finally:
+        e2.shutdown()
 
 
-def test_reset_updates_executor_options(comm: Communicator) -> None:
-    """``_reset`` updates the polars-layer config to the new options."""
+def test_make_engine_with_options(spmd_engine: SPMDEngine) -> None:
+    """Engine created via ``make_engine`` carries the requested options."""
     from cudf_polars.utils.config import SPMDContext
 
-    with SPMDEngine(
-        comm=comm, executor_options={"max_rows_per_partition": 10}
-    ) as engine:
-        engine._reset(executor_options={"max_rows_per_partition": 42})
-
-        opts = engine.config["executor_options"]
+    cluster = spmd_engine.cluster
+    e2 = cluster.make_engine(executor_options={"max_rows_per_partition": 42})
+    try:
+        opts = e2.config["executor_options"]
         assert opts["max_rows_per_partition"] == 42
-        # Reserved keys are still injected by ``_reset``.
         assert opts["cluster"] == "spmd"
         assert isinstance(opts["spmd_context"], SPMDContext)
+    finally:
+        e2.shutdown()
 
 
-def test_reset_collects_after_options_change(comm: Communicator) -> None:
-    """The engine still drives a real query after ``_reset``."""
-    with SPMDEngine(
-        comm=comm, executor_options={"max_rows_per_partition": 10}
-    ) as engine:
-        engine._reset(executor_options={"max_rows_per_partition": 3})
-        result = pl.LazyFrame({"a": [1, 2, 3, 4, 5]}).collect(engine=engine)
+def test_make_engine_and_collect(spmd_engine: SPMDEngine) -> None:
+    """Engine from ``make_engine`` drives a real query."""
+    cluster = spmd_engine.cluster
+    e2 = cluster.make_engine(executor_options={"max_rows_per_partition": 3})
+    try:
+        result = pl.LazyFrame({"a": [1, 2, 3, 4, 5]}).collect(engine=e2)
         assert sorted(result["a"].to_list()) == [1, 2, 3, 4, 5]
+    finally:
+        e2.shutdown()
 
 
-def test_reset_after_shutdown_raises(comm: Communicator) -> None:
-    """``shutdown`` is idempotent; ``_reset`` after shutdown raises every time."""
-    engine = SPMDEngine(comm=comm)
-    engine.shutdown()
-    engine.shutdown()  # idempotent
+def test_make_engine_after_cluster_shutdown_raises() -> None:
+    """``make_engine`` raises after the cluster is shut down."""
+    from cudf_polars.engine.spmd import SPMDCluster
+
+    cluster = SPMDCluster()
+    cluster.shutdown()
+    cluster.shutdown()  # idempotent
     with pytest.raises(RuntimeError, match="shut-down"):
-        engine._reset()
-    with pytest.raises(RuntimeError, match="shut-down"):
-        engine._reset()  # still raises on a second attempt
-    engine.shutdown()  # still safe after a failed _reset
-
-
-def test_reset_rejects_construction_time_executor_options(
-    comm: Communicator,
-) -> None:
-    """``_reset`` rejects ``executor_options`` keys read at engine construction."""
-    with (
-        SPMDEngine(comm=comm) as engine,
-        pytest.raises(ValueError, match="num_py_executors"),
-    ):
-        engine._reset(executor_options={"num_py_executors": 4})
-
-
-def test_reset_rejects_construction_time_engine_options(
-    comm: Communicator,
-) -> None:
-    """``_reset`` rejects ``engine_options`` keys read at engine construction."""
-    with SPMDEngine(comm=comm) as engine:
-        with pytest.raises(ValueError, match="hardware_binding"):
-            engine._reset(
-                engine_options={
-                    "hardware_binding": HardwareBindingPolicy(enabled=False),
-                },
-            )
-        with pytest.raises(ValueError, match="memory_resource_config"):
-            engine._reset(engine_options={"memory_resource_config": None})
+        cluster.make_engine()
 
 
 # Group keys probed with num_partitions=2, nranks=2, ROUND_ROBIN:

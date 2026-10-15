@@ -7,14 +7,13 @@ from __future__ import annotations
 
 import importlib.util
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     import polars as pl
 
-    from cudf_polars.engine.core import StreamingEngine
     from cudf_polars.engine.options import StreamingOptions
 
 
@@ -124,9 +123,9 @@ def create_streaming_options(
     from cudf_polars.engine.options import StreamingOptions
     from cudf_polars.utils.config import StreamingFallbackMode
 
-    # ``allow_gpu_sharing=True`` is always set so the cached multi-rank
-    # engines (Dask workers, Ray actors with ``num_ranks > 1``) don't trip
-    # the UUID-collision guard on every ``_reset(...)``.
+    # ``allow_gpu_sharing=True`` is always set so multi-rank engines
+    # (Dask workers, Ray actors with ``num_ranks > 1``) don't trip the
+    # UUID-collision guard.
     match blocksize_mode:
         case "medium":
             return StreamingOptions(
@@ -169,34 +168,6 @@ def merge_streaming_options(
     from cudf_polars.engine.options import StreamingOptions
 
     return StreamingOptions(**{**base.to_dict(), **overrides.to_dict()})
-
-
-EngineT = TypeVar("EngineT", bound="StreamingEngine")
-
-
-def configure_streaming_engine[EngineT: "StreamingEngine"](
-    engine: EngineT, options: StreamingOptions
-) -> EngineT:
-    """
-    Configure an engine with a set of options.
-
-    Parameters
-    ----------
-    engine
-        Streaming engine to configure. The caller owns its lifecycle.
-    options
-        Configuration options to apply to the engine.
-
-    Returns
-    -------
-    ``engine``, reset to the requested options.
-    """
-    engine._reset(
-        rapidsmpf_options=options.to_rapidsmpf_options(),
-        executor_options=options.to_executor_options(),
-        engine_options=options.to_engine_options(),
-    )
-    return engine
 
 
 def get_blocksize_mode(obj: pl.GPUEngine) -> Literal["medium", "small"]:

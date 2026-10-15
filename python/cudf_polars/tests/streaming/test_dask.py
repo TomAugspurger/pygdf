@@ -144,100 +144,55 @@ def test_run(dask_engine: DaskEngine) -> None:
     assert len(set(result)) == dask_engine.nranks
 
 
-@pytest.fixture(scope="module")
-def reset_engine(dask_client: distributed.Client) -> Iterator[DaskEngine]:
-    """Module-scoped engine for reset tests — independent of ``dask_engine``.
+def test_make_engine_reuses_workers(dask_engine: DaskEngine) -> None:
+    """Two engines from the same cluster share the same Dask workers."""
+    cluster = dask_engine.cluster
+    workers_before = sorted(cluster._client.scheduler_info(n_workers=-1)["workers"])
+    pids_before = sorted(dask_engine._run(os.getpid))
 
-    These tests exercise :meth:`DaskEngine._reset` (which mutates the
-    engine in-place). A dedicated fixture keeps those mutations from
-    leaking into the conftest-shared ``dask_engine``.
-
-    Note: Do not use this fixture if you call _reset with a new dask_client.
-    """
-    with DaskEngine(
-        executor_options={"max_rows_per_partition": 10},
-        dask_client=dask_client,
-    ) as e:
-        yield e
-
-
-def test_reset_keeps_workers_alive(reset_engine: DaskEngine) -> None:
-    """``_reset`` must not respawn dask workers."""
-    workers_before = sorted(
-        reset_engine._dask_ctx.client.scheduler_info(n_workers=-1)["workers"]
-    )
-    pids_before = sorted(reset_engine._run(os.getpid))
-
-    reset_engine._reset(executor_options={"max_rows_per_partition": 7})
-
-    workers_after = sorted(
-        reset_engine._dask_ctx.client.scheduler_info(n_workers=-1)["workers"]
-    )
-    pids_after = sorted(reset_engine._run(os.getpid))
-
-    # Same worker addresses …
-    assert workers_before == workers_after
-    # … and the workers are running in the same OS processes.
-    assert pids_before == pids_after
+    e2 = cluster.make_engine(executor_options={"max_rows_per_partition": 7})
+    try:
+        workers_after = sorted(cluster._client.scheduler_info(n_workers=-1)["workers"])
+        pids_after = sorted(e2._run(os.getpid))
+        assert workers_before == workers_after
+        assert pids_before == pids_after
+    finally:
+        e2.shutdown()
 
 
-def test_reset_updates_executor_options(reset_engine: DaskEngine) -> None:
-    """``_reset`` updates the polars-layer config to the new options."""
-    reset_engine._reset(executor_options={"max_rows_per_partition": 42})
-
-    opts = reset_engine.config["executor_options"]
-    assert opts["max_rows_per_partition"] == 42
-    # Reserved keys are still injected by ``_reset``.
-    assert opts["cluster"] == "dask"
-    assert isinstance(opts["dask_context"], DaskContext)
-
-
-def test_reset_collects_after_options_change(reset_engine: DaskEngine) -> None:
-    """The engine still drives a real query after ``_reset``."""
-    reset_engine._reset(executor_options={"max_rows_per_partition": 3})
-    assert_gpu_result_equal(
-        pl.LazyFrame({"a": [1, 2, 3, 4, 5]}),
-        engine=reset_engine,
-        check_row_order=False,
-    )
+def test_make_engine_with_options(dask_engine: DaskEngine) -> None:
+    """Engine created via ``make_engine`` carries the requested options."""
+    cluster = dask_engine.cluster
+    e2 = cluster.make_engine(executor_options={"max_rows_per_partition": 42})
+    try:
+        opts = e2.config["executor_options"]
+        assert opts["max_rows_per_partition"] == 42
+        assert opts["cluster"] == "dask"
+        assert isinstance(opts["dask_context"], DaskContext)
+    finally:
+        e2.shutdown()
 
 
-def test_reset_after_shutdown_raises(dask_client: distributed.Client) -> None:
-    """``shutdown`` is idempotent; ``_reset`` after shutdown raises every time."""
-    engine = DaskEngine(
-        dask_client=dask_client,
-        executor_options={"max_rows_per_partition": 10},
-    )
-    engine.shutdown()
-    engine.shutdown()  # idempotent
-    with pytest.raises(RuntimeError, match="shut-down"):
-        engine._reset()
-    with pytest.raises(RuntimeError, match="shut-down"):
-        engine._reset()  # still raises on a second attempt
-    engine.shutdown()  # still safe after a failed _reset
-
-
-def test_reset_rejects_construction_time_executor_options(
-    reset_engine: DaskEngine,
-) -> None:
-    """``_reset`` rejects ``executor_options`` keys read at worker setup."""
-    with pytest.raises(ValueError, match="num_py_executors"):
-        reset_engine._reset(executor_options={"num_py_executors": 4})
-
-
-def test_reset_rejects_construction_time_engine_options(
-    reset_engine: DaskEngine,
-) -> None:
-    """``_reset`` rejects ``engine_options`` keys read at worker setup."""
-    from cudf_polars.engine.hardware_binding import (
-        HardwareBindingPolicy,
-    )
-
-    with pytest.raises(ValueError, match="hardware_binding"):
-        reset_engine._reset(
-            engine_options={
-                "hardware_binding": HardwareBindingPolicy(enabled=False),
-            },
+def test_make_engine_and_collect(dask_engine: DaskEngine) -> None:
+    """Engine from ``make_engine`` drives a real query."""
+    cluster = dask_engine.cluster
+    e2 = cluster.make_engine(executor_options={"max_rows_per_partition": 3})
+    try:
+        assert_gpu_result_equal(
+            pl.LazyFrame({"a": [1, 2, 3, 4, 5]}),
+            engine=e2,
+            check_row_order=False,
         )
-    with pytest.raises(ValueError, match="memory_resource_config"):
-        reset_engine._reset(engine_options={"memory_resource_config": None})
+    finally:
+        e2.shutdown()
+
+
+def test_make_engine_after_cluster_shutdown_raises() -> None:
+    """``make_engine`` raises after the cluster is shut down."""
+    from cudf_polars.engine.dask import DaskCluster
+
+    cluster = DaskCluster()
+    cluster.shutdown()
+    cluster.shutdown()  # idempotent
+    with pytest.raises(RuntimeError, match="shut-down"):
+        cluster.make_engine()

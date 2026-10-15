@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -14,15 +14,10 @@ import polars as pl
 
 from rapidsmpf.bootstrap import is_running_with_rrun
 
-from cudf_polars.engine.hardware_binding import HardwareBindingPolicy
 from cudf_polars.utils.config import RayContext
 
 ray = pytest.importorskip("ray")
 from cudf_polars.engine.ray import RayEngine  # noqa: E402
-
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
 
 pytestmark = [
     pytest.mark.skipif(
@@ -121,120 +116,74 @@ def test_num_ranks_oversubscribes(ray_engine: RayEngine, ray_num_ranks: int) -> 
     assert sorted(result["a"].to_list()) == [1, 2, 3, 4]
 
 
-@pytest.fixture(scope="module")
-def reset_engine(
-    ray_num_ranks: int,
-    ray_init_options: dict[str, Any],
-) -> Iterator[RayEngine]:
-    """Module-scoped engine for reset tests — independent of ``ray_engine``.
+def test_make_engine_reuses_actors(ray_engine: RayEngine) -> None:
+    """Two engines from the same cluster share the same Ray actors."""
+    cluster = ray_engine.cluster
+    assert cluster._rank_actors is not None
+    actors_before = list(cluster._rank_actors)
+    pids_before = ray_engine._run(os.getpid)
 
-    These tests exercise :meth:`RayEngine._reset` (which mutates the
-    engine in-place). A dedicated fixture keeps those mutations from
-    leaking into the conftest-shared ``ray_engine``.
-    """
-    with RayEngine(
-        executor_options={"max_rows_per_partition": 10},
-        engine_options={"allow_gpu_sharing": True},
-        num_ranks=ray_num_ranks,
-        ray_init_options=ray_init_options,
-    ) as e:
-        yield e
-
-
-def test_reset_keeps_actors_alive(reset_engine: RayEngine) -> None:
-    """``_reset`` must not respawn rank actor processes."""
-    actors_before = list(reset_engine.rank_actors)
-    pids_before = reset_engine._run(os.getpid)
-
-    reset_engine._reset(
+    e2 = cluster.make_engine(
         executor_options={"max_rows_per_partition": 7},
         engine_options={"allow_gpu_sharing": True},
     )
+    try:
+        assert cluster._rank_actors is not None
+        actors_after = list(cluster._rank_actors)
+        pids_after = e2._run(os.getpid)
+        assert all(a is b for a, b in zip(actors_before, actors_after, strict=True))
+        assert pids_before == pids_after
+    finally:
+        e2.shutdown()
 
-    actors_after = list(reset_engine.rank_actors)
-    pids_after = reset_engine._run(os.getpid)
 
-    # The Python ``ActorHandle`` objects are the same instances …
-    assert all(a is b for a, b in zip(actors_before, actors_after, strict=True))
-    # … and the actors are running in the same OS processes.
-    assert pids_before == pids_after
-
-
-def test_reset_updates_executor_options(reset_engine: RayEngine) -> None:
-    """``_reset`` updates the polars-layer config to the new options."""
-    reset_engine._reset(
+def test_make_engine_with_options(ray_engine: RayEngine) -> None:
+    """Engine created via ``make_engine`` carries the requested options."""
+    cluster = ray_engine.cluster
+    e2 = cluster.make_engine(
         executor_options={"max_rows_per_partition": 42},
         engine_options={"allow_gpu_sharing": True},
     )
+    try:
+        opts = e2.config["executor_options"]
+        assert opts["max_rows_per_partition"] == 42
+        assert opts["cluster"] == "ray"
+        assert isinstance(opts["ray_context"], RayContext)
+        assert opts["ray_context"].rank_actors == cluster._rank_actors
+    finally:
+        e2.shutdown()
 
-    opts = reset_engine.config["executor_options"]
-    assert opts["max_rows_per_partition"] == 42
-    # Reserved keys are still injected by ``_reset``.
-    assert opts["cluster"] == "ray"
-    assert isinstance(opts["ray_context"], RayContext)
-    assert opts["ray_context"].rank_actors == reset_engine.rank_actors
 
-
-def test_reset_collects_after_options_change(reset_engine: RayEngine) -> None:
-    """The engine still drives a real query after ``_reset``."""
-    reset_engine._reset(
+def test_make_engine_and_collect(ray_engine: RayEngine) -> None:
+    """Engine from ``make_engine`` drives a real query."""
+    cluster = ray_engine.cluster
+    e2 = cluster.make_engine(
         executor_options={"max_rows_per_partition": 3},
         engine_options={"allow_gpu_sharing": True},
     )
-    result = pl.LazyFrame({"a": [1, 2, 3, 4, 5]}).collect(engine=reset_engine)
-    assert sorted(result["a"].to_list()) == [1, 2, 3, 4, 5]
+    try:
+        result = pl.LazyFrame({"a": [1, 2, 3, 4, 5]}).collect(engine=e2)
+        assert sorted(result["a"].to_list()) == [1, 2, 3, 4, 5]
+    finally:
+        e2.shutdown()
 
 
-def test_reset_after_shutdown_raises(
+def test_make_engine_after_cluster_shutdown_raises(
     ray_init_options: dict[str, Any],
+    ray_num_ranks: int,
 ) -> None:
-    """``shutdown`` is idempotent; ``_reset`` after shutdown raises every time."""
-    engine = RayEngine(
-        executor_options={"max_rows_per_partition": 10},
+    """``make_engine`` raises after the cluster is shut down."""
+    from cudf_polars.engine.ray import RayCluster
+
+    cluster = RayCluster(
+        num_ranks=ray_num_ranks,
         engine_options={"allow_gpu_sharing": True},
-        # This test covers a closed engine's client-side state only; it does
-        # not exercise collective shutdown, so one actor is sufficient.
-        num_ranks=1,
         ray_init_options=ray_init_options,
     )
-    engine.shutdown()
-    engine.shutdown()  # idempotent
+    cluster.shutdown()
+    cluster.shutdown()  # idempotent
     with pytest.raises(RuntimeError, match="shut-down"):
-        engine._reset()
-    with pytest.raises(RuntimeError, match="shut-down"):
-        engine._reset()  # still raises on a second attempt
-    engine.shutdown()  # still safe after a failed _reset
-
-
-def test_reset_rejects_construction_time_executor_options(
-    reset_engine: RayEngine,
-) -> None:
-    """``_reset`` rejects ``executor_options`` keys read at actor construction."""
-    with pytest.raises(ValueError, match="num_py_executors"):
-        reset_engine._reset(
-            executor_options={"num_py_executors": 4},
-            engine_options={"allow_gpu_sharing": True},
-        )
-
-
-def test_reset_rejects_construction_time_engine_options(
-    reset_engine: RayEngine,
-) -> None:
-    """``_reset`` rejects ``engine_options`` keys read at actor construction."""
-    with pytest.raises(ValueError, match="hardware_binding"):
-        reset_engine._reset(
-            engine_options={
-                "allow_gpu_sharing": True,
-                "hardware_binding": HardwareBindingPolicy(enabled=False),
-            },
-        )
-    with pytest.raises(ValueError, match="memory_resource_config"):
-        reset_engine._reset(
-            engine_options={
-                "allow_gpu_sharing": True,
-                "memory_resource_config": None,
-            },
-        )
+        cluster.make_engine(engine_options={"allow_gpu_sharing": True})
 
 
 def test_shutdown_skips_when_ray_not_initialized(
@@ -251,12 +200,12 @@ def test_shutdown_skips_when_ray_not_initialized(
     try:
         with patch("ray.is_initialized", return_value=False):
             engine.shutdown()  # must not raise, must not auto-init
-        # The exit stack is closed; rank_actors is cleared.
-        assert engine._rank_actors is None
+        # The exit stack is closed; cluster is cleared.
+        assert engine._cluster is None
     finally:
         # Defensive: if the guard somehow didn't fire, make sure the
         # actors are released so the next test's fixture isn't blocked.
-        if engine._rank_actors is not None:
+        if engine._cluster is not None:
             engine.shutdown()
 
 
@@ -285,7 +234,8 @@ def test_gathers_are_in_rank_order(ray_init_options: dict[str, Any]) -> None:
         # Hold the actors in descending rank order, so position and rank are
         # guaranteed to disagree. Without this, a position-ordered gather can
         # agree with rank order by luck.
-        engine._rank_actors = [actors[i] for i in reversed(ascending)]
+        assert engine._cluster is not None
+        engine._cluster._rank_actors = [actors[i] for i in reversed(ascending)]
 
         assert [info.pid for info in engine.gather_cluster_info()] == expected
 

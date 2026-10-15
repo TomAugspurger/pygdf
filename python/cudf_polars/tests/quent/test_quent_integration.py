@@ -21,8 +21,8 @@ from cudf_polars.utils.config import ConfigOptions
 
 pytest.importorskip("cudf_polars_quent")
 
-import cudf_polars.quent
 import cudf_polars.quent._runtime
+from cudf_polars.dsl.tracing import LOG_TRACES
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterator
@@ -36,48 +36,31 @@ if TYPE_CHECKING:
 def engine_with_quent_context(
     request: pytest.FixtureRequest,
     quent_context: QuentConfig,
-    ray_num_ranks: int,
-    ray_init_options: dict[str, Any],
+    spmd_cluster: Any,
+    dask_cluster: Any,
+    ray_cluster: Any,
 ) -> Iterator[StreamingEngine]:
+    """
+    Yield a streaming engine configured with Quent tracing.
+
+    All three backends reuse the session-scoped cluster, so the expensive
+    UCX / rapidsmpf / Ray bootstrap is paid only once per test session.
+    """
     backend = request.param
-    executor_options = {
+    executor_options: dict[str, Any] = {
         "quent_context": quent_context,
         "fallback_mode": "silent",
     }
-    engine: StreamingEngine
     if backend == "ray":
         pytest.importorskip("ray")
-        from cudf_polars.engine.ray import RayEngine
-
-        engine = RayEngine(
-            executor_options=executor_options,
-            engine_options={"allow_gpu_sharing": True},
-            ray_init_options=ray_init_options,
-            num_ranks=ray_num_ranks,
-        )
+        cluster = ray_cluster
     elif backend == "dask":
         pytest.importorskip("distributed")
-        from cudf_polars.engine.dask import DaskEngine
-
-        engine = DaskEngine(executor_options=executor_options)
+        cluster = dask_cluster
     else:
-        from rapidsmpf import bootstrap
-        from rapidsmpf.communicator.single import new_communicator
-        from rapidsmpf.config import Options, get_environment_variables
-        from rapidsmpf.progress_thread import ProgressThread
+        cluster = spmd_cluster
 
-        from cudf_polars.engine.spmd import SPMDEngine
-
-        comm = (
-            bootstrap.create_ucxx_comm(
-                progress_thread=ProgressThread(), type=bootstrap.BackendType.AUTO
-            )
-            if bootstrap.is_running_with_rrun()
-            else new_communicator(
-                Options(get_environment_variables()), ProgressThread()
-            )
-        )
-        engine = SPMDEngine(executor_options=executor_options, comm=comm)
+    engine: StreamingEngine = cluster.make_engine(executor_options=executor_options)
     try:
         yield engine
     finally:
@@ -236,11 +219,6 @@ def test_quent_lifecycle(
             pytest.raises(Exception),  # noqa: B017 - backend-specific wrapper
         ):
             failed_query.collect(engine=engine_with_quent_context)
-        with pytest.raises(ValueError, match="quent_context cannot be changed"):
-            engine_with_quent_context._reset(
-                executor_options={"quent_context": cudf_polars.quent.QuentConfig()}
-            )
-
         # StreamingExecutor
         config_options = ConfigOptions.from_polars_engine(engine_with_quent_context)
         hash_a = hash(config_options)
