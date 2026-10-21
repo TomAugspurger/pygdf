@@ -781,7 +781,11 @@ class SPMDEngine(StreamingEngine):
 
     def _shutdown_spmd(self) -> None:
         """Run collective cleanup before local resources unwind."""
-        steps: list[Callable[[], object]] = [self._drop_persisted]
+        steps: list[Callable[[], object]] = []
+        if self._py_executor is not None:
+            py_executor = self._py_executor
+            steps.append(lambda: py_executor.shutdown(wait=True, cancel_futures=True))
+        steps.append(self._drop_persisted)
         if self._quent_worker_runtime is not None:
             assert self._comm is not None
             comm = self._comm
