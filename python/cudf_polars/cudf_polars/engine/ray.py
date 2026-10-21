@@ -388,6 +388,7 @@ class RankActor:
                 rank=self._comm.rank,
                 nranks=self._nranks,
                 instance_name=f"RankActor-{self._worker_id.hex[:8]}",
+                buffer_resource=self._ctx.br(),
             )
 
     def close_quent(self) -> None:
@@ -494,9 +495,14 @@ class RankActor:
         try:
             # Drop persisted partitions before tearing down the Context.
             rank_local_store.close_all()
+            steps: list[Callable[[], object]] = []
+            if self._quent_worker_runtime is not None:
+                steps.append(self._quent_worker_runtime.close)
             if self._ctx is not None:
-                self._ctx.shutdown()
+                steps.append(self._ctx.shutdown)
+            run_cleanup_steps("Ray worker teardown failed", *steps)
         finally:
+            self._quent_worker_runtime = None
             self._ctx = None
             self._comm = None
             self._mr = None
@@ -751,15 +757,6 @@ def _shutdown_ray(
     """Release Ray resources in dependency order."""
     ray_running = ray.is_initialized()
     steps: list[Callable[[], object]] = []
-    if ray_running and quent_collector is not None:
-        steps.append(
-            lambda: ray.get([actor.close_quent.remote() for actor in rank_actors])
-        )
-    if quent_runtime is not None:
-        steps.append(quent_runtime.close)
-    elif quent_collector is not None:
-        steps.append(quent_collector.close)
-
     if ray_running:
 
         def shutdown_actors() -> None:
@@ -770,6 +767,10 @@ def _shutdown_ray(
             )
 
         steps.append(shutdown_actors)
+    if quent_runtime is not None:
+        steps.append(quent_runtime.close)
+    elif quent_collector is not None:
+        steps.append(quent_collector.close)
     if shutdown_ray:
         steps.append(ray.shutdown)
     run_cleanup_steps("Ray engine shutdown failed", *steps)

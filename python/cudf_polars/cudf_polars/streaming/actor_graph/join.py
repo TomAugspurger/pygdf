@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, Literal, assert_never
+from typing import TYPE_CHECKING, Any, Literal, assert_never, cast
 
 from cudf_streaming import CardinalityEstimator
 from cudf_streaming.channel_metadata import (
@@ -72,6 +72,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     process_children,
     recv_metadata,
     replay_buffered_channel,
+    reservation_attributes,
     sample_inputs,
     send_metadata,
     shutdown_on_error,
@@ -305,7 +306,15 @@ async def _collect_small_side_for_broadcast(
 
     dfs: list[DataFrame] = []
     if need_allgather:
-        allgather = AllGatherManager(context, comm, collective_id)
+        allgather = AllGatherManager(
+            context,
+            comm,
+            collective_id,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "join.broadcast.allgather",
+            ),
+        )
         with allgather.inserting() as inserter:
             for s_id in range(len(chunks)):
                 await inserter.insert(s_id, chunks.pop(0))
@@ -341,6 +350,10 @@ async def _collect_small_side_for_broadcast(
                 chunks,
                 reserve_extra=0 if len(chunks) == 1 else size,
                 net_memory_delta=0,
+                attributes=reservation_attributes(
+                    ir_context.actor_bound_quent_ir_execution_state,
+                    "join.broadcast.collect",
+                ),
             )
             with opaque_memory_usage(extra):
                 dfs = [
@@ -373,6 +386,10 @@ async def _collect_small_side_for_broadcast(
                     group,
                     reserve_extra=0 if len(group) == 1 else group_size,
                     net_memory_delta=0,
+                    attributes=reservation_attributes(
+                        ir_context.actor_bound_quent_ir_execution_state,
+                        "join.broadcast.collect",
+                    ),
                 )
                 with opaque_memory_usage(extra):
                     dfs.append(
@@ -413,7 +430,15 @@ async def _broadcast_join_large_chunk(
     join_results: list[DataFrame] = []
     input_bytes = large_chunk_size + small_size
     with opaque_memory_usage(
-        await reserve_memory(context, size=input_bytes, net_memory_delta=0)
+        await reserve_memory(
+            context,
+            size=input_bytes,
+            net_memory_delta=0,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "join.broadcast.evaluate",
+            ),
+        )
     ):
         for sdf in dfs_to_join:
             result = await ir_context.to_thread(
@@ -539,6 +564,10 @@ async def broadcast_join(
             TableChunk.from_message(msg, br=context.br()),
             reserve_extra=0,
             net_memory_delta=missing_net_memory_delta,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "join.broadcast.large",
+            ),
         )
         input_rows += large_chunk.shape[0]
         output_rows += await _broadcast_join_large_chunk(
@@ -593,6 +622,9 @@ def add_prefilter(
             ch_filtered,
             collective_id,
             prefilter_statistics,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state, "prefilter.bloom"
+            ),
         )
     elif decision.method == "broadcast_semi_join":
         domain_schema = {key.name: key.value.dtype for key in spec.domain_on}
@@ -638,7 +670,14 @@ def make_prefilter_execution(
     collective_ids: JoinCollectiveIds,
 ) -> JoinPrefilterExecution:
     """Create the actors and channels that realize selected prefilters."""
-    execution = JoinPrefilterExecution(context, ch_left, ch_right)
+    execution = JoinPrefilterExecution(
+        context,
+        ch_left,
+        ch_right,
+        attributes=reservation_attributes(
+            ir_context.actor_bound_quent_ir_execution_state, "prefilter.project.keys"
+        ),
+    )
 
     # Prepare every required domain before connecting target-side filters. This
     # is important for opposing direct filters: each filter must consume the
@@ -876,6 +915,9 @@ async def _join_chunks(
             ],
             reserve_extra=0,
             net_memory_delta=missing_net_memory_delta,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state, "join.chunks"
+            ),
         )
 
         input_bytes = sum(
@@ -886,10 +928,18 @@ async def _join_chunks(
             )
         )
         with opaque_memory_usage(
-            await reserve_memory(context, size=input_bytes, net_memory_delta=0)
+            await reserve_memory(
+                context,
+                size=input_bytes,
+                net_memory_delta=0,
+                attributes=reservation_attributes(
+                    ir_context.actor_bound_quent_ir_execution_state,
+                    "join.evaluate",
+                ),
+            )
         ):
-            df = await ir_context.to_thread(
-                ir.do_evaluate,
+            df = await ir_context.to_thread(  # type: ignore[call-arg]
+                cast("Any", ir.do_evaluate),
                 *ir._non_child_args,
                 chunk_to_frame(left_chunk, left),
                 chunk_to_frame(right_chunk, right),
@@ -1490,6 +1540,8 @@ async def collect_samples(
     sample_chunk_count: int,
     target_partition_size: int,
     collective_id: int,
+    *,
+    attributes: dict[str, str] | None,
 ) -> None:
     """Sample inputs and attach aggregate estimates to their planning state."""
     if not inputs:
@@ -1538,6 +1590,7 @@ async def collect_samples(
         comm,
         samplers,
         collective_id,
+        attributes=attributes,
     )
     for (input_, _), sample in zip(sampling_inputs, samples, strict=True):
         input_.sample = sample
@@ -1571,6 +1624,8 @@ async def resolve_prefilters(
     right_partitioning: NormalizedPartitioning,
     executor: StreamingExecutor,
     collective_id: int,
+    *,
+    attributes: dict[str, str] | None,
 ) -> None:
     """Resolve optional prefilters after selecting the join strategy."""
     config = executor.join_filter_pushdown
@@ -1599,6 +1654,7 @@ async def resolve_prefilters(
         executor.dynamic_planning.sample_chunk_count,
         executor.target_partition_size,
         collective_id,
+        attributes=attributes,
     )
     choose_prefilters(
         join_state,
@@ -1619,6 +1675,7 @@ async def _validate_broadcast_candidate(
     collective_id: int,
     *,
     can_join_build_chunks_separately: bool,
+    attributes: dict[str, str] | None,
 ) -> bool:
     """Buffer a candidate until exhausted or proven too large to broadcast."""
     sample = input_.sample
@@ -1661,6 +1718,7 @@ async def _validate_broadcast_candidate(
         local_rows,
         int(local_is_complete),
         int(local_fits),
+        attributes=attributes,
     )
     is_complete = complete_rank_count == comm.nranks
 
@@ -1695,6 +1753,7 @@ async def choose_strategy(
     collective_ids: JoinCollectiveIds,
     *,
     tracer: ActorTracer | None,
+    attributes: dict[str, str] | None,
 ) -> JoinStrategy:
     """Collect any required samples and choose broadcast vs shuffle."""
     left, right = ir.children[:2]
@@ -1758,6 +1817,7 @@ async def choose_strategy(
             right_partitioning,
             executor,
             collective_ids.size_estimate,
+            attributes=attributes,
         )
         return ordered_strategy
     else:
@@ -1770,6 +1830,7 @@ async def choose_strategy(
             executor.dynamic_planning.sample_chunk_count,
             executor.target_partition_size,
             collective_ids.size_estimate,
+            attributes=attributes,
         )
 
     left_sample = join_state.left.sample
@@ -1803,6 +1864,7 @@ async def choose_strategy(
             can_join_build_chunks_separately=_allow_decomposed_broadcast(
                 comm, ir, candidate_input.metadata
             ),
+            attributes=attributes,
         ):
             strategy: JoinStrategy = broadcast_candidate
         else:
@@ -1845,6 +1907,7 @@ async def choose_strategy(
         right_partitioning,
         executor,
         collective_ids.size_estimate,
+        attributes=attributes,
     )
     return strategy
 
@@ -1931,6 +1994,10 @@ async def join_actor(
             executor,
             collective_ids,
             tracer=tracer,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "join.planning.collective",
+            ),
         )
         for candidate in join_state.candidates:
             if candidate.decision is None:

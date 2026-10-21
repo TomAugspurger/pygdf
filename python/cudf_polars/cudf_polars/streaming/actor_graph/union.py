@@ -25,6 +25,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     gather_in_task_group,
     process_children,
     recv_metadata,
+    reservation_attributes,
     send_metadata,
 )
 
@@ -110,6 +111,10 @@ async def union_node(
                         TableChunk.from_message(msg, br=context.br()),
                         reserve_extra=0,
                         net_memory_delta=0,
+                        attributes=reservation_attributes(
+                            ir_context.actor_bound_quent_ir_execution_state,
+                            "union.forward",
+                        ),
                     )
                 await ch_out.send(
                     context,

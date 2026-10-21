@@ -467,6 +467,7 @@ def _setup_worker(
             rank=comm.rank,
             nranks=comm.nranks,
             instance_name=f"rank-{comm.rank}",
+            buffer_resource=ctx.br(),
         )
     else:
         quent_worker_runtime = None
@@ -482,19 +483,6 @@ def _setup_worker(
         kvikio_monitor=make_kvikio_monitor(enabled=kvikio_statistics),
     )
     setattr(dask_worker, attr, mp_ctx)
-
-
-def _close_quent_worker(
-    *, uid: str, dask_worker: distributed.Worker | None = None
-) -> None:
-    """Close one worker's Quent collector client."""
-    assert dask_worker is not None
-    mp_ctx: _WorkerContext | None = getattr(
-        dask_worker, f"_cudf_polars_mp_context_{uid}", None
-    )
-    if mp_ctx is not None and mp_ctx.quent_worker_runtime is not None:
-        mp_ctx.quent_worker_runtime.close()
-        mp_ctx.quent_worker_runtime = None
 
 
 def _teardown_worker(
@@ -530,9 +518,14 @@ def _teardown_worker(
         # Shut down the Context explicitly on the same thread that
         # constructed it.
         try:
+            steps: list[Callable[[], object]] = []
+            if mp_ctx.quent_worker_runtime is not None:
+                steps.append(mp_ctx.quent_worker_runtime.close)
             if mp_ctx.ctx is not None:
-                mp_ctx.ctx.shutdown()
+                steps.append(mp_ctx.ctx.shutdown)
+            run_cleanup_steps("Dask worker teardown failed", *steps)
         finally:
+            mp_ctx.quent_worker_runtime = None
             mp_ctx.ctx = None
             mp_ctx.comm = None
             mp_ctx.base_mr = None
@@ -550,20 +543,14 @@ def _shutdown_dask(
 ) -> None:
     """Release Dask resources in dependency order."""
     steps: list[Callable[[], object]] = []
-    if client is not None and (
-        quent_runtime is not None or quent_collector is not None
-    ):
-        steps.append(
-            lambda: client.run(functools.partial(_close_quent_worker, uid=uid))
-        )
+    if client is not None:
+        steps.append(lambda: client.run(functools.partial(_teardown_worker, uid=uid)))
     if quent_runtime is not None:
         steps.append(quent_runtime.close)
     elif (
         quent_collector is not None
     ):  # pragma: no-cover; runs on the worker, not client
         steps.append(quent_collector.close)
-    if client is not None:
-        steps.append(lambda: client.run(functools.partial(_teardown_worker, uid=uid)))
     if owned_client is not None:
         steps.append(owned_client.close)
     if owned_cluster is not None:

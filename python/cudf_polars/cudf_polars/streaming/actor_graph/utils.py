@@ -9,7 +9,9 @@ import contextlib
 import itertools
 import math
 import operator
+import re
 import struct
+import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
@@ -67,6 +69,7 @@ if TYPE_CHECKING:
         Coroutine,
         Generator,
         Iterator,
+        Mapping,
         Sequence,
     )
 
@@ -82,6 +85,7 @@ if TYPE_CHECKING:
 
     from cudf_polars.dsl.expr import Expr
     from cudf_polars.dsl.ir import IR, IRExecutionContext
+    from cudf_polars.quent._context import ActorBoundQuentIRExecutionState
     from cudf_polars.streaming.actor_graph.dispatch import SubNetGenerator
     from cudf_polars.typing import Schema
 
@@ -100,6 +104,34 @@ type PartitioningLevel = Literal["flat", "inter_rank", "local"]
 CUDF_ROW_LIMIT = 2**31 - 1
 # Stay well below the cuDF row limit when forming a single table/partition.
 MAX_ROWS_PER_PARTITION = CUDF_ROW_LIMIT // 4
+_RESERVATION_SITE_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+$")
+
+
+def reservation_attributes(
+    quent_state: ActorBoundQuentIRExecutionState | None,
+    site: str,
+) -> dict[str, str] | None:
+    """Build validated rapidsmpf reservation telemetry attributes."""
+    if quent_state is None:
+        return None
+    if not _RESERVATION_SITE_PATTERN.fullmatch(site):
+        raise ValueError(
+            "reservation site must be a stable lowercase dotted identifier"
+        )
+    actor_id = quent_state.actor_id
+    if not isinstance(actor_id, uuid.UUID):
+        raise TypeError("Quent reservation actor_id must be a UUID")
+    attributes = {
+        "rapidsmpf.site": site,
+        "quent.actor_id": str(actor_id),
+    }
+    if any(
+        key.startswith(("quent.", "rapidsmpf."))
+        and key not in {"quent.actor_id", "rapidsmpf.site"}
+        for key in attributes
+    ):  # pragma: no cover - guards future protocol additions
+        raise ValueError("unsupported reservation telemetry protocol attribute")
+    return attributes
 
 
 def _hash_keys_match(
@@ -992,7 +1024,11 @@ async def evaluate_chunk(
         if not chunk.is_available():
             raise ValueError("already_available=True requires an available TableChunk")
         reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
-            chunk.data_alloc_size(), net_memory_delta=0
+            chunk.data_alloc_size(),
+            net_memory_delta=0,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state, "evaluate.chunk"
+            ),
         )
     else:
         chunk, reservation = await make_table_chunks_available_or_wait(
@@ -1000,6 +1036,9 @@ async def evaluate_chunk(
             chunk,
             reserve_extra=chunk.data_alloc_size(),
             net_memory_delta=0,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state, "evaluate.chunk"
+            ),
         )
     with opaque_memory_usage(reservation):
         for single_ir in irs:
@@ -1045,7 +1084,14 @@ async def allgather_and_reduce(
     -------
     The chunk produced by evaluating ``reduce_ir`` on the gathered result.
     """
-    allgather = AllGatherManager(context, comm, collective_id)
+    allgather = AllGatherManager(
+        context,
+        comm,
+        collective_id,
+        attributes=reservation_attributes(
+            ir_context.actor_bound_quent_ir_execution_state, "allgather.reduce"
+        ),
+    )
     with allgather.inserting() as inserter:
         await inserter.insert(0, local_chunk)
     stream = ir_context.get_cuda_stream()
@@ -1087,6 +1133,9 @@ async def concat_batch(
         batch,
         reserve_extra=sum(c.data_alloc_size() for c in batch),
         net_memory_delta=0,
+        attributes=reservation_attributes(
+            ir_context.actor_bound_quent_ir_execution_state, "concat.batch"
+        ),
     )
     with opaque_memory_usage(extra):
         df = await ir_context.to_thread(
@@ -1284,6 +1333,8 @@ async def aggregate_table_size_stats(
     comm: Communicator,
     samples: tuple[TableSizeStats, ...],
     collective_id: int,
+    *,
+    attributes: Mapping[str, str | int | bool | float] | None,
 ) -> tuple[TableSizeStats, ...]:
     """Aggregate table-size and row estimates across ranks."""
     totals = await allgather_reduce(
@@ -1300,6 +1351,7 @@ async def aggregate_table_size_stats(
                 int(sample.is_complete),
             )
         ),
+        attributes=attributes,
     )
     totals_iter = iter(totals)
     return tuple(
@@ -1388,7 +1440,11 @@ class ChunkSampler:
             chunks.insert(Message(msg.sequence_number, chunk))
         return chunks
 
-    async def sample(self) -> TableSizeStats:
+    async def sample(
+        self,
+        *,
+        attributes: Mapping[str, str | int | bool | float] | None,
+    ) -> TableSizeStats:
         """Sample the configured channel and return extrapolated statistics."""
         ch_sampled = self.context.create_channel()
         temporary_channels = [ch_sampled]
@@ -1410,6 +1466,7 @@ class ChunkSampler:
                     ch_cardinality,
                     ch_sampled,
                     self.cardinality_columns,
+                    attributes=attributes,
                 ),
                 self.store_sample(ch_sampled),
                 ch_cardinality.recv(self.context),
@@ -1453,18 +1510,21 @@ async def sample_inputs(
     comm: Communicator,
     samplers: Sequence[ChunkSampler],
     collective_id: int,
+    *,
+    attributes: Mapping[str, str | int | bool | float] | None,
 ) -> tuple[TableSizeStats, ...]:
     """Sample input channels concurrently and aggregate their statistics."""
     if not samplers:
         return ()
     local_samples = await gather_in_task_group(
-        *(sampler.sample() for sampler in samplers)
+        *(sampler.sample(attributes=attributes) for sampler in samplers)
     )
     return await aggregate_table_size_stats(
         context,
         comm,
         tuple(local_samples),
         collective_id,
+        attributes=attributes,
     )
 
 
@@ -1512,7 +1572,7 @@ async def _sample_chunks(
         ch_in_chunk_count=local_count,
         cardinality_estimator=cardinality_estimator,
         cardinality_columns=tuple(cardinality_columns),
-    ).sample()
+    ).sample(attributes=None)
 
 
 async def replay_buffered_channel(
@@ -2058,6 +2118,7 @@ async def allgather_reduce(
     comm: Communicator,
     op_id: int,
     *local_values: int,
+    attributes: Mapping[str, str | int | bool | float] | None,
 ) -> tuple[int, ...]:
     """
     Allgather local scalar values and sum each across all ranks.
@@ -2072,6 +2133,8 @@ async def allgather_reduce(
         The collective operation ID for this allgather.
     *local_values
         One or more local scalar values to contribute.
+    attributes
+        Attributes propagated to the rapidsmpf collective.
 
     Returns
     -------
@@ -2086,7 +2149,7 @@ async def allgather_reduce(
     data = struct.pack(fmt, *local_values)
     packed = PackedData.from_host_bytes(data, context.br())
 
-    allgather = AllGather(context, comm, op_id)
+    allgather = AllGather(context, comm, op_id, attributes=attributes)
     try:
         allgather.insert(0, packed)
     finally:

@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 
     import cudf_polars_quent as quent_bindings
 
+    from rapidsmpf.memory.buffer_resource import BufferResource
+
     from cudf_polars.containers import DataFrame
     from cudf_polars.dsl.ir import IR
     from cudf_polars.quent._context import (
@@ -208,6 +210,8 @@ class QuentWorkerRuntime:
     session: QuentSession
     worker_resources: WorkerResources
     _worker_handle: quent_bindings.WorkerInitHandle | None
+    _buffer_resource: BufferResource | None
+    _reservation_recorder: object | None
 
     @classmethod
     def create(
@@ -219,6 +223,7 @@ class QuentWorkerRuntime:
         rank: int,
         nranks: int,
         instance_name: str,
+        buffer_resource: BufferResource,
     ) -> QuentWorkerRuntime:
         """Create a worker runtime and declare its resources."""
         from cudf_polars.quent._context import WorkerResources
@@ -235,13 +240,22 @@ class QuentWorkerRuntime:
             worker_id=worker_id,
             rank=rank,
             nranks=nranks,
+            buffer_resource=buffer_resource,
         )
         resources.declare(session)
+        recorder = _quent.reservation_recorder_capsule(
+            session.binding_context,
+            worker_id,
+            resources.reservable_memory_ids,
+        )
+        buffer_resource.set_reservation_recorder(recorder)
         return cls(
             config=config,
             session=session,
             worker_resources=resources,
             _worker_handle=worker_handle,
+            _buffer_resource=buffer_resource,
+            _reservation_recorder=recorder,
         )
 
     def query_worker_state(self, query_id: uuid.UUID) -> QuentQueryWorkerState:
@@ -352,10 +366,30 @@ class QuentWorkerRuntime:
             )
 
     def close(self) -> None:
-        """Close the Worker and its process-local Collector client."""
+        """Drain reservation telemetry, then close Worker and session."""
         worker_handle = self._worker_handle
+        buffer_resource = self._buffer_resource
+        recorder = self._reservation_recorder
         self._worker_handle = None
+        self._buffer_resource = None
+        self._reservation_recorder = None
         steps: list[Callable[[], object]] = []
+        if buffer_resource is not None:
+            steps.append(lambda: buffer_resource.set_reservation_recorder(None))
+        if recorder is not None:
+
+            def close_recorder() -> None:
+                diagnostics = _quent.reservation_recorder_diagnostics(recorder)
+                try:
+                    if diagnostics:
+                        raise RuntimeError(
+                            "Reservation recorder diagnostics: "
+                            + "; ".join(diagnostics)
+                        )
+                finally:
+                    _quent.close_reservation_recorder(recorder)
+
+            steps.append(close_recorder)
         if worker_handle is not None:
             steps.append(worker_handle.exit)
         steps.append(self.session.close)

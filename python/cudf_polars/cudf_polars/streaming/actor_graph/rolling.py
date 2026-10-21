@@ -34,6 +34,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     names_to_indices,
     process_children,
     recv_metadata,
+    reservation_attributes,
     send_metadata,
     shutdown_on_error,
 )
@@ -42,7 +43,7 @@ from cudf_polars.streaming.utils import _fallback_inform
 from cudf_polars.utils.cuda_stream import join_cuda_streams, stream_ordered_after
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 
     from rapidsmpf.communicator.communicator import Communicator
     from rapidsmpf.memory.buffer_resource import BufferResource
@@ -126,7 +127,10 @@ class RollingManager:
         row_offset = 0
         while (msg := await self.ch_in.recv(self.context)) is not None:
             chunk = await self.policy.prepare_chunk(
-                self.context, msg, row_offset=row_offset
+                self.context,
+                msg,
+                row_offset=row_offset,
+                ir_context=self.ir_context,
             )
             self.policy.validate_cursor(self.context, chunk)
             self.policy.observe(chunk)
@@ -274,6 +278,7 @@ class _RollingPolicy[BufferedChunkT: BufferedChunk]:
         msg: Message,
         *,
         row_offset: int,
+        ir_context: IRExecutionContext,
     ) -> BufferedChunkT:
         raise NotImplementedError
 
@@ -317,7 +322,12 @@ class _RollingPolicy[BufferedChunkT: BufferedChunk]:
         if len(chunks) == 1:
             return chunks[0]
         reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
-            sum(chunk.data_alloc_size() for chunk in chunks), net_memory_delta=0
+            sum(chunk.data_alloc_size() for chunk in chunks),
+            net_memory_delta=0,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "rolling.region.concatenate",
+            ),
         )
         chunk_streams = [chunk.stream for chunk in chunks]
         with (
@@ -369,7 +379,12 @@ class _RollingPolicy[BufferedChunkT: BufferedChunk]:
             stream=result.stream,
         )
         reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
-            result.data_alloc_size(), net_memory_delta=0
+            result.data_alloc_size(),
+            net_memory_delta=0,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "rolling.result.copy",
+            ),
         )
         with opaque_memory_usage(reservation):
             table = table.copy(result.stream, context.br().device_mr)
@@ -508,6 +523,7 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
         dtype: plc.DataType,
         context: Context,
         needle_stream: Stream,
+        attributes: Mapping[str, str | int | bool | float] | None,
     ) -> int:
         """Return the globally indexed insertion row of a needle in some chunks."""
         assert len(chunks) > 0
@@ -528,7 +544,9 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
             memory_scope = nullcontext()
             if needs_cast:
                 reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
-                    chunk.num_rows * 8, net_memory_delta=0
+                    chunk.num_rows * 8,
+                    net_memory_delta=0,
+                    attributes=attributes,
                 )
                 memory_scope = opaque_memory_usage(reservation)
             with memory_scope:
@@ -596,6 +614,7 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
         msg: Message,
         *,
         row_offset: int,
+        ir_context: IRExecutionContext,
     ) -> RangeBufferedChunk:
         """Convert a message to a staged chunk and extract range metadata."""
         chunk = TableChunk.from_message(msg, br=context.br())
@@ -605,6 +624,10 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
             chunk,
             reserve_extra=32,
             net_memory_delta=0,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "rolling.range.prepare",
+            ),
         )
         with opaque_memory_usage(extra):
             index_column = chunk.table_view().columns()[self.index]
@@ -718,6 +741,10 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
             dtype=self.index_dtype,
             context=context,
             needle_stream=cursor.chunk.stream,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "rolling.range.search",
+            ),
         )
         ghost_stop = await self._global_insertion_row(
             chunks,
@@ -728,6 +755,10 @@ class RangeOverlapPolicy(_RollingPolicy[RangeBufferedChunk]):
             dtype=self.index_dtype,
             context=context,
             needle_stream=cursor.chunk.stream,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "rolling.range.search",
+            ),
         )
         # We must extract at least the whole of the current cursor chunk.
         ghost_start = min(cursor.row_start, ghost_start)
@@ -756,12 +787,20 @@ class RowCountOverlapPolicy(_RollingPolicy[BufferedChunk]):
         msg: Message,
         *,
         row_offset: int,
+        ir_context: IRExecutionContext,
     ) -> BufferedChunk:
         """Convert a message to an available chunk with row-span metadata."""
         chunk = TableChunk.from_message(msg, br=context.br())
         nrows, _ = chunk.shape
         chunk, _ = await make_table_chunks_available_or_wait(
-            context, chunk, reserve_extra=0, net_memory_delta=0
+            context,
+            chunk,
+            reserve_extra=0,
+            net_memory_delta=0,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "rolling.rows.prepare",
+            ),
         )
         return BufferedChunk(msg.sequence_number, chunk, row_offset, nrows)
 
@@ -794,7 +833,6 @@ class RowCountOverlapPolicy(_RollingPolicy[BufferedChunk]):
         ir_context: IRExecutionContext,
     ) -> BufferedChunk | None:
         """Keep only emitted rows that a future fixed-size window can use."""
-        del ir_context
         if self.preceding == 0 or cursor.num_rows == 0:
             return None
         start = max(cursor.row_start, cursor.row_stop - self.preceding)
@@ -808,7 +846,12 @@ class RowCountOverlapPolicy(_RollingPolicy[BufferedChunk]):
             stream=stream,
         )
         reservation = await context.memory(MemoryType.DEVICE).reserve_or_wait(
-            cursor.chunk.data_alloc_size(), net_memory_delta=0
+            cursor.chunk.data_alloc_size(),
+            net_memory_delta=0,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "rolling.rows.history",
+            ),
         )
         with opaque_memory_usage(reservation):
             table = table.copy(stream=stream, mr=context.br().device_mr)
@@ -888,7 +931,15 @@ async def rolling_actor(
                 tracer.set_duplicated()
 
             stream = ir_context.get_cuda_stream()
-            ag = AllGatherManager(context, comm, collective_id)
+            ag = AllGatherManager(
+                context,
+                comm,
+                collective_id,
+                attributes=reservation_attributes(
+                    ir_context.actor_bound_quent_ir_execution_state,
+                    "rolling.allgather",
+                ),
+            )
             with ag.inserting() as inserter:
                 while (msg := await ch_in.recv(context)) is not None:
                     chunk = TableChunk.from_message(msg, context.br())

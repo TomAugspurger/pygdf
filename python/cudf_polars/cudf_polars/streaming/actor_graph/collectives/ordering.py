@@ -38,6 +38,7 @@ from cudf_polars.streaming.actor_graph.utils import (
     concat_batch,
     empty_table_chunk,
     recv_metadata,
+    reservation_attributes,
     send_metadata,
     shutdown_channels_on_error,
 )
@@ -46,7 +47,7 @@ from cudf_polars.utils.cuda_stream import stream_ordered_after
 from cudf_polars.utils.dtypes import make_empty_column
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from cudf_streaming.channel_metadata import OrderKey
     from rapidsmpf.communicator.communicator import Communicator
@@ -280,6 +281,10 @@ async def extract_orderscheme_partitioning(
             TableChunk.from_message(msg, br=context.br()),
             reserve_extra=0,
             net_memory_delta=0,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "ordering.endpoints",
+            ),
         )
         tbl = chunk.table_view()
         key_tbl = plc.Table([tbl.columns()[index] for index in key_indices])
@@ -320,7 +325,15 @@ async def extract_orderscheme_partitioning(
                 br=context.br(),
             )
         )
-        allgather = AllGatherManager(context, comm, collective_id)
+        allgather = AllGatherManager(
+            context,
+            comm,
+            collective_id,
+            attributes=reservation_attributes(
+                ir_context.actor_bound_quent_ir_execution_state,
+                "ordering.endpoints.allgather",
+            ),
+        )
         with allgather.inserting() as inserter:
             await inserter.insert(comm.rank, local_chunk)
         endpoint_table = await allgather.extract_concatenated(
@@ -660,6 +673,8 @@ async def _unpack_remote_partition(
     context: Context,
     packed: PackedData,
     stream: Stream,
+    *,
+    attributes: Mapping[str, str | int | bool | float] | None,
 ) -> TableChunk:
     """Unpack one remote output-partition payload."""
     br = context.br()
@@ -672,9 +687,16 @@ async def _unpack_remote_partition(
         context,
         unpack_and_concat_cost(partitions),
         net_memory_delta=0,
+        attributes=attributes,
     )
     return TableChunk.from_pylibcudf_table(
-        unpack_and_concat(partitions, stream=stream, br=br, reservation=reservation),
+        unpack_and_concat(
+            partitions,
+            stream=stream,
+            br=br,
+            reservation=reservation,
+            attributes=attributes,
+        ),
         stream,
         exclusive_view=True,
         br=br,
@@ -711,12 +733,15 @@ class _OutputPartitionBuffer:
         boundary_chunk: TableChunk,
         input_ordering: Ordering,
         output_ordering: Ordering,
+        *,
+        attributes: Mapping[str, str | int | bool | float] | None,
     ) -> None:
         self.context = context
         self.ch_in = ch_in
         self.boundary_chunk = boundary_chunk
         self.input_ordering = input_ordering
         self.output_ordering = output_ordering
+        self.attributes = attributes
         self.pending: dict[int, ChunkStore] = {}
         self.input_done = False
 
@@ -756,6 +781,7 @@ class _OutputPartitionBuffer:
                 chunk,
                 reserve_extra=copy_bytes + sort_bytes,
                 net_memory_delta=0,
+                attributes=self.attributes,
             )
             with (
                 opaque_memory_usage(extra),
@@ -917,7 +943,15 @@ async def _adjust_ordering_impl(
         context, comm, input_ordering, output_ordering, output_boundaries
     )
     buffer = _OutputPartitionBuffer(
-        context, ch_in, output_boundaries, input_ordering, output_ordering
+        context,
+        ch_in,
+        output_boundaries,
+        input_ordering,
+        output_ordering,
+        attributes=reservation_attributes(
+            ir_context.actor_bound_quent_ir_execution_state,
+            "ordering.partition.output",
+        ),
     )
     exchange = None
     if plan.remote_sources or plan.remote_destinations:
@@ -991,7 +1025,15 @@ async def _adjust_ordering_impl(
                 exchange.extract(source_rank),
                 strict=True,
             ):
-                chunk = await _unpack_remote_partition(context, packed, stream)
+                chunk = await _unpack_remote_partition(
+                    context,
+                    packed,
+                    stream,
+                    attributes=reservation_attributes(
+                        ir_context.actor_bound_quent_ir_execution_state,
+                        "ordering.partition.remote",
+                    ),
+                )
                 if chunk.table_view().num_rows() > 0:
                     _store_chunk(context, remote_pieces, pid, chunk)
             pieces_by_source[source_rank] = remote_pieces
