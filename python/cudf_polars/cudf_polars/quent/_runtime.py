@@ -14,6 +14,7 @@ import threading
 import time
 from typing import TYPE_CHECKING
 
+from cudf_polars.quent._reservation_events import ReservationEventIngestor
 from cudf_polars.utils.cleanup import run_cleanup_steps
 
 if TYPE_CHECKING:
@@ -235,7 +236,7 @@ class QuentWorkerRuntime:
     worker_resources: WorkerResources
     _worker_handle: quent_bindings.WorkerInitHandle | None
     _buffer_resource: BufferResource | None
-    _reservation_ingestor: quent_bindings.ReservationEventIngestor | None
+    _reservation_ingestor: ReservationEventIngestor | None
     _reservation_events_lock: threading.Lock = dataclasses.field(
         default_factory=threading.Lock
     )
@@ -271,7 +272,7 @@ class QuentWorkerRuntime:
             buffer_resource=buffer_resource,
         )
         resources.declare(session)
-        ingestor = _quent.ReservationEventIngestor(
+        ingestor = ReservationEventIngestor(
             session.binding_context,
             worker_id,
             resources.reservable_memory_ids,
