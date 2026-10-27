@@ -726,6 +726,10 @@ files:
       polars_compat_version: ["2.0"]
     includes:
       - test_cudf_polars_compat
+  test_cudf_polars_quent:
+    output: none
+    includes:
+      - depends_on_cudf_polars_quent
 channels:
   - rapidsai-nightly
   - rapidsai
@@ -1308,6 +1312,7 @@ dependencies:
     common:
       - output_types: conda
         packages:
+          # Keep these pins in sync with conda/recipes/cudf-polars-quent/recipe.yaml
           - maturin>=1.14,<2
           - rust=1.97
   test_python_narwhals:
@@ -1852,6 +1857,11 @@ dependencies:
       - output_types: conda
         packages:
           - cudf-polars==26.12.*,>=0.0.0a0
+  depends_on_cudf_polars_quent:
+    common:
+      - output_types: conda
+        packages:
+          - cudf-polars-quent==26.12.*,>=0.0.0a0
   depends_on_narwhals:
     common:
       - output_types: [conda, requirements, constraints, pyproject]

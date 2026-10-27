@@ -32,6 +32,12 @@ if [[ -n "${CUDF_EXTRA_DEPENDENCY_MATRIX:-}" ]]; then
   DEPENDENCY_MATRIX="${DEPENDENCY_MATRIX};${CUDF_EXTRA_DEPENDENCY_MATRIX}"
 fi
 
+if [[ "${INSTALL_CUDF_POLARS_QUENT:-false}" == "true" ]]; then
+  # Opt-in because only some jobs depend on the cudf-polars-quent build job.
+  CUDF_POLARS_QUENT_CHANNEL=$(rapids-download-from-github "$(rapids-artifact-name conda_python cudf-polars-quent cudf --stable)")
+  CMD="${CMD} --prepend-channel \"${CUDF_POLARS_QUENT_CHANNEL}\""
+fi
+
 CMD="${CMD} \
   --prepend-channel \"${CPP_CHANNEL}\" \
   --prepend-channel \"${PYTHON_CHANNEL}\" \

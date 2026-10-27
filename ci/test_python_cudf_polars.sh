@@ -19,7 +19,10 @@ case "${POLARS_VERSIONS:-latest}" in
 esac
 export CUDF_EXTRA_DEPENDENCY_MATRIX="polars_compat_version=${POLARS_COMPAT_VERSION}"
 
-source ./ci/test_python_common.sh test_python_other test_cudf_polars_compat
+# Install the conda cudf-polars-quent package so the tests in tests/quent run.
+export INSTALL_CUDF_POLARS_QUENT=true
+
+source ./ci/test_python_common.sh test_python_other test_cudf_polars_compat test_cudf_polars_quent
 
 rapids-logger "Check GPU usage"
 nvidia-smi
