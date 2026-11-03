@@ -571,34 +571,36 @@ def read_lake_files(
         if len(source_indices) == 1
         else plc.concatenate.concatenate(source_indices, stream=stream)
     )
-    if len(frames) == 1:
-        return frames[0], rows_per_path, source_index, exact
-    names = list(frames[0].column_map)
-    if not names:
-        return (
-            DataFrame(
-                [], num_rows=sum(frame.num_rows for frame in frames), stream=stream
-            ),
-            rows_per_path,
-            source_index,
-            exact,
-        )
     return (
-        DataFrame.from_table(
-            plc.concatenate.concatenate(
-                [
-                    plc.Table([frame.column_map[name].obj for name in names])
-                    for frame in frames
-                ],
-                stream=stream,
-            ),
-            names,
-            [schema[name] for name in names],
-            stream=stream,
-        ),
+        _concatenate_frames(frames, schema, stream=stream),
         rows_per_path,
         source_index,
         exact,
+    )
+
+
+def _concatenate_frames(
+    frames: Sequence[DataFrame], schema: Schema, *, stream: Stream
+) -> DataFrame:
+    """Stack frames that hold the same columns on top of each other."""
+    if len(frames) == 1:
+        return frames[0]
+    names = list(frames[0].column_map)
+    if not names:
+        return DataFrame(
+            [], num_rows=sum(frame.num_rows for frame in frames), stream=stream
+        )
+    return DataFrame.from_table(
+        plc.concatenate.concatenate(
+            [
+                plc.Table([frame.column_map[name].obj for name in names])
+                for frame in frames
+            ],
+            stream=stream,
+        ),
+        names,
+        [schema[name] for name in names],
+        stream=stream,
     )
 
 
@@ -988,6 +990,83 @@ def _null_column(dtype: DataType, size: int, *, stream: Stream) -> plc.Column:
 
 
 def _read_group(
+    paths: Sequence[str],
+    present: Sequence[Any],
+    footer: _Footer,
+    rows_per_path: Sequence[int],
+    wanted: Mapping[Any, str],
+    schema: Schema,
+    lake_options: LakehouseScanOptions,
+    filters: plc.expressions.Expression | None,
+    source_offset: int | None,
+    *,
+    by_field_id: bool,
+    stream: Stream,
+) -> tuple[DataFrame, plc.Column | None]:
+    """
+    Read one run of same-shaped files and map it onto the table schema.
+
+    This is :func:`_read_files`, except that a run which the parquet reader
+    refuses to read together is split in two and each half is read on its own.
+
+    Notes
+    -----
+    The footer layout we group files on does not capture everything the reader
+    compares. Files that hold the same logical types can still differ in a
+    legacy field the reader requires to agree, such as the ``ConvertedType``
+    of a timestamp. Iceberg tables mix such files: those a pyarrow based
+    writer rewrote during an overwrite or delete carry
+    ``ConvertedType.TIMESTAMP_MICROS`` on a timestamp without a time zone,
+    while the files polars wrote do not. The reader reports the disagreement
+    as soon as it opens the sources, before reading any data, so a run is
+    split on demand rather than predicting it. Each file still holds one
+    layout, so the splitting ends at a single file at the latest.
+    """
+    try:
+        return _read_files(
+            paths,
+            present,
+            footer,
+            rows_per_path,
+            wanted,
+            schema,
+            lake_options,
+            filters,
+            source_offset,
+            by_field_id=by_field_id,
+            stream=stream,
+        )
+    except ValueError as err:
+        if len(paths) == 1 or "mismatching data type or schema" not in str(err):
+            raise  # pragma: no cover; only reachable with a reader failure
+    middle = len(paths) // 2
+    halves = [
+        _read_group(
+            paths[lo:hi],
+            present,
+            footer,
+            rows_per_path[lo:hi],
+            wanted,
+            schema,
+            lake_options,
+            filters,
+            None if source_offset is None else source_offset + lo,
+            by_field_id=by_field_id,
+            stream=stream,
+        )
+        for lo, hi in ((0, middle), (middle, len(paths)))
+    ]
+    frame = _concatenate_frames([half[0] for half in halves], schema, stream=stream)
+    source_indices = [half[1] for half in halves if half[1] is not None]
+    source_index = (
+        plc.concatenate.concatenate(source_indices, stream=stream)
+        if source_indices
+        else None
+    )
+    return frame, source_index
+
+
+def _read_files(
     paths: Sequence[str],
     present: Sequence[Any],
     footer: _Footer,
