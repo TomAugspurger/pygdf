@@ -4,6 +4,7 @@
 mod actor;
 mod analyzer;
 mod evaluate;
+mod memory_sample;
 mod model;
 mod reservation;
 mod reservation_metrics;

@@ -22,10 +22,12 @@ use uuid::Uuid;
 use super::CudfPolarsUiAnalyzer;
 use crate::{
     evaluate::EvaluateUsage,
+    memory_sample::MemorySampleUsage,
     reservation::OCCUPANCY_ENTITY_TYPE,
     resource::{
         DATA_CHANNEL_RESOURCE_TYPE, DEVICE_MEMORY_RESOURCE_TYPE, EVALUATE_ENTITY_TYPE,
-        PROCESSOR_RESOURCE_TYPE, RESERVABLE_MEMORY_RESOURCE_TYPE, resource_type,
+        PROCESSOR_RESOURCE_TYPE, RESERVABLE_MEMORY_RESOURCE_TYPE, SAMPLED_MEMORY_RESOURCE_TYPE,
+        resource_type,
     },
 };
 
@@ -109,6 +111,7 @@ impl CudfPolarsUiAnalyzer {
                 | DEVICE_MEMORY_RESOURCE_TYPE
                 | DATA_CHANNEL_RESOURCE_TYPE
                 | RESERVABLE_MEMORY_RESOURCE_TYPE
+                | SAMPLED_MEMORY_RESOURCE_TYPE
         ) {
             return Err(AnalyzerError::InvalidArgument(format!(
                 "unknown resource type {resource_type_name:?}"
@@ -248,6 +251,13 @@ impl CudfPolarsUiAnalyzer {
                             builder.try_push(&segment)?;
                         }
                     }
+                }
+            }
+            if resource_type_name == SAMPLED_MEMORY_RESOURCE_TYPE {
+                for sample in self.memory_samples.iter().filter(|sample| {
+                    sample.query_id == query_id && selected_resource_ids.contains(&sample.memory_id)
+                }) {
+                    builder.try_push(&MemorySampleUsage(sample))?;
                 }
             }
             let result = builder.build();

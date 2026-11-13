@@ -28,6 +28,7 @@ use crate::{
     actor::ActorSpan,
     evaluate::EvaluateSpan,
     generated::CudfPolarsEvent,
+    memory_sample::MemorySampleSpan,
     model::CudfPolarsModel,
     resource::{DeclaredResource, DeclaredResourceGroup},
 };
@@ -40,6 +41,7 @@ pub struct CudfPolarsUiAnalyzer {
     pub(super) evaluate_indices: HashMap<Uuid, usize>,
     pub(super) occupancies: Vec<crate::reservation::OccupancySpan>,
     pub(super) occupancy_indices: HashMap<Uuid, usize>,
+    pub(super) memory_samples: Vec<MemorySampleSpan>,
     pub(super) resources: HashMap<Uuid, DeclaredResource>,
     pub(super) resource_groups: HashMap<Uuid, DeclaredResourceGroup>,
 }

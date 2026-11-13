@@ -14,15 +14,18 @@ use crate::{
     evaluate::{EvaluateBuilder, EvaluateSpan},
     generated::{
         ActorEvent, CudfPolarsEvent, DataChannelEvent, DeviceMemoryEvent, EngineEvent,
-        EvaluateEvent, OperatorEvent, PlanEvent, PortEvent, ProcessorEvent, QueryEvent,
-        QueryGroupEvent, ReservableMemoryEvent, ReservationOccupancyEvent, StorageEvent,
+        EvaluateEvent, MemoryResourceSamplerEvent, OperatorEvent, PlanEvent, PortEvent,
+        ProcessorEvent, QueryEvent, QueryGroupEvent, ReservableMemoryEvent,
+        ReservationOccupancyEvent, SampledMemoryResourceEvent, StorageEvent,
         ThreadPoolEvent, WorkerEvent,
     },
+    memory_sample::{MemorySampleBuilder, MemorySampleSpan},
     model::CudfPolarsModelBuilder,
     reservation::build_occupancies,
     resource::{
         DATA_CHANNEL_RESOURCE_TYPE, DEVICE_MEMORY_RESOURCE_TYPE, DeclaredResource,
         DeclaredResourceGroup, PROCESSOR_RESOURCE_TYPE, RESERVABLE_MEMORY_RESOURCE_TYPE,
+        SAMPLED_MEMORY_RESOURCE_TYPE,
     },
 };
 
@@ -35,6 +38,7 @@ impl CudfPolarsUiAnalyzer {
         let mut builder = CudfPolarsModelBuilder::try_new(engine_id)?;
         let mut actor_builders = HashMap::<Uuid, ActorBuilder>::new();
         let mut evaluate_builders = HashMap::<Uuid, EvaluateBuilder>::new();
+        let mut memory_sample_builders = HashMap::<Uuid, MemorySampleBuilder>::new();
         let mut resources = HashMap::new();
         let mut resource_groups = HashMap::new();
         let mut occupancy_events = Vec::new();
@@ -65,6 +69,12 @@ impl CudfPolarsUiAnalyzer {
                         .entry(event.id)
                         .or_default()
                         .push(event.timestamp, evaluate_event);
+                }
+                CudfPolarsEvent::MemoryResourceSampler(sample_event) => {
+                    memory_sample_builders
+                        .entry(event.id)
+                        .or_default()
+                        .push(event.timestamp, sample_event);
                 }
                 CudfPolarsEvent::ThreadPool(ThreadPoolEvent::Declared {
                     instance_name,
@@ -139,6 +149,20 @@ impl CudfPolarsUiAnalyzer {
                         },
                     );
                 }
+                CudfPolarsEvent::SampledMemoryResource(SampledMemoryResourceEvent::Declared {
+                    instance_name,
+                    worker,
+                }) => {
+                    resources.insert(
+                        event.id,
+                        DeclaredResource {
+                            id: event.id,
+                            instance_name: instance_name.clone(),
+                            type_name: SAMPLED_MEMORY_RESOURCE_TYPE,
+                            parent_group_id: worker.target,
+                        },
+                    );
+                }
                 _ => {}
             }
             builder.try_push(event)?;
@@ -159,6 +183,17 @@ impl CudfPolarsUiAnalyzer {
                 Err(error) => Some(Err(error)),
             })
             .collect::<AnalyzerResult<Vec<_>>>()?;
+        let memory_samples: Vec<MemorySampleSpan> = memory_sample_builders
+            .into_iter()
+            .filter_map(|(id, builder)| match builder.try_build(id) {
+                Ok(samples) => Some(Ok(samples)),
+                Err(AnalyzerError::IncompleteEntity(_)) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<AnalyzerResult<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         let mut model = builder.try_build()?;
         for actor in &actors {
             if let Ok(operator) = model.operator_mut(actor.operator_id) {
@@ -184,6 +219,7 @@ impl CudfPolarsUiAnalyzer {
             evaluate_indices,
             occupancies,
             occupancy_indices,
+            memory_samples,
             resources,
             resource_groups,
         })
@@ -249,6 +285,10 @@ fn events_for_engine(
                     worker,
                     ..
                 })
+                | CudfPolarsEvent::SampledMemoryResource(SampledMemoryResourceEvent::Declared {
+                    worker,
+                    ..
+                })
                 | CudfPolarsEvent::Storage(StorageEvent::Declared { worker, .. })
                 | CudfPolarsEvent::DataChannel(DataChannelEvent::Declared { worker, .. }) => {
                     Some(worker.target)
@@ -263,6 +303,10 @@ fn events_for_engine(
                     worker,
                     ..
                 }) => Some(worker.target),
+                CudfPolarsEvent::MemoryResourceSampler(MemoryResourceSamplerEvent::Sampling {
+                    query,
+                    ..
+                }) => Some(query.target),
                 _ => None,
             };
             parent_id.map(|parent_id| (event.id, parent_id))

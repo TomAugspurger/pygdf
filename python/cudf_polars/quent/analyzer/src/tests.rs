@@ -19,10 +19,11 @@ use crate::{
     CudfPolarsUiAnalyzer, Viewer,
     generated::{
         ActorEvent, ColumnSchema, CudfPolars, CudfPolarsEvent, DataFrameSchema, EngineEvent,
-        EvaluateEvent, Implementation, JoinFilterPushdownDetails, OperatorEvent, OperatorSchemas,
-        OperatorStatistics, PlanEvent, ProcessorEvent, QueryEvent, QueryGroupEvent,
-        ReservableMemory, ReservableMemoryBounds, ReservableMemoryEvent, ReservableMemoryUsage,
-        ReservationOccupancyEvent, RuntimePrefilterStatistics, ThreadPoolEvent, WorkerEvent,
+        EvaluateEvent, Implementation, JoinFilterPushdownDetails, MemoryResourceSamplerEvent,
+        OperatorEvent, OperatorSchemas, OperatorStatistics, PlanEvent, ProcessorEvent, QueryEvent,
+        QueryGroupEvent, ReservableMemory, ReservableMemoryBounds, ReservableMemoryEvent,
+        ReservableMemoryUsage, ReservationOccupancyEvent, RuntimePrefilterStatistics,
+        SampledMemoryResourceEvent, SampledMemoryResourceUsage, ThreadPoolEvent, WorkerEvent,
     },
     reservation::OCCUPANCY_ENTITY_TYPE,
     resource::{EVALUATE_ENTITY_TYPE, PROCESSOR_RESOURCE_TYPE, RESERVABLE_MEMORY_RESOURCE_TYPE},
@@ -56,6 +57,28 @@ fn entity_list_request(
     }
 }
 
+fn resource_timeline_request(
+    resource_id: Uuid,
+    entity_type_name: Option<&str>,
+    long_entities_threshold_s: Option<f64>,
+) -> TimelineRequest<OperatorFilter> {
+    TimelineRequest::Resource(quent_ui::timeline::request::ResourceTimelineRequest {
+        resource_id,
+        long_entities_threshold_s,
+        entity_filter: quent_ui::timeline::request::EntityFilter {
+            entity_type_name: entity_type_name.map(str::to_owned),
+        },
+        application: OperatorFilter {
+            operator_ids: vec![],
+        },
+        config: quent_ui::timeline::request::TimelineConfig {
+            num_bins: 4,
+            start: 0.0,
+            end: 20e-9,
+        },
+    })
+}
+
 #[test]
 fn builds_query_bundle_from_generated_events() {
     let engine_id = Uuid::now_v7();
@@ -76,6 +99,8 @@ fn builds_query_bundle_from_generated_events() {
     let processor_id = Uuid::now_v7();
     let evaluate_id = Uuid::now_v7();
     let incomplete_evaluate_id = Uuid::now_v7();
+    let sampled_memory_id = Uuid::now_v7();
+    let memory_sampler_id = Uuid::now_v7();
     let events = vec![
         Event::new(
             engine_id,
@@ -138,6 +163,14 @@ fn builds_query_bundle_from_generated_events() {
             CudfPolarsEvent::QueryGroup(QueryGroupEvent::Declared {
                 instance_name: Some("group".to_owned()),
                 engine: EntityRef::new(engine_id, ()),
+            }),
+        ),
+        Event::new(
+            sampled_memory_id,
+            3,
+            CudfPolarsEvent::SampledMemoryResource(SampledMemoryResourceEvent::Declared {
+                instance_name: "rank-0 sampled memory resource".to_owned(),
+                worker: EntityRef::new(worker_id, ()),
             }),
         ),
         Event::new(
@@ -287,6 +320,18 @@ fn builds_query_bundle_from_generated_events() {
             }),
         ),
         Event::new(
+            memory_sampler_id,
+            10,
+            CudfPolarsEvent::MemoryResourceSampler(MemoryResourceSamplerEvent::Sampling {
+                seq: 0,
+                query: EntityRef::new(query_id, ()),
+                memory: EntityRef::new(
+                    sampled_memory_id,
+                    SampledMemoryResourceUsage { bytes: 1024 },
+                ),
+            }),
+        ),
+        Event::new(
             occupancy_id,
             15,
             CudfPolarsEvent::ReservationOccupancy(ReservationOccupancyEvent::Held {
@@ -376,6 +421,11 @@ fn builds_query_bundle_from_generated_events() {
                     decision: None,
                 },
             }),
+        ),
+        Event::new(
+            memory_sampler_id,
+            20,
+            CudfPolarsEvent::MemoryResourceSampler(MemoryResourceSamplerEvent::Stopped { seq: 1 }),
         ),
         Event::new(
             operator_id,
@@ -566,43 +616,19 @@ fn builds_query_bundle_from_generated_events() {
             entries: [
                 (
                     "processor:evaluate".to_owned(),
-                    TimelineRequest::Resource(
-                        quent_ui::timeline::request::ResourceTimelineRequest {
-                            resource_id: processor_id,
-                            long_entities_threshold_s: Some(1e-9),
-                            entity_filter: quent_ui::timeline::request::EntityFilter {
-                                entity_type_name: Some(EVALUATE_ENTITY_TYPE.to_owned()),
-                            },
-                            application: OperatorFilter {
-                                operator_ids: vec![],
-                            },
-                            config: quent_ui::timeline::request::TimelineConfig {
-                                num_bins: 4,
-                                start: 0.0,
-                                end: 20e-9,
-                            },
-                        },
-                    ),
+                    resource_timeline_request(processor_id, Some(EVALUATE_ENTITY_TYPE), Some(1e-9)),
                 ),
                 (
                     "reservable-memory:occupancy".to_owned(),
-                    TimelineRequest::Resource(
-                        quent_ui::timeline::request::ResourceTimelineRequest {
-                            resource_id: reservable_memory_id,
-                            long_entities_threshold_s: Some(1e-9),
-                            entity_filter: quent_ui::timeline::request::EntityFilter {
-                                entity_type_name: Some(OCCUPANCY_ENTITY_TYPE.to_owned()),
-                            },
-                            application: OperatorFilter {
-                                operator_ids: vec![],
-                            },
-                            config: quent_ui::timeline::request::TimelineConfig {
-                                num_bins: 4,
-                                start: 0.0,
-                                end: 20e-9,
-                            },
-                        },
+                    resource_timeline_request(
+                        reservable_memory_id,
+                        Some(OCCUPANCY_ENTITY_TYPE),
+                        Some(1e-9),
                     ),
+                ),
+                (
+                    "sampled-memory".to_owned(),
+                    resource_timeline_request(sampled_memory_id, None, None),
                 ),
             ]
             .into_iter()
@@ -644,6 +670,18 @@ fn builds_query_bundle_from_generated_events() {
     );
     assert_eq!(timeline.long_fsms.len(), 1);
     assert_eq!(timeline.long_fsms[0].id, occupancy_id);
+
+    let BulkTimelinesResponseEntry::Ok { data, .. } = &response.entries["sampled-memory"] else {
+        panic!("sampled memory timeline entry failed")
+    };
+    let UiResourceTimeline::Binned(timeline) = data else {
+        panic!("expected an unkeyed sampled memory timeline")
+    };
+    assert!(
+        timeline.capacities_values["bytes"]
+            .iter()
+            .any(|&value| value > 0.0)
+    );
 
     let entities = analyzer
         .list_entities(entity_list_request(

@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub(crate) const PROCESSOR_RESOURCE_TYPE: &str = "processor";
 pub(crate) const DEVICE_MEMORY_RESOURCE_TYPE: &str = "device_memory";
 pub(crate) const RESERVABLE_MEMORY_RESOURCE_TYPE: &str = "reservable_memory";
+pub(crate) const SAMPLED_MEMORY_RESOURCE_TYPE: &str = "sampled_memory_resource";
 pub(crate) const DATA_CHANNEL_RESOURCE_TYPE: &str = "data_channel";
 pub(crate) const EVALUATE_ENTITY_TYPE: &str = "Evaluate";
 
@@ -29,7 +30,9 @@ pub(crate) struct DeclaredResourceGroup {
 pub(crate) fn resource_type(name: &str) -> ResourceTypeDecl {
     let mut resource_type = match name {
         PROCESSOR_RESOURCE_TYPE => ResourceTypeDecl::unit(name),
-        DEVICE_MEMORY_RESOURCE_TYPE | RESERVABLE_MEMORY_RESOURCE_TYPE => {
+        DEVICE_MEMORY_RESOURCE_TYPE
+        | RESERVABLE_MEMORY_RESOURCE_TYPE
+        | SAMPLED_MEMORY_RESOURCE_TYPE => {
             ResourceTypeDecl::new(name, [CapacityDecl::new_occupancy("bytes")])
         }
         DATA_CHANNEL_RESOURCE_TYPE => {
@@ -39,7 +42,9 @@ pub(crate) fn resource_type(name: &str) -> ResourceTypeDecl {
     };
     if !matches!(
         name,
-        DEVICE_MEMORY_RESOURCE_TYPE | RESERVABLE_MEMORY_RESOURCE_TYPE
+        DEVICE_MEMORY_RESOURCE_TYPE
+        | RESERVABLE_MEMORY_RESOURCE_TYPE
+        | SAMPLED_MEMORY_RESOURCE_TYPE
     ) {
         resource_type
             .used_by
