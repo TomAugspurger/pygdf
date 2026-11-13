@@ -16,16 +16,17 @@ default = ["collector"]
 collector = []
 
 [dependencies]
+cudf-polars-quent-browser = { path = "../browser", features = ["generate"] }
 pyo3 = { version = "0.29", features = ["abi3-py312"] }
-quent-collector-python = { git = "https://github.com/rapidsai/quent", rev = "4049c42d8665a9319724b5f6aab5c68d009114ef" }
-quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent", rev = "4049c42d8665a9319724b5f6aab5c68d009114ef" }
-quent-instrumentation = { git = "https://github.com/rapidsai/quent", rev = "4049c42d8665a9319724b5f6aab5c68d009114ef", features = ["serde", "io-ndjson", "io-collector"] }
-quent-io = { git = "https://github.com/rapidsai/quent", rev = "4049c42d8665a9319724b5f6aab5c68d009114ef", default-features = false, features = ["ndjson", "collector"] }
+quent-collector-python = { git = "https://github.com/rapidsai/quent", rev = "8551f90c648b25508061f941a6fc43046f739d7a" }
+quent-dynamic-attributes = { git = "https://github.com/rapidsai/quent", rev = "8551f90c648b25508061f941a6fc43046f739d7a" }
+quent-instrumentation = { git = "https://github.com/rapidsai/quent", rev = "8551f90c648b25508061f941a6fc43046f739d7a", features = ["serde", "io-ndjson", "io-collector"] }
+quent-io = { git = "https://github.com/rapidsai/quent", rev = "8551f90c648b25508061f941a6fc43046f739d7a", default-features = false, features = ["ndjson", "collector"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [build-dependencies]
-quent-build-info = { git = "https://github.com/rapidsai/quent", rev = "4049c42d8665a9319724b5f6aab5c68d009114ef" }
-quent-instrumentation-build = { git = "https://github.com/rapidsai/quent", rev = "4049c42d8665a9319724b5f6aab5c68d009114ef" }
-quent-schema-codegen-python = { git = "https://github.com/rapidsai/quent", rev = "4049c42d8665a9319724b5f6aab5c68d009114ef" }
-quent-yaml = { git = "https://github.com/rapidsai/quent", rev = "4049c42d8665a9319724b5f6aab5c68d009114ef" }
+quent-build-info = { git = "https://github.com/rapidsai/quent", rev = "8551f90c648b25508061f941a6fc43046f739d7a" }
+quent-instrumentation-build = { git = "https://github.com/rapidsai/quent", rev = "8551f90c648b25508061f941a6fc43046f739d7a" }
+quent-schema-codegen-python = { git = "https://github.com/rapidsai/quent", rev = "8551f90c648b25508061f941a6fc43046f739d7a" }
+quent-yaml = { git = "https://github.com/rapidsai/quent", rev = "8551f90c648b25508061f941a6fc43046f739d7a" }

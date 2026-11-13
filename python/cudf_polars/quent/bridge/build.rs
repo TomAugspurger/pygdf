@@ -17,10 +17,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let generated = quent_instrumentation_build::generate(
         &parsed.schema,
         &quent_instrumentation_build::Options {
-            serde: true,
-            combined_event: true,
+            events: quent_instrumentation_build::EventOptions {
+                serde: true,
+                combined_event: true,
+                record_derives: &["Clone"],
+                ..Default::default()
+            },
             analyzer_package: Some("cudf-polars-quent-analyzer".to_owned()),
-            record_derives: &["Clone"],
             collector_sink: true,
             ..Default::default()
         },
@@ -54,6 +57,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for file in &mut stubs {
         if file.name == "_quent_generated/__init__.pyi" {
             file.name = "cudf_polars_quent.pyi".to_owned();
+            file.content.push_str(
+                "\ndef write_browser_bundle(\n\
+                 \x20   input: str,\n\
+                 \x20   output: str,\n\
+                 ) -> tuple[str, int, int, str, int]: ...\n",
+            );
         }
 
         if file.name.ends_with(".pyi") {

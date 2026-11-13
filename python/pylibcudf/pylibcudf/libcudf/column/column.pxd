@@ -31,7 +31,7 @@ cdef extern from "cudf/column/column.hpp" namespace "cudf" nogil:
             const column& other,
             cudaStream_t stream,
             device_async_resource_ref mr
-        ) except +libcudf_exception_handler
+        ) except +libcudf_exception_handle
 
         column(
             column_view view,
