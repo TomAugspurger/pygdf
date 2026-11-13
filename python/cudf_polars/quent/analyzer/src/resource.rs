@@ -43,8 +43,8 @@ pub(crate) fn resource_type(name: &str) -> ResourceTypeDecl {
     if !matches!(
         name,
         DEVICE_MEMORY_RESOURCE_TYPE
-        | RESERVABLE_MEMORY_RESOURCE_TYPE
-        | SAMPLED_MEMORY_RESOURCE_TYPE
+            | RESERVABLE_MEMORY_RESOURCE_TYPE
+            | SAMPLED_MEMORY_RESOURCE_TYPE
     ) {
         resource_type
             .used_by
